@@ -1,6 +1,8 @@
 pub const meta = @import("meta.zig");
+pub const errors = @import("errors.zig");
 pub const Meta = meta.Meta;
 pub const MetaError = meta.Error;
+pub const DbOpenError = errors.DbOpenError;
 pub const MetaSlot = meta.MetaSlot;
 pub const SelectedMeta = meta.SelectedMeta;
 pub const decodeMeta = meta.decode;
