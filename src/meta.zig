@@ -1,4 +1,5 @@
 const std = @import("std");
+const errors = @import("errors.zig");
 
 pub const magic: u32 = 0x544C425A; // "ZBLT"
 pub const version: u32 = 1;
@@ -26,18 +27,7 @@ pub const SelectedMeta = struct {
     meta: Meta,
 };
 
-pub const Error = error{
-    InvalidMagic,
-    InvalidVersion,
-    InvalidChecksum,
-    InvalidPageSize,
-    PageTooSmall,
-    PageLengthMismatch,
-    RootPageOutOfRange,
-    AllocatorRootOutOfRange,
-    NoValidMetaPage,
-    OutOfMemory,
-};
+pub const Error = errors.MetaError;
 
 // encode meta struct to a byte array
 pub fn encode(allocator: std.mem.Allocator, meta: Meta) Error![]u8 {
