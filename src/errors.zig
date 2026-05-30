@@ -11,6 +11,13 @@ pub const MetaError = error{
     OutOfMemory,
 };
 
+pub const PageError = error{
+    InvalidPageType,
+    InvalidBasePageSize,
+    PageTooSmall,
+    SpanSizeOverflow,
+};
+
 pub const DbOpenError = error{
     InvalidDatabaseFile,
     DatabaseFileTooSmall,
