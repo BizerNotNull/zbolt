@@ -18,6 +18,14 @@ pub const PageError = error{
     SpanSizeOverflow,
 };
 
+pub const PageLayoutError = error{
+    UnexpectedPageType,
+    InvalidPageLayout,
+    EntryOutOfBounds,
+    EntriesNotSorted,
+    PageFull,
+};
+
 pub const DbOpenError = error{
     InvalidDatabaseFile,
     DatabaseFileTooSmall,

@@ -2,11 +2,18 @@ const std = @import("std");
 const errors = @import("errors.zig");
 
 pub const header_size: usize = 16;
+pub const data_header_size: usize = 24;
+
 const page_id_offset: usize = 0;
 const page_type_offset: usize = 8;
 const order_offset: usize = 9;
 const count_offset: usize = 10;
 const reserved_offset: usize = 12;
+
+const lower_offset: usize = header_size;
+const upper_offset: usize = header_size + 2;
+const data_flags_offset: usize = header_size + 4;
+const data_reserved_offset: usize = header_size + 6;
 
 pub const PageType = enum(u8) {
     meta = 1,
@@ -22,27 +29,96 @@ pub const Header = struct {
     order: u8,
 };
 
+pub const DataHeader = struct {
+    lower: u16,
+    upper: u16,
+    flags: u16,
+};
+
 pub const Error = errors.PageError;
+pub const LayoutError = errors.PageLayoutError;
 
-pub fn encodeHeader(page: []u8, header: Header) Error!void {
-    if (page.len < header_size) return error.PageTooSmall;
+pub const leaf = @import("page/leaf.zig");
+pub const branch = @import("page/branch.zig");
 
-    writeInt(u64, page, page_id_offset, header.page_id);
-    page[page_type_offset] = @intFromEnum(header.page_type);
-    page[order_offset] = header.order;
-    writeInt(u16, page, count_offset, header.count);
-    writeInt(u32, page, reserved_offset, 0);
+pub const LeafEntry = leaf.Entry;
+pub const LeafEntryView = leaf.EntryView;
+pub const LeafPage = leaf.LeafPage;
+pub const BranchEntry = branch.Entry;
+pub const BranchEntryView = branch.EntryView;
+pub const BranchPage = branch.BranchPage;
+
+pub fn encodeHeader(page_bytes: []u8, header: Header) Error!void {
+    if (page_bytes.len < header_size) return error.PageTooSmall;
+
+    writeInt(u64, page_bytes, page_id_offset, header.page_id);
+    page_bytes[page_type_offset] = @intFromEnum(header.page_type);
+    page_bytes[order_offset] = header.order;
+    writeInt(u16, page_bytes, count_offset, header.count);
+    writeInt(u32, page_bytes, reserved_offset, 0);
 }
 
-pub fn decodeHeader(page: []const u8) Error!Header {
-    if (page.len < header_size) return error.PageTooSmall;
+pub fn decodeHeader(page_bytes: []const u8) Error!Header {
+    if (page_bytes.len < header_size) return error.PageTooSmall;
 
     return .{
-        .page_id = readInt(u64, page, page_id_offset),
-        .page_type = try decodePageType(page[page_type_offset]),
-        .count = readInt(u16, page, count_offset),
-        .order = page[order_offset],
+        .page_id = readInt(u64, page_bytes, page_id_offset),
+        .page_type = try decodePageType(page_bytes[page_type_offset]),
+        .count = readInt(u16, page_bytes, count_offset),
+        .order = page_bytes[order_offset],
     };
+}
+
+pub fn encodeDataHeader(page_bytes: []u8, header: DataHeader) (Error || LayoutError)!void {
+    try ensureDataHeaderCapacity(page_bytes);
+
+    writeInt(u16, page_bytes, lower_offset, header.lower);
+    writeInt(u16, page_bytes, upper_offset, header.upper);
+    writeInt(u16, page_bytes, data_flags_offset, header.flags);
+    writeInt(u16, page_bytes, data_reserved_offset, 0);
+}
+
+pub fn decodeDataHeader(page_bytes: []const u8) (Error || LayoutError)!DataHeader {
+    try ensureDataHeaderCapacity(page_bytes);
+
+    return .{
+        .lower = readInt(u16, page_bytes, lower_offset),
+        .upper = readInt(u16, page_bytes, upper_offset),
+        .flags = readInt(u16, page_bytes, data_flags_offset),
+    };
+}
+
+pub fn ensureDataHeaderCapacity(page_bytes: []const u8) Error!void {
+    if (page_bytes.len < data_header_size) return error.PageTooSmall;
+}
+
+pub fn validateDataBounds(page_len: usize, lower: u16, upper: u16) LayoutError!void {
+    // `lower` grows forward and `upper` grows backward. If they cross, slot metadata
+    // and payload bytes have overlapped, so we reject the page before exposing slices.
+    if (lower < data_header_size) return error.InvalidPageLayout;
+    if (lower > upper) return error.InvalidPageLayout;
+    if (upper > page_len) return error.InvalidPageLayout;
+}
+
+pub fn validatePageType(actual: PageType, expected: PageType) LayoutError!void {
+    if (actual != expected) return error.UnexpectedPageType;
+}
+
+pub fn validateEntryIndex(count: u16, index: u16) LayoutError!void {
+    if (index >= count) return error.EntryOutOfBounds;
+}
+
+pub fn checkedCastU16(value: usize) LayoutError!u16 {
+    return std.math.cast(u16, value) orelse error.PageFull;
+}
+
+pub fn checkedAdd(base: usize, extra: usize) LayoutError!usize {
+    return std.math.add(usize, base, extra) catch error.InvalidPageLayout;
+}
+
+pub fn validateRange(page_len: usize, offset: usize, len: usize) LayoutError!void {
+    const end = checkedAdd(offset, len) catch return error.EntryOutOfBounds;
+    if (end > page_len) return error.EntryOutOfBounds;
 }
 
 pub fn spanSize(base_page_size: u32, order: u8) Error!usize {
@@ -58,6 +134,18 @@ pub fn spanSize(base_page_size: u32, order: u8) Error!usize {
     return std.math.cast(usize, result) orelse return error.SpanSizeOverflow;
 }
 
+pub fn writeInt(comptime T: type, page_bytes: []u8, offset: usize, value: T) void {
+    var bytes: [@sizeOf(T)]u8 = undefined;
+    std.mem.writeInt(T, &bytes, value, .little);
+    std.mem.copyForwards(u8, page_bytes[offset .. offset + @sizeOf(T)], bytes[0..]);
+}
+
+pub fn readInt(comptime T: type, page_bytes: []const u8, offset: usize) T {
+    var bytes: [@sizeOf(T)]u8 = undefined;
+    std.mem.copyForwards(u8, bytes[0..], page_bytes[offset .. offset + @sizeOf(T)]);
+    return std.mem.readInt(T, &bytes, .little);
+}
+
 fn decodePageType(raw: u8) Error!PageType {
     return switch (raw) {
         @intFromEnum(PageType.meta) => .meta,
@@ -68,24 +156,10 @@ fn decodePageType(raw: u8) Error!PageType {
     };
 }
 
-// TODO: repeat with meta.zig
-fn writeInt(comptime T: type, page: []u8, offset: usize, value: T) void {
-    var bytes: [@sizeOf(T)]u8 = undefined;
-    std.mem.writeInt(T, &bytes, value, .little);
-    std.mem.copyForwards(u8, page[offset .. offset + @sizeOf(T)], bytes[0..]);
-}
-
-// TODO: repeat with meta.zig
-fn readInt(comptime T: type, page: []const u8, offset: usize) T {
-    var bytes: [@sizeOf(T)]u8 = undefined;
-    std.mem.copyForwards(u8, bytes[0..], page[offset .. offset + @sizeOf(T)]);
-    return std.mem.readInt(T, &bytes, .little);
-}
-
-// ==========tests==========
+// ======tests=====
 
 test "encodeHeader decodeHeader round trip preserves fields" {
-    var page = [_]u8{0} ** 64;
+    var page_bytes = [_]u8{0} ** 64;
     const header = Header{
         .page_id = 42,
         .page_type = .leaf,
@@ -93,24 +167,24 @@ test "encodeHeader decodeHeader round trip preserves fields" {
         .order = 2,
     };
 
-    try encodeHeader(page[0..], header);
-    const decoded = try decodeHeader(page[0..]);
+    try encodeHeader(page_bytes[0..], header);
+    const decoded = try decodeHeader(page_bytes[0..]);
 
     try std.testing.expectEqualDeep(header, decoded);
 }
 
 test "decodeHeader rejects invalid page type" {
-    var page = [_]u8{0} ** header_size;
-    writeInt(u64, page[0..], page_id_offset, 1);
-    page[page_type_offset] = 255;
+    var page_bytes = [_]u8{0} ** header_size;
+    writeInt(u64, page_bytes[0..], page_id_offset, 1);
+    page_bytes[page_type_offset] = 255;
 
-    try std.testing.expectError(error.InvalidPageType, decodeHeader(page[0..]));
+    try std.testing.expectError(error.InvalidPageType, decodeHeader(page_bytes[0..]));
 }
 
 test "encodeHeader rejects page shorter than header" {
-    var page = [_]u8{0} ** (header_size - 1);
+    var page_bytes = [_]u8{0} ** (header_size - 1);
 
-    try std.testing.expectError(error.PageTooSmall, encodeHeader(page[0..], .{
+    try std.testing.expectError(error.PageTooSmall, encodeHeader(page_bytes[0..], .{
         .page_id = 1,
         .page_type = .branch,
         .count = 0,
@@ -119,9 +193,31 @@ test "encodeHeader rejects page shorter than header" {
 }
 
 test "decodeHeader rejects page shorter than header" {
-    var page = [_]u8{0} ** (header_size - 1);
+    var page_bytes = [_]u8{0} ** (header_size - 1);
 
-    try std.testing.expectError(error.PageTooSmall, decodeHeader(page[0..]));
+    try std.testing.expectError(error.PageTooSmall, decodeHeader(page_bytes[0..]));
+}
+
+test "encodeDataHeader decodeDataHeader round trip preserves fields" {
+    var page_bytes = [_]u8{0} ** data_header_size;
+    const header = DataHeader{
+        .lower = data_header_size,
+        .upper = data_header_size,
+        .flags = 3,
+    };
+
+    try encodeDataHeader(page_bytes[0..], header);
+    const decoded = try decodeDataHeader(page_bytes[0..]);
+
+    try std.testing.expectEqualDeep(header, decoded);
+}
+
+test "validateDataBounds accepts empty-page bounds" {
+    try validateDataBounds(4096, data_header_size, 4096);
+}
+
+test "validateDataBounds rejects lower larger than upper" {
+    try std.testing.expectError(error.InvalidPageLayout, validateDataBounds(4096, 40, 32));
 }
 
 test "spanSize uses base page size when order is zero" {
@@ -141,19 +237,19 @@ test "spanSize rejects overflow" {
 }
 
 test "decodeHeader leaves payload bytes untouched" {
-    var page = [_]u8{0} ** 64;
-    @memset(page[header_size..], 0xAB);
+    var page_bytes = [_]u8{0} ** 64;
+    @memset(page_bytes[header_size..], 0xAB);
 
-    try encodeHeader(page[0..], .{
+    try encodeHeader(page_bytes[0..], .{
         .page_id = 9,
         .page_type = .allocator,
         .count = 3,
         .order = 1,
     });
 
-    _ = try decodeHeader(page[0..]);
+    _ = try decodeHeader(page_bytes[0..]);
 
-    for (page[header_size..]) |byte| {
+    for (page_bytes[header_size..]) |byte| {
         try std.testing.expectEqual(@as(u8, 0xAB), byte);
     }
 }
