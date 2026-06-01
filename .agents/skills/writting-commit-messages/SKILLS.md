@@ -23,6 +23,10 @@ Write commit messages that follow commit style guidelines for the project.
 
 ## Rules
 
+- **One purpose per commit**: Each commit should express a single,
+  clear purpose. If the diff mixes unrelated changes, split them
+  into separate commits before writing the message.
+
 ### Subject line
 
 - **Subsystem prefix**: Use a short, lowercase identifier for the
