@@ -1,6 +1,7 @@
 const std = @import("std");
 const errors = @import("errors.zig");
 const meta = @import("meta.zig");
+const page = @import("page.zig");
 
 const default_page_size: u32 = 4096;
 const bootstrap_page_count: u64 = 3;
@@ -92,9 +93,8 @@ fn initializeEmptyDatabase(db: *DB) !void {
     const meta1_page = try meta.encode(db.allocator, initial_meta);
     defer db.allocator.free(meta1_page);
 
-    const root_page = try db.allocator.alloc(u8, default_page_size);
+    const root_page = try allocateEmptyRootPage(db.allocator, default_page_size, initial_meta.root_page_id);
     defer db.allocator.free(root_page);
-    @memset(root_page, 0);
 
     // TODO: atomic write for crash-safe, need to ponder neccessity on commit marker
     const io = db.io_threaded.io();
@@ -121,26 +121,41 @@ fn readPage(
     page_id: u64,
     page_size: u32,
 ) ![]u8 {
-    const page = try allocator.alloc(u8, page_size);
-    errdefer allocator.free(page);
+    const page_bytes = try allocator.alloc(u8, page_size);
+    errdefer allocator.free(page_bytes);
 
     var buffer: [256]u8 = undefined;
     var reader = file.reader(io, &buffer);
     try reader.seekTo(page_id * page_size);
-    try reader.interface.readSliceAll(page);
+    try reader.interface.readSliceAll(page_bytes);
 
-    return page;
+    return page_bytes;
 }
 
-fn writePage(file: *std.Io.File, io: std.Io, page_id: u64, page: []const u8) !void {
+fn writePage(file: *std.Io.File, io: std.Io, page_id: u64, page_bytes: []const u8) !void {
     var buffer: [256]u8 = undefined;
     var writer = file.writer(io, &buffer);
-    try writer.seekTo(page_id * page.len);
-    try writer.interface.writeAll(page);
+    try writer.seekTo(page_id * page_bytes.len);
+    try writer.interface.writeAll(page_bytes);
     try writer.interface.flush();
 }
 
-// ==========tests==========
+fn allocateEmptyRootPage(allocator: std.mem.Allocator, page_size: u32, page_id: u64) ![]u8 {
+    const root_page = try allocator.alloc(u8, page_size);
+    errdefer allocator.free(root_page);
+    @memset(root_page, 0);
+
+    // The bootstrap root is a real empty leaf page so the open path never has to special-case
+    // page 2 as an untyped placeholder during validation or later tree traversal.
+    try page.LeafPage.init(root_page, .{
+        .page_id = page_id,
+        .page_type = .leaf,
+        .count = 0,
+        .order = 0,
+    });
+
+    return root_page;
+}
 
 fn tempFilePath(buf: []u8, tmp_dir: std.Io.Dir, file_name: []const u8) ![]const u8 {
     var dir_path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
@@ -171,14 +186,37 @@ fn bootstrapFile(path: []const u8) !void {
     defer std.testing.allocator.free(meta0_page);
     const meta1_page = try meta.encode(std.testing.allocator, seeded_meta);
     defer std.testing.allocator.free(meta1_page);
-    const root_page = try std.testing.allocator.alloc(u8, default_page_size);
+    const root_page = try allocateEmptyRootPage(std.testing.allocator, default_page_size, seeded_meta.root_page_id);
     defer std.testing.allocator.free(root_page);
-    @memset(root_page, 0);
 
     try writePage(&file, io, 0, meta0_page);
     try writePage(&file, io, 1, meta1_page);
     try writePage(&file, io, 2, root_page);
 }
+
+fn writeSeededDatabase(path: []const u8, meta0: meta.Meta, meta1: meta.Meta) !void {
+    const io = std.testing.io;
+    var file = try std.Io.Dir.createFileAbsolute(io, path, .{
+        .read = true,
+        .truncate = true,
+    });
+    defer file.close(io);
+
+    const meta0_page = try meta.encode(std.testing.allocator, meta0);
+    defer std.testing.allocator.free(meta0_page);
+    const meta1_page = try meta.encode(std.testing.allocator, meta1);
+    defer std.testing.allocator.free(meta1_page);
+
+    const root_size = @max(meta0.page_size, meta1.page_size);
+    const root_page = try allocateEmptyRootPage(std.testing.allocator, root_size, 2);
+    defer std.testing.allocator.free(root_page);
+
+    try writePage(&file, io, 0, meta0_page);
+    try writePage(&file, io, 1, meta1_page);
+    try writePage(&file, io, 2, root_page);
+}
+
+// ======tests=====
 
 test "open returns DB for an existing file" {
     var tmp = std.testing.tmpDir(.{});
@@ -265,6 +303,23 @@ test "open writes identical valid meta pages on bootstrap" {
     try std.testing.expectEqualDeep(expected, decoded1);
 }
 
+test "open bootstraps a valid empty leaf root page" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path = try tempFilePath(&path_buf, tmp.dir, "bootstrap-root.db");
+
+    const db = try open(std.testing.allocator, path);
+    defer db.close();
+
+    const root_page = try readPage(std.testing.allocator, &db.file, db.io_threaded.io(), 2, default_page_size);
+    defer std.testing.allocator.free(root_page);
+
+    const leaf_page = try page.LeafPage.validate(root_page);
+    try std.testing.expectEqual(@as(u16, 0), leaf_page.count());
+}
+
 test "open recovers cached state from an existing valid database" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -324,10 +379,10 @@ test "open prefers only valid meta when the other one is invalid" {
         var file = try std.Io.Dir.openFileAbsolute(io, path, .{ .mode = .read_write });
         defer file.close(io);
 
-        const page = try readPage(std.testing.allocator, &file, io, 1, default_page_size);
-        defer std.testing.allocator.free(page);
+        const page_bytes = try readPage(std.testing.allocator, &file, io, 1, default_page_size);
+        defer std.testing.allocator.free(page_bytes);
 
-        var invalid_page = try std.testing.allocator.dupe(u8, page);
+        var invalid_page = try std.testing.allocator.dupe(u8, page_bytes);
         defer std.testing.allocator.free(invalid_page);
         invalid_page[12] ^= 0xFF;
         try writePage(&file, io, 1, invalid_page);
@@ -414,27 +469,4 @@ test "open maps invalid meta recovery into centralized db error" {
     }
 
     try std.testing.expectError(errors.DbOpenError.InvalidDatabaseFile, open(std.testing.allocator, path));
-}
-
-fn writeSeededDatabase(path: []const u8, meta0: meta.Meta, meta1: meta.Meta) !void {
-    const io = std.testing.io;
-    var file = try std.Io.Dir.createFileAbsolute(io, path, .{
-        .read = true,
-        .truncate = true,
-    });
-    defer file.close(io);
-
-    const meta0_page = try meta.encode(std.testing.allocator, meta0);
-    defer std.testing.allocator.free(meta0_page);
-    const meta1_page = try meta.encode(std.testing.allocator, meta1);
-    defer std.testing.allocator.free(meta1_page);
-
-    const root_size = @max(meta0.page_size, meta1.page_size);
-    const root_page = try std.testing.allocator.alloc(u8, root_size);
-    defer std.testing.allocator.free(root_page);
-    @memset(root_page, 0);
-
-    try writePage(&file, io, 0, meta0_page);
-    try writePage(&file, io, 1, meta1_page);
-    try writePage(&file, io, 2, root_page);
 }
