@@ -2,6 +2,7 @@ const std = @import("std");
 const errors = @import("errors.zig");
 const meta = @import("meta.zig");
 const page = @import("page.zig");
+const tree = @import("tree.zig");
 
 const default_page_size: u32 = 4096;
 const bootstrap_page_count: u64 = 3;
@@ -20,6 +21,15 @@ pub const DB = struct {
         self.allocator.free(self.path);
         self.io_threaded.deinit();
         self.allocator.destroy(self);
+    }
+
+    /// Returns an owned copy of the value for `key`, or `null` when the key is absent.
+    pub fn get(self: *DB, allocator: std.mem.Allocator, key: []const u8) !?[]u8 {
+        return tree.lookup(self, allocator, key);
+    }
+
+    pub fn readPageAlloc(self: *DB, allocator: std.mem.Allocator, page_id: u64) ![]u8 {
+        return readPage(allocator, &self.file, self.io_threaded.io(), page_id, self.page_size);
     }
 };
 
@@ -116,7 +126,7 @@ fn loadSelectedMeta(allocator: std.mem.Allocator, file: *std.Io.File, io: std.Io
 
 fn readPage(
     allocator: std.mem.Allocator,
-    file: *std.Io.File,
+    file: *const std.Io.File,
     io: std.Io,
     page_id: u64,
     page_size: u32,
