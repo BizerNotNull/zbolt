@@ -25,6 +25,8 @@ pub fn lookup(db: *db_mod.DB, allocator: std.mem.Allocator, key: []const u8) !?[
                 const leaf_page = try page.LeafPage.validate(page_bytes);
                 return try findInLeaf(leaf_page, allocator, key);
             },
+            // The read path only understands tree navigation pages. Reaching any
+            // other page type means the root or a child pointer escaped the tree.
             else => return error.UnexpectedPageType,
         }
     }
@@ -38,11 +40,15 @@ fn selectChild(branch_page: page.BranchPage, key: []const u8) !u64 {
     var index: u16 = 0;
     while (index < branch_page.count()) : (index += 1) {
         const entry = try branch_page.entry(index);
+        // Branch entries store upper bounds, so the first bound that is not less
+        // than the target identifies the subtree that may still contain the key.
         if (std.mem.order(u8, entry.key, key) != .lt) {
             return entry.child_page_id;
         }
     }
 
+    // A branch page that cannot route a search key violates the stored
+    // upper-bound invariant rather than representing a normal lookup miss.
     return TreeLookupError.CorruptTreePath;
 }
 
@@ -51,7 +57,11 @@ fn findInLeaf(leaf_page: page.LeafPage, allocator: std.mem.Allocator, key: []con
     while (index < leaf_page.count()) : (index += 1) {
         const entry = try leaf_page.entry(index);
         switch (std.mem.order(u8, entry.key, key)) {
+            // `lookup` frees the backing page buffer before returning, so callers
+            // receive an owned copy instead of a borrowed slice into page memory.
             .eq => return try allocator.dupe(u8, entry.value),
+            // Leaf entries are sorted, so once we pass the target key the page
+            // cannot contain a later match.
             .gt => return null,
             .lt => {},
         }
@@ -60,6 +70,10 @@ fn findInLeaf(leaf_page: page.LeafPage, allocator: std.mem.Allocator, key: []con
     return null;
 }
 
+// ======tests=====
+
+// Test helpers build on-disk fixtures that exercise the real `DB.open` and
+// `DB.get` path without mixing fixture details into the production API.
 fn tempFilePath(buf: []u8, tmp_dir: std.Io.Dir, file_name: []const u8) ![]const u8 {
     var dir_path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const dir_path_len = try tmp_dir.realPath(std.testing.io, &dir_path_buf);
