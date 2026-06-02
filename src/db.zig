@@ -32,47 +32,31 @@ pub const DB = struct {
         return tree.lookup(self, allocator, key);
     }
 
-    /// Commits a single-key update by copy-on-writing the current root leaf.
-    /// This minimal write path intentionally stops at leaf roots until branch
-    /// updates and page splitting are implemented.
+    /// Commits a single-key update by copy-on-writing the affected tree path.
     pub fn put(self: *DB, key: []const u8, value: []const u8) !void {
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         defer arena.deinit();
 
         const allocator = arena.allocator();
-        const root_page_bytes = try self.readPageAlloc(allocator, self.root_page_id);
-        const root_leaf = try page.LeafPage.validate(root_page_bytes);
-
-        var next_entries = std.ArrayList(page.LeafEntry).empty;
-        try collectUpdatedLeafEntries(&next_entries, root_leaf, allocator, key, value);
-
-        const next_root_page_id = self.high_water_mark + 1;
-        const next_root_page = try self.allocator.alloc(u8, self.page_size);
-        defer self.allocator.free(next_root_page);
-        @memset(next_root_page, 0);
-
-        _ = try page.LeafPage.encodeInto(next_root_page, .{
-            .page_id = next_root_page_id,
-            .page_type = .leaf,
-            .count = 0,
-            .order = root_leaf.header.order,
-        }, next_entries.items);
+        const write_result = try tree.writePut(self, allocator, key, value);
 
         const next_meta = meta.Meta{
             .page_size = self.page_size,
             .flags = self.flags,
-            .root_page_id = next_root_page_id,
+            .root_page_id = write_result.root_page_id,
             .allocator_root = self.allocator_root,
-            .high_water_mark = next_root_page_id,
+            .high_water_mark = write_result.high_water_mark,
             .txid = self.txid + 1,
         };
         const next_meta_page = try meta.encode(self.allocator, next_meta);
         defer self.allocator.free(next_meta_page);
 
         const io = self.io_threaded.io();
-        // The new leaf is written before the meta flip so recovery never sees a
-        // root pointer to a page whose contents were not persisted yet.
-        try writePage(&self.file, io, next_root_page_id, next_root_page);
+        // Dirty tree pages are written in child-to-root order, and the meta
+        // page remains the only commit point visible during recovery.
+        for (write_result.pages) |pending_page| {
+            try writePage(&self.file, io, pending_page.page_id, pending_page.bytes);
+        }
 
         const next_meta_slot = inactiveMetaSlot(self.meta_slot);
         // Meta pages act as the commit point. Writing the inactive slot last
@@ -234,54 +218,6 @@ fn allocateEmptyRootPage(allocator: std.mem.Allocator, page_size: u32, page_id: 
     return root_page;
 }
 
-fn collectUpdatedLeafEntries(
-    entries: *std.ArrayList(page.LeafEntry),
-    root_leaf: page.LeafPage,
-    allocator: std.mem.Allocator,
-    key: []const u8,
-    value: []const u8,
-) !void {
-    var inserted = false;
-    var index: u16 = 0;
-    while (index < root_leaf.count()) : (index += 1) {
-        const existing = try root_leaf.entry(index);
-        switch (std.mem.order(u8, existing.key, key)) {
-            .lt => try appendLeafEntry(entries, allocator, existing.key, existing.value, existing.flags),
-            .eq => {
-                // Preserve the stored flags on overwrite so the minimal writer
-                // only changes the key/value payload it was asked to replace.
-                try appendLeafEntry(entries, allocator, key, value, existing.flags);
-                inserted = true;
-            },
-            .gt => {
-                if (!inserted) {
-                    try appendLeafEntry(entries, allocator, key, value, 0);
-                    inserted = true;
-                }
-                try appendLeafEntry(entries, allocator, existing.key, existing.value, existing.flags);
-            },
-        }
-    }
-
-    if (!inserted) {
-        try appendLeafEntry(entries, allocator, key, value, 0);
-    }
-}
-
-fn appendLeafEntry(
-    entries: *std.ArrayList(page.LeafEntry),
-    allocator: std.mem.Allocator,
-    key: []const u8,
-    value: []const u8,
-    flags: u32,
-) !void {
-    try entries.append(allocator, .{
-        .key = try allocator.dupe(u8, key),
-        .value = try allocator.dupe(u8, value),
-        .flags = flags,
-    });
-}
-
 fn inactiveMetaSlot(slot: meta.MetaSlot) meta.MetaSlot {
     return switch (slot) {
         .meta0 => .meta1,
@@ -353,6 +289,100 @@ fn writeSeededDatabase(path: []const u8, meta0: meta.Meta, meta1: meta.Meta) !vo
     try writePage(&file, io, 0, meta0_page);
     try writePage(&file, io, 1, meta1_page);
     try writePage(&file, io, 2, root_page);
+}
+
+fn writeTreeDatabase(path: []const u8, root_page_id: u64, pages: []const []const u8) !void {
+    const io = std.testing.io;
+    var file = try std.Io.Dir.createFileAbsolute(io, path, .{
+        .read = true,
+        .truncate = true,
+    });
+    defer file.close(io);
+
+    const high_water_mark = 2 + pages.len - 1;
+    const seeded_meta = meta.Meta{
+        .page_size = default_page_size,
+        .flags = 0,
+        .root_page_id = root_page_id,
+        .allocator_root = 0,
+        .high_water_mark = high_water_mark,
+        .txid = 0,
+    };
+
+    const meta0_page = try meta.encode(std.testing.allocator, seeded_meta);
+    defer std.testing.allocator.free(meta0_page);
+    const meta1_page = try meta.encode(std.testing.allocator, seeded_meta);
+    defer std.testing.allocator.free(meta1_page);
+
+    try writePage(&file, io, 0, meta0_page);
+    try writePage(&file, io, 1, meta1_page);
+
+    for (pages, 0..) |page_bytes, index| {
+        try writePage(&file, io, 2 + index, page_bytes);
+    }
+}
+
+fn generatedKey(buf: []u8, index: usize) ![]const u8 {
+    return std.fmt.bufPrint(buf, "k{d:0>4}", .{index});
+}
+
+fn fillFixedValue(buf: []u8, byte: u8) []const u8 {
+    @memset(buf, byte);
+    return buf;
+}
+
+fn appendGeneratedLeafEntries(
+    entries: *std.ArrayList(page.LeafEntry),
+    allocator: std.mem.Allocator,
+    start: usize,
+    count: usize,
+    value_len: usize,
+) !void {
+    var index: usize = 0;
+    while (index < count) : (index += 1) {
+        var key_buf: [5]u8 = undefined;
+        const key = try generatedKey(&key_buf, start + index);
+        const value = try allocator.alloc(u8, value_len);
+        @memset(value, 'x');
+
+        try entries.append(allocator, .{
+            .key = try allocator.dupe(u8, key),
+            .value = value,
+            .flags = 0,
+        });
+    }
+}
+
+fn encodeLeafFixture(page_id: u64, entries: []const page.LeafEntry) ![default_page_size]u8 {
+    var leaf_page = [_]u8{0} ** default_page_size;
+    _ = try page.LeafPage.encodeInto(leaf_page[0..], .{
+        .page_id = page_id,
+        .page_type = .leaf,
+        .count = 0,
+        .order = 0,
+    }, entries);
+    return leaf_page;
+}
+
+fn expectBranchRootMatchesChildren(db: *DB) !void {
+    const root_page = try db.readPageAlloc(std.testing.allocator, db.root_page_id);
+    defer std.testing.allocator.free(root_page);
+
+    const branch_page = try page.BranchPage.validate(root_page);
+    try std.testing.expectEqual(@as(u16, 2), branch_page.count());
+
+    var index: u16 = 0;
+    while (index < branch_page.count()) : (index += 1) {
+        const branch_entry = try branch_page.entry(index);
+        const child_page_bytes = try db.readPageAlloc(std.testing.allocator, branch_entry.child_page_id);
+        defer std.testing.allocator.free(child_page_bytes);
+
+        const child_leaf = try page.LeafPage.validate(child_page_bytes);
+        try std.testing.expect(child_leaf.count() > 0);
+
+        const child_max = try child_leaf.entry(child_leaf.count() - 1);
+        try std.testing.expectEqualSlices(u8, child_max.key, branch_entry.key);
+    }
 }
 
 // ======tests=====
@@ -685,12 +715,231 @@ test "put inserts in sorted order and overwrites existing keys across reopen" {
     try std.testing.expectEqualSlices(u8, "updated", second.value);
 }
 
-test "put rejects non-leaf roots until branch commits exist" {
+test "put splits a full root leaf into a branch root" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
-    const path = try tempFilePath(&path_buf, tmp.dir, "put-branch-root.db");
+    const path = try tempFilePath(&path_buf, tmp.dir, "put-root-split.db");
+
+    {
+        const db = try open(std.testing.allocator, path);
+        defer db.close();
+
+        var value_buf: [160]u8 = undefined;
+        const value = fillFixedValue(&value_buf, 'x');
+
+        var index: usize = 0;
+        while (index < 24) : (index += 1) {
+            var key_buf: [5]u8 = undefined;
+            const key = try generatedKey(&key_buf, index);
+            try db.put(key, value);
+        }
+
+        try std.testing.expectEqual(@as(u64, 28), db.high_water_mark);
+        try std.testing.expectEqual(@as(u64, 24), db.txid);
+        try expectBranchRootMatchesChildren(db);
+
+        const selected = try loadSelectedMeta(std.testing.allocator, &db.file, db.io_threaded.io(), db.page_size);
+        try std.testing.expectEqual(db.root_page_id, selected.meta.root_page_id);
+        try std.testing.expectEqual(db.high_water_mark, selected.meta.high_water_mark);
+        try std.testing.expectEqual(db.txid, selected.meta.txid);
+    }
+
+    const reopened = try open(std.testing.allocator, path);
+    defer reopened.close();
+
+    var index: usize = 0;
+    while (index < 24) : (index += 1) {
+        var key_buf: [5]u8 = undefined;
+        const key = try generatedKey(&key_buf, index);
+
+        const value = (try reopened.get(std.testing.allocator, key)).?;
+        defer std.testing.allocator.free(value);
+        try std.testing.expectEqual(@as(usize, 160), value.len);
+        try std.testing.expectEqual(@as(u8, 'x'), value[0]);
+    }
+
+    try expectBranchRootMatchesChildren(reopened);
+}
+
+test "put updates a branch-root leaf child without changing its upper bound" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path = try tempFilePath(&path_buf, tmp.dir, "put-branch-update.db");
+
+    var branch_root = [_]u8{0} ** default_page_size;
+    _ = try page.BranchPage.encodeInto(branch_root[0..], .{
+        .page_id = 2,
+        .page_type = .branch,
+        .count = 0,
+        .order = 0,
+    }, &.{
+        .{ .key = "beta", .child_page_id = 3 },
+        .{ .key = "omega", .child_page_id = 4 },
+    });
+
+    const left_leaf = try encodeLeafFixture(3, &.{
+        .{ .key = "alpha", .value = "one", .flags = 0 },
+        .{ .key = "beta", .value = "two", .flags = 0 },
+    });
+    const right_leaf = try encodeLeafFixture(4, &.{
+        .{ .key = "gamma", .value = "three", .flags = 0 },
+        .{ .key = "omega", .value = "last", .flags = 0 },
+    });
+
+    try writeTreeDatabase(path, 2, &.{
+        branch_root[0..],
+        left_leaf[0..],
+        right_leaf[0..],
+    });
+
+    const db = try open(std.testing.allocator, path);
+    defer db.close();
+
+    try db.put("alpha", "updated");
+
+    try std.testing.expectEqual(@as(u64, 6), db.root_page_id);
+    try std.testing.expectEqual(@as(u64, 6), db.high_water_mark);
+    try std.testing.expectEqual(@as(u64, 1), db.txid);
+
+    const value = (try db.get(std.testing.allocator, "alpha")).?;
+    defer std.testing.allocator.free(value);
+    try std.testing.expectEqualSlices(u8, "updated", value);
+    try expectBranchRootMatchesChildren(db);
+
+    const root_page = try db.readPageAlloc(std.testing.allocator, db.root_page_id);
+    defer std.testing.allocator.free(root_page);
+    const branch_page = try page.BranchPage.validate(root_page);
+    const first = try branch_page.entry(0);
+    try std.testing.expectEqualSlices(u8, "beta", first.key);
+}
+
+test "put appends past the largest branch upper bound into the rightmost child" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path = try tempFilePath(&path_buf, tmp.dir, "put-branch-append.db");
+
+    var branch_root = [_]u8{0} ** default_page_size;
+    _ = try page.BranchPage.encodeInto(branch_root[0..], .{
+        .page_id = 2,
+        .page_type = .branch,
+        .count = 0,
+        .order = 0,
+    }, &.{
+        .{ .key = "beta", .child_page_id = 3 },
+        .{ .key = "omega", .child_page_id = 4 },
+    });
+
+    const left_leaf = try encodeLeafFixture(3, &.{
+        .{ .key = "alpha", .value = "one", .flags = 0 },
+        .{ .key = "beta", .value = "two", .flags = 0 },
+    });
+    const right_leaf = try encodeLeafFixture(4, &.{
+        .{ .key = "gamma", .value = "three", .flags = 0 },
+        .{ .key = "omega", .value = "last", .flags = 0 },
+    });
+
+    try writeTreeDatabase(path, 2, &.{
+        branch_root[0..],
+        left_leaf[0..],
+        right_leaf[0..],
+    });
+
+    const db = try open(std.testing.allocator, path);
+    defer db.close();
+
+    try db.put("zzzz", "tail");
+
+    const value = (try db.get(std.testing.allocator, "zzzz")).?;
+    defer std.testing.allocator.free(value);
+    try std.testing.expectEqualSlices(u8, "tail", value);
+    try expectBranchRootMatchesChildren(db);
+
+    const root_page = try db.readPageAlloc(std.testing.allocator, db.root_page_id);
+    defer std.testing.allocator.free(root_page);
+    const branch_page = try page.BranchPage.validate(root_page);
+    const second = try branch_page.entry(1);
+    try std.testing.expectEqualSlices(u8, "zzzz", second.key);
+}
+
+test "put rejects unsupported branch child split before changing commit state" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path = try tempFilePath(&path_buf, tmp.dir, "put-child-split-unsupported.db");
+
+    var left_entries = std.ArrayList(page.LeafEntry).empty;
+    try appendGeneratedLeafEntries(&left_entries, std.testing.allocator, 0, 1, 160);
+    defer {
+        for (left_entries.items) |entry| {
+            std.testing.allocator.free(entry.key);
+            std.testing.allocator.free(entry.value);
+        }
+        left_entries.deinit(std.testing.allocator);
+    }
+
+    var right_entries = std.ArrayList(page.LeafEntry).empty;
+    try appendGeneratedLeafEntries(&right_entries, std.testing.allocator, 1, 23, 160);
+    defer {
+        for (right_entries.items) |entry| {
+            std.testing.allocator.free(entry.key);
+            std.testing.allocator.free(entry.value);
+        }
+        right_entries.deinit(std.testing.allocator);
+    }
+
+    const left_leaf = try encodeLeafFixture(3, left_entries.items);
+    const right_leaf = try encodeLeafFixture(4, right_entries.items);
+
+    var branch_root = [_]u8{0} ** default_page_size;
+    _ = try page.BranchPage.encodeInto(branch_root[0..], .{
+        .page_id = 2,
+        .page_type = .branch,
+        .count = 0,
+        .order = 0,
+    }, &.{
+        .{ .key = left_entries.items[left_entries.items.len - 1].key, .child_page_id = 3 },
+        .{ .key = right_entries.items[right_entries.items.len - 1].key, .child_page_id = 4 },
+    });
+
+    try writeTreeDatabase(path, 2, &.{
+        branch_root[0..],
+        left_leaf[0..],
+        right_leaf[0..],
+    });
+
+    const db = try open(std.testing.allocator, path);
+    defer db.close();
+
+    const old_root_page_id = db.root_page_id;
+    const old_high_water_mark = db.high_water_mark;
+    const old_txid = db.txid;
+    const old_meta_slot = db.meta_slot;
+
+    var value_buf: [160]u8 = undefined;
+    try std.testing.expectError(
+        tree.TreeWriteError.UnsupportedChildSplit,
+        db.put("zzzz", fillFixedValue(&value_buf, 'y')),
+    );
+
+    try std.testing.expectEqual(old_root_page_id, db.root_page_id);
+    try std.testing.expectEqual(old_high_water_mark, db.high_water_mark);
+    try std.testing.expectEqual(old_txid, db.txid);
+    try std.testing.expectEqual(old_meta_slot, db.meta_slot);
+}
+
+test "put rejects non-tree root pages" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path = try tempFilePath(&path_buf, tmp.dir, "put-non-tree-root.db");
 
     try bootstrapFile(path);
 
@@ -700,12 +949,17 @@ test "put rejects non-leaf roots until branch commits exist" {
         defer file.close(io);
 
         var branch_root = [_]u8{0} ** default_page_size;
-        _ = try page.BranchPage.encodeInto(branch_root[0..], .{
+        try page.encodeHeader(branch_root[0..], .{
             .page_id = 2,
-            .page_type = .branch,
+            .page_type = .allocator,
             .count = 0,
             .order = 0,
-        }, &.{});
+        });
+        try page.encodeDataHeader(branch_root[0..], .{
+            .lower = page.data_header_size,
+            .upper = default_page_size,
+            .flags = 0,
+        });
         try writePage(&file, io, 2, branch_root[0..]);
     }
 

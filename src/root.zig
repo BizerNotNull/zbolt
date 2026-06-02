@@ -8,6 +8,7 @@ pub const PageError = page.Error;
 pub const PageLayoutError = page.LayoutError;
 pub const DbOpenError = errors.DbOpenError;
 pub const TreeLookupError = tree.TreeLookupError;
+pub const TreeWriteError = tree.TreeWriteError;
 pub const MetaSlot = meta.MetaSlot;
 pub const SelectedMeta = meta.SelectedMeta;
 pub const PageHeader = page.Header;
