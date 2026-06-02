@@ -270,7 +270,9 @@ fn writeBranchRootPut(
         else => return err,
     };
 
-    const branch_entries = try collectBranchFiniteEntries(allocator, root_branch);
+    var branch_entries = try collectBranchFiniteEntries(allocator, root_branch);
+    defer deinitBranchEntries(&branch_entries, allocator);
+
     const rightmost_child_page_id = replaceBranchChild(
         branch_entries.items,
         root_branch.rightmostChildPageId(),
@@ -327,6 +329,7 @@ fn splitBranchChildLeaf(
         allocator.free(split_pages.right_page);
         return err;
     };
+    defer deinitBranchEntries(&branch_entries, allocator);
 
     const rightmost_child_page_id = replaceBranchChildAndInsertFence(
         &branch_entries,
@@ -425,17 +428,29 @@ fn collectBranchFiniteEntries(
     branch_page: page.BranchPage,
 ) !std.ArrayList(page.BranchEntry) {
     var branch_entries = std.ArrayList(page.BranchEntry).empty;
+    errdefer deinitBranchEntries(&branch_entries, allocator);
 
     var index: u16 = 0;
     while (index < branch_page.count()) : (index += 1) {
         const existing = try branch_page.entry(index);
-        try branch_entries.append(allocator, .{
-            .key = try allocator.dupe(u8, existing.key),
+        const key = try allocator.dupe(u8, existing.key);
+        branch_entries.append(allocator, .{
+            .key = key,
             .child_page_id = existing.child_page_id,
-        });
+        }) catch |err| {
+            allocator.free(key);
+            return err;
+        };
     }
 
     return branch_entries;
+}
+
+fn deinitBranchEntries(entries: *std.ArrayList(page.BranchEntry), allocator: std.mem.Allocator) void {
+    for (entries.items) |entry| {
+        allocator.free(entry.key);
+    }
+    entries.deinit(allocator);
 }
 
 fn replaceBranchChild(
@@ -465,18 +480,26 @@ fn replaceBranchChildAndInsertFence(
     switch (routed_child) {
         .finite_left => |index| {
             const insertion_index: usize = index;
-            try entries.insert(allocator, insertion_index, .{
-                .key = try allocator.dupe(u8, new_fence_key),
+            const key = try allocator.dupe(u8, new_fence_key);
+            entries.insert(allocator, insertion_index, .{
+                .key = key,
                 .child_page_id = left_page_id,
-            });
+            }) catch |err| {
+                allocator.free(key);
+                return err;
+            };
             entries.items[insertion_index + 1].child_page_id = right_page_id;
             return rightmost_child_page_id;
         },
         .rightmost => {
-            try entries.append(allocator, .{
-                .key = try allocator.dupe(u8, new_fence_key),
+            const key = try allocator.dupe(u8, new_fence_key);
+            entries.append(allocator, .{
+                .key = key,
                 .child_page_id = left_page_id,
-            });
+            }) catch |err| {
+                allocator.free(key);
+                return err;
+            };
             return right_page_id;
         },
     }
