@@ -30,3 +30,9 @@ pub const DbOpenError = error{
     InvalidDatabaseFile,
     DatabaseFileTooSmall,
 };
+
+pub const DbWriteError = error{
+    RootPageNotWritableLeaf,
+    UnsupportedWriteTree,
+    LeafSplitRequired,
+};

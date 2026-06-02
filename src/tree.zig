@@ -2,10 +2,17 @@ const std = @import("std");
 const meta = @import("meta.zig");
 const page = @import("page.zig");
 const db_mod = @import("db.zig");
+const errors = @import("errors.zig");
 const test_page_size = 4096;
 
 pub const TreeLookupError = error{
     CorruptTreePath,
+};
+
+const OwnedLeafEntry = struct {
+    key: []u8,
+    value: []u8,
+    flags: u32,
 };
 
 pub fn lookup(db: *db_mod.DB, allocator: std.mem.Allocator, key: []const u8) !?[]u8 {
@@ -29,6 +36,30 @@ pub fn lookup(db: *db_mod.DB, allocator: std.mem.Allocator, key: []const u8) !?[
             // other page type means the root or a child pointer escaped the tree.
             else => return error.UnexpectedPageType,
         }
+    }
+}
+
+pub fn rewriteSingleLeafRoot(
+    allocator: std.mem.Allocator,
+    root_page_bytes: []const u8,
+    key: []const u8,
+    value: []const u8,
+    new_page_id: u64,
+) ![]u8 {
+    const header = try page.decodeHeader(root_page_bytes);
+    switch (header.page_type) {
+        .leaf => {
+            const leaf_page = try page.LeafPage.validate(root_page_bytes);
+            const current_entries = try readOwnedLeafEntries(allocator, leaf_page);
+            defer freeOwnedLeafEntries(allocator, current_entries);
+
+            const next_entries = try upsertOwnedLeafEntries(allocator, current_entries, key, value);
+            defer freeOwnedLeafEntries(allocator, next_entries);
+
+            return encodeOwnedLeafEntries(allocator, root_page_bytes.len, new_page_id, header.order, next_entries);
+        },
+        .branch => return errors.DbWriteError.UnsupportedWriteTree,
+        else => return errors.DbWriteError.RootPageNotWritableLeaf,
     }
 }
 
@@ -68,6 +99,133 @@ fn findInLeaf(leaf_page: page.LeafPage, allocator: std.mem.Allocator, key: []con
     }
 
     return null;
+}
+
+fn readOwnedLeafEntries(allocator: std.mem.Allocator, leaf_page: page.LeafPage) ![]OwnedLeafEntry {
+    const entries = try allocator.alloc(OwnedLeafEntry, leaf_page.count());
+    errdefer allocator.free(entries);
+
+    var initialized: usize = 0;
+    errdefer freeOwnedLeafEntriesPartial(allocator, entries, initialized);
+
+    var index: u16 = 0;
+    while (index < leaf_page.count()) : (index += 1) {
+        const entry = try leaf_page.entry(index);
+        entries[index] = .{
+            .key = try allocator.dupe(u8, entry.key),
+            .value = try allocator.dupe(u8, entry.value),
+            .flags = entry.flags,
+        };
+        initialized += 1;
+    }
+
+    return entries;
+}
+
+fn upsertOwnedLeafEntries(
+    allocator: std.mem.Allocator,
+    entries: []const OwnedLeafEntry,
+    key: []const u8,
+    value: []const u8,
+) ![]OwnedLeafEntry {
+    var insert_index: usize = entries.len;
+    var replace_index: ?usize = null;
+
+    for (entries, 0..) |entry, index| {
+        switch (std.mem.order(u8, entry.key, key)) {
+            .eq => {
+                replace_index = index;
+                insert_index = index;
+                break;
+            },
+            .gt => {
+                insert_index = index;
+                break;
+            },
+            .lt => {},
+        }
+    }
+
+    const next_len = if (replace_index == null) entries.len + 1 else entries.len;
+    const next_entries = try allocator.alloc(OwnedLeafEntry, next_len);
+    errdefer allocator.free(next_entries);
+
+    var initialized: usize = 0;
+    errdefer freeOwnedLeafEntriesPartial(allocator, next_entries, initialized);
+
+    var source_index: usize = 0;
+    var dest_index: usize = 0;
+    while (dest_index < next_len) : (dest_index += 1) {
+        if (dest_index == insert_index) {
+            next_entries[dest_index] = .{
+                .key = try allocator.dupe(u8, key),
+                .value = try allocator.dupe(u8, value),
+                .flags = if (replace_index) |index| entries[index].flags else 0,
+            };
+            initialized += 1;
+            if (replace_index != null) source_index += 1;
+            continue;
+        }
+
+        next_entries[dest_index] = .{
+            .key = try allocator.dupe(u8, entries[source_index].key),
+            .value = try allocator.dupe(u8, entries[source_index].value),
+            .flags = entries[source_index].flags,
+        };
+        initialized += 1;
+        source_index += 1;
+    }
+
+    return next_entries;
+}
+
+fn encodeOwnedLeafEntries(
+    allocator: std.mem.Allocator,
+    page_size: usize,
+    page_id: u64,
+    order: u8,
+    entries: []const OwnedLeafEntry,
+) ![]u8 {
+    const page_bytes = try allocator.alloc(u8, page_size);
+    errdefer allocator.free(page_bytes);
+    @memset(page_bytes, 0);
+
+    const borrowed_entries = try allocator.alloc(page.LeafEntry, entries.len);
+    defer allocator.free(borrowed_entries);
+
+    for (entries, 0..) |entry, index| {
+        borrowed_entries[index] = .{
+            .key = entry.key,
+            .value = entry.value,
+            .flags = entry.flags,
+        };
+    }
+
+    // v1 stops at the first page-full result so the write path stays append-only
+    // until leaf splitting and parent updates are implemented together.
+    _ = page.LeafPage.encodeInto(page_bytes, .{
+        .page_id = page_id,
+        .page_type = .leaf,
+        .count = 0,
+        .order = order,
+    }, borrowed_entries) catch |err| switch (err) {
+        error.PageFull => return errors.DbWriteError.LeafSplitRequired,
+        else => return err,
+    };
+
+    return page_bytes;
+}
+
+fn freeOwnedLeafEntries(allocator: std.mem.Allocator, entries: []OwnedLeafEntry) void {
+    freeOwnedLeafEntriesPartial(allocator, entries, entries.len);
+    allocator.free(entries);
+}
+
+fn freeOwnedLeafEntriesPartial(allocator: std.mem.Allocator, entries: []OwnedLeafEntry, initialized: usize) void {
+    for (entries[0..initialized]) |entry| {
+        allocator.free(entry.key);
+        allocator.free(entry.value);
+    }
 }
 
 // ======tests=====
@@ -449,4 +607,84 @@ test "DB.get integrates facade lookup against a real file" {
     defer std.testing.allocator.free(value);
 
     try std.testing.expectEqualSlices(u8, "one", value);
+}
+
+test "rewriteSingleLeafRoot inserts a missing key in sorted order" {
+    var root_page_bytes = [_]u8{0} ** test_page_size;
+    _ = try page.LeafPage.encodeInto(root_page_bytes[0..], .{
+        .page_id = 2,
+        .page_type = .leaf,
+        .count = 0,
+        .order = 0,
+    }, &.{
+        .{ .key = "alpha", .value = "one", .flags = 0 },
+        .{ .key = "gamma", .value = "three", .flags = 0 },
+    });
+
+    const next_page = try rewriteSingleLeafRoot(std.testing.allocator, root_page_bytes[0..], "beta", "two", 3);
+    defer std.testing.allocator.free(next_page);
+
+    const leaf_page = try page.LeafPage.validate(next_page);
+    try std.testing.expectEqual(@as(u16, 3), leaf_page.count());
+    try std.testing.expectEqualSlices(u8, "alpha", (try leaf_page.entry(0)).key);
+    try std.testing.expectEqualSlices(u8, "beta", (try leaf_page.entry(1)).key);
+    try std.testing.expectEqualSlices(u8, "gamma", (try leaf_page.entry(2)).key);
+    try std.testing.expectEqualSlices(u8, "two", (try leaf_page.entry(1)).value);
+}
+
+test "rewriteSingleLeafRoot replaces an existing key without duplicating it" {
+    var root_page_bytes = [_]u8{0} ** test_page_size;
+    _ = try page.LeafPage.encodeInto(root_page_bytes[0..], .{
+        .page_id = 2,
+        .page_type = .leaf,
+        .count = 0,
+        .order = 0,
+    }, &.{
+        .{ .key = "alpha", .value = "one", .flags = 0 },
+        .{ .key = "beta", .value = "two", .flags = 7 },
+    });
+
+    const next_page = try rewriteSingleLeafRoot(std.testing.allocator, root_page_bytes[0..], "beta", "updated", 3);
+    defer std.testing.allocator.free(next_page);
+
+    const leaf_page = try page.LeafPage.validate(next_page);
+    try std.testing.expectEqual(@as(u16, 2), leaf_page.count());
+    const second = try leaf_page.entry(1);
+    try std.testing.expectEqualSlices(u8, "beta", second.key);
+    try std.testing.expectEqualSlices(u8, "updated", second.value);
+    try std.testing.expectEqual(@as(u32, 7), second.flags);
+}
+
+test "rewriteSingleLeafRoot reports leaf split requirement when page is full" {
+    var root_page_bytes = [_]u8{0} ** 48;
+    _ = try page.LeafPage.encodeInto(root_page_bytes[0..], .{
+        .page_id = 2,
+        .page_type = .leaf,
+        .count = 0,
+        .order = 0,
+    }, &.{
+        .{ .key = "abcdef", .value = "ghijkl", .flags = 0 },
+    });
+
+    try std.testing.expectError(
+        errors.DbWriteError.LeafSplitRequired,
+        rewriteSingleLeafRoot(std.testing.allocator, root_page_bytes[0..], "z", "1", 3),
+    );
+}
+
+test "rewriteSingleLeafRoot rejects branch roots until branch writes exist" {
+    var root_page_bytes = [_]u8{0} ** test_page_size;
+    _ = try page.BranchPage.encodeInto(root_page_bytes[0..], .{
+        .page_id = 2,
+        .page_type = .branch,
+        .count = 0,
+        .order = 0,
+    }, &.{
+        .{ .key = "omega", .child_page_id = 3 },
+    });
+
+    try std.testing.expectError(
+        errors.DbWriteError.UnsupportedWriteTree,
+        rewriteSingleLeafRoot(std.testing.allocator, root_page_bytes[0..], "alpha", "one", 3),
+    );
 }
