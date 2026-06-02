@@ -26,6 +26,16 @@ pub const WriteResult = struct {
     pages: []const PendingPage,
 };
 
+const RoutedChild = union(enum) {
+    finite_left: u16,
+    rightmost,
+};
+
+const RoutedPage = struct {
+    child: RoutedChild,
+    page_id: u64,
+};
+
 pub fn lookup(db: *db_mod.DB, allocator: std.mem.Allocator, key: []const u8) !?[]u8 {
     var page_id = db.root_page_id;
 
@@ -37,7 +47,7 @@ pub fn lookup(db: *db_mod.DB, allocator: std.mem.Allocator, key: []const u8) !?[
         switch (header.page_type) {
             .branch => {
                 const branch_page = try page.BranchPage.validate(page_bytes);
-                page_id = try selectChild(branch_page, key);
+                page_id = (try routeChild(branch_page, key)).page_id;
             },
             .leaf => {
                 const leaf_page = try page.LeafPage.validate(page_bytes);
@@ -66,36 +76,33 @@ fn readTreePage(db: *db_mod.DB, allocator: std.mem.Allocator, page_id: u64) ![]u
     return db.readPageAlloc(allocator, page_id);
 }
 
-fn selectChild(branch_page: page.BranchPage, key: []const u8) !u64 {
+fn routeChild(branch_page: page.BranchPage, key: []const u8) !RoutedPage {
     var index: u16 = 0;
     while (index < branch_page.count()) : (index += 1) {
         const entry = try branch_page.entry(index);
-        // Branch entries store upper bounds, so the first bound that is not less
-        // than the target identifies the subtree that may still contain the key.
-        if (std.mem.order(u8, entry.key, key) != .lt) {
-            return entry.child_page_id;
+        // Finite fences are exclusive for their left child. Equality belongs to
+        // the child on the right, so routing uses the first fence greater than the key.
+        if (std.mem.order(u8, key, entry.key) == .lt) {
+            return .{
+                .child = .{ .finite_left = index },
+                .page_id = entry.child_page_id,
+            };
         }
     }
 
-    // A branch page that cannot route a search key violates the stored
-    // upper-bound invariant rather than representing a normal lookup miss.
-    return TreeLookupError.CorruptTreePath;
+    const rightmost_child_page_id = branch_page.rightmostChildPageId();
+    if (rightmost_child_page_id == page.branch.invalid_child_page_id) return TreeLookupError.CorruptTreePath;
+    return .{
+        .child = .rightmost,
+        .page_id = rightmost_child_page_id,
+    };
 }
 
-fn selectChildIndexForPut(branch_page: page.BranchPage, key: []const u8) !u16 {
-    if (branch_page.count() == 0) return TreeWriteError.EmptyBranchRoot;
-
-    var index: u16 = 0;
-    while (index < branch_page.count()) : (index += 1) {
-        const entry = try branch_page.entry(index);
-        if (std.mem.order(u8, entry.key, key) != .lt) {
-            return index;
-        }
-    }
-
-    // Writes past the current largest upper bound extend the rightmost child
-    // instead of treating the path as corrupt like the read-only lookup path.
-    return branch_page.count() - 1;
+fn routeChildForPut(branch_page: page.BranchPage, key: []const u8) !RoutedPage {
+    return routeChild(branch_page, key) catch |err| switch (err) {
+        TreeLookupError.CorruptTreePath => return TreeWriteError.EmptyBranchRoot,
+        else => return err,
+    };
 }
 
 fn findInLeaf(leaf_page: page.LeafPage, allocator: std.mem.Allocator, key: []const u8) !?[]u8 {
@@ -193,10 +200,9 @@ fn splitRootLeaf(
         };
 
         const branch_entries = [_]page.BranchEntry{
-            .{ .key = maxKey(entries[0..split_index]), .child_page_id = left_id },
-            .{ .key = maxKey(entries[split_index..]), .child_page_id = right_id },
+            .{ .key = minKey(entries[split_index..]), .child_page_id = left_id },
         };
-        const root_page = encodeBranchPageAlloc(allocator, db.page_size, root_id, 0, &branch_entries) catch |err| {
+        const root_page = encodeBranchPageAlloc(allocator, db.page_size, root_id, 0, &branch_entries, right_id) catch |err| {
             allocator.free(left_page);
             allocator.free(right_page);
             return err;
@@ -225,10 +231,9 @@ fn writeBranchRootPut(
     value: []const u8,
 ) !WriteResult {
     const root_branch = try page.BranchPage.validate(root_page_bytes);
-    const child_index = try selectChildIndexForPut(root_branch, key);
-    const child_entry = try root_branch.entry(child_index);
+    const routed_child = try routeChildForPut(root_branch, key);
 
-    const child_page_bytes = try readTreePage(db, allocator, child_entry.child_page_id);
+    const child_page_bytes = try readTreePage(db, allocator, routed_child.page_id);
     defer allocator.free(child_page_bytes);
 
     const child_header = try page.decodeHeader(child_page_bytes);
@@ -255,9 +260,9 @@ fn writeBranchRootPut(
     var index: u16 = 0;
     while (index < root_branch.count()) : (index += 1) {
         const existing = try root_branch.entry(index);
-        if (index == child_index) {
+        if (routed_child.child == .finite_left and routed_child.child.finite_left == index) {
             try branch_entries.append(allocator, .{
-                .key = maxKey(next_child_entries.items),
+                .key = try allocator.dupe(u8, existing.key),
                 .child_page_id = new_child_id,
             });
         } else {
@@ -267,6 +272,10 @@ fn writeBranchRootPut(
             });
         }
     }
+    const rightmost_child_page_id = switch (routed_child.child) {
+        .finite_left => root_branch.rightmostChildPageId(),
+        .rightmost => new_child_id,
+    };
 
     const new_root_page = encodeBranchPageAlloc(
         allocator,
@@ -274,6 +283,7 @@ fn writeBranchRootPut(
         new_root_id,
         root_branch.header.order,
         branch_entries.items,
+        rightmost_child_page_id,
     ) catch |err| {
         allocator.free(new_child_page);
         return err;
@@ -363,6 +373,7 @@ fn encodeBranchPageAlloc(
     page_id: u64,
     order: u8,
     entries: []const page.BranchEntry,
+    rightmost_child_page_id: u64,
 ) ![]u8 {
     const page_bytes = try allocator.alloc(u8, page_size);
     errdefer allocator.free(page_bytes);
@@ -373,14 +384,14 @@ fn encodeBranchPageAlloc(
         .page_type = .branch,
         .count = 0,
         .order = order,
-    }, entries);
+    }, entries, rightmost_child_page_id);
 
     return page_bytes;
 }
 
-fn maxKey(entries: []const page.LeafEntry) []const u8 {
+fn minKey(entries: []const page.LeafEntry) []const u8 {
     std.debug.assert(entries.len > 0);
-    return entries[entries.len - 1].key;
+    return entries[0].key;
 }
 
 // ======tests=====
@@ -537,7 +548,7 @@ test "lookup stops when a leaf entry key is already greater than target" {
     try std.testing.expect(value == null);
 }
 
-test "lookup descends through branch pages using upper-bound routing" {
+test "lookup routes through branch pages using exclusive fences" {
     const page_size = test_page_size;
     var branch_page_bytes = [_]u8{0} ** page_size;
     _ = try page.BranchPage.encodeInto(branch_page_bytes[0..], .{
@@ -546,9 +557,8 @@ test "lookup descends through branch pages using upper-bound routing" {
         .count = 0,
         .order = 0,
     }, &.{
-        .{ .key = "beta", .child_page_id = 3 },
-        .{ .key = "omega", .child_page_id = 4 },
-    });
+        .{ .key = "gamma", .child_page_id = 3 },
+    }, 4);
 
     var left_leaf_bytes = [_]u8{0} ** page_size;
     _ = try page.LeafPage.encodeInto(left_leaf_bytes[0..], .{
@@ -582,10 +592,10 @@ test "lookup descends through branch pages using upper-bound routing" {
     });
     defer db.close();
 
-    const value = (try lookup(db, std.testing.allocator, "omega")).?;
+    const value = (try lookup(db, std.testing.allocator, "gamma")).?;
     defer std.testing.allocator.free(value);
 
-    try std.testing.expectEqualSlices(u8, "last", value);
+    try std.testing.expectEqualSlices(u8, "three", value);
 }
 
 test "lookup returns null after descending through branch pages" {
@@ -597,9 +607,8 @@ test "lookup returns null after descending through branch pages" {
         .count = 0,
         .order = 0,
     }, &.{
-        .{ .key = "beta", .child_page_id = 3 },
-        .{ .key = "omega", .child_page_id = 4 },
-    });
+        .{ .key = "gamma", .child_page_id = 3 },
+    }, 4);
 
     var left_leaf_bytes = [_]u8{0} ** page_size;
     _ = try page.LeafPage.encodeInto(left_leaf_bytes[0..], .{
@@ -638,7 +647,7 @@ test "lookup returns null after descending through branch pages" {
     try std.testing.expect(value == null);
 }
 
-test "lookup rejects branch paths whose upper-bounds cannot route the key" {
+test "lookup routes keys above the last finite fence to the rightmost child" {
     const page_size = test_page_size;
     var branch_page_bytes = [_]u8{0} ** page_size;
     _ = try page.BranchPage.encodeInto(branch_page_bytes[0..], .{
@@ -647,11 +656,11 @@ test "lookup rejects branch paths whose upper-bounds cannot route the key" {
         .count = 0,
         .order = 0,
     }, &.{
-        .{ .key = "beta", .child_page_id = 3 },
-    });
+        .{ .key = "gamma", .child_page_id = 3 },
+    }, 4);
 
-    var leaf_bytes = [_]u8{0} ** page_size;
-    _ = try page.LeafPage.encodeInto(leaf_bytes[0..], .{
+    var left_leaf_bytes = [_]u8{0} ** page_size;
+    _ = try page.LeafPage.encodeInto(left_leaf_bytes[0..], .{
         .page_id = 3,
         .page_type = .leaf,
         .count = 0,
@@ -661,16 +670,120 @@ test "lookup rejects branch paths whose upper-bounds cannot route the key" {
         .{ .key = "beta", .value = "two", .flags = 0 },
     });
 
+    var right_leaf_bytes = [_]u8{0} ** page_size;
+    _ = try page.LeafPage.encodeInto(right_leaf_bytes[0..], .{
+        .page_id = 4,
+        .page_type = .leaf,
+        .count = 0,
+        .order = 0,
+    }, &.{
+        .{ .key = "gamma", .value = "three", .flags = 0 },
+        .{ .key = "omega", .value = "last", .flags = 0 },
+    });
+
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const db = try openTestDb(tmp, "branch-corrupt.db", page_size, 2, &.{
+    const db = try openTestDb(tmp, "branch-tail-miss.db", page_size, 2, &.{
         branch_page_bytes[0..],
-        leaf_bytes[0..],
+        left_leaf_bytes[0..],
+        right_leaf_bytes[0..],
     });
     defer db.close();
 
-    try std.testing.expectError(TreeLookupError.CorruptTreePath, lookup(db, std.testing.allocator, "omega"));
+    const value = try lookup(db, std.testing.allocator, "zzzz");
+    defer if (value) |owned| std.testing.allocator.free(owned);
+    try std.testing.expect(value == null);
+}
+
+test "lookup routes equality to the child right of each finite fence" {
+    const page_size = test_page_size;
+    var branch_page_bytes = [_]u8{0} ** page_size;
+    _ = try page.BranchPage.encodeInto(branch_page_bytes[0..], .{
+        .page_id = 2,
+        .page_type = .branch,
+        .count = 0,
+        .order = 0,
+    }, &.{
+        .{ .key = "gamma", .child_page_id = 3 },
+        .{ .key = "theta", .child_page_id = 4 },
+        .{ .key = "zeta", .child_page_id = 5 },
+    }, 6);
+
+    var child_a = [_]u8{0} ** page_size;
+    _ = try page.LeafPage.encodeInto(child_a[0..], .{
+        .page_id = 3,
+        .page_type = .leaf,
+        .count = 0,
+        .order = 0,
+    }, &.{.{ .key = "alpha", .value = "A", .flags = 0 }});
+
+    var child_b = [_]u8{0} ** page_size;
+    _ = try page.LeafPage.encodeInto(child_b[0..], .{
+        .page_id = 4,
+        .page_type = .leaf,
+        .count = 0,
+        .order = 0,
+    }, &.{.{ .key = "gamma", .value = "B", .flags = 0 }});
+
+    var child_c = [_]u8{0} ** page_size;
+    _ = try page.LeafPage.encodeInto(child_c[0..], .{
+        .page_id = 5,
+        .page_type = .leaf,
+        .count = 0,
+        .order = 0,
+    }, &.{.{ .key = "theta", .value = "C", .flags = 0 }});
+
+    var child_d = [_]u8{0} ** page_size;
+    _ = try page.LeafPage.encodeInto(child_d[0..], .{
+        .page_id = 6,
+        .page_type = .leaf,
+        .count = 0,
+        .order = 0,
+    }, &.{.{ .key = "zeta", .value = "D", .flags = 0 }});
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const db = try openTestDb(tmp, "branch-multi-fence.db", page_size, 2, &.{
+        branch_page_bytes[0..],
+        child_a[0..],
+        child_b[0..],
+        child_c[0..],
+        child_d[0..],
+    });
+    defer db.close();
+
+    const gamma = (try lookup(db, std.testing.allocator, "gamma")).?;
+    defer std.testing.allocator.free(gamma);
+    try std.testing.expectEqualSlices(u8, "B", gamma);
+
+    const theta = (try lookup(db, std.testing.allocator, "theta")).?;
+    defer std.testing.allocator.free(theta);
+    try std.testing.expectEqualSlices(u8, "C", theta);
+
+    const zeta = (try lookup(db, std.testing.allocator, "zeta")).?;
+    defer std.testing.allocator.free(zeta);
+    try std.testing.expectEqualSlices(u8, "D", zeta);
+}
+
+test "lookup rejects empty branch roots without a rightmost child" {
+    const page_size = test_page_size;
+    var branch_page_bytes = [_]u8{0} ** page_size;
+    try page.BranchPage.init(branch_page_bytes[0..], .{
+        .page_id = 2,
+        .page_type = .branch,
+        .count = 0,
+        .order = 0,
+    });
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const db = try openTestDb(tmp, "empty-branch-root.db", page_size, 2, &.{branch_page_bytes[0..]});
+    defer db.close();
+
+    try std.testing.expectError(TreeLookupError.CorruptTreePath, lookup(db, std.testing.allocator, "alpha"));
 }
 
 test "lookup rejects root pages that are neither branch nor leaf" {
