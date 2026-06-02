@@ -369,19 +369,24 @@ fn expectBranchRootMatchesChildren(db: *DB) !void {
     defer std.testing.allocator.free(root_page);
 
     const branch_page = try page.BranchPage.validate(root_page);
-    try std.testing.expectEqual(@as(u16, 2), branch_page.count());
+    try std.testing.expectEqual(@as(u16, 1), branch_page.count());
 
     var index: u16 = 0;
     while (index < branch_page.count()) : (index += 1) {
         const branch_entry = try branch_page.entry(index);
-        const child_page_bytes = try db.readPageAlloc(std.testing.allocator, branch_entry.child_page_id);
-        defer std.testing.allocator.free(child_page_bytes);
+        const right_child_page_id = if (index + 1 < branch_page.count())
+            (try branch_page.entry(index + 1)).child_page_id
+        else
+            branch_page.rightmostChildPageId();
 
-        const child_leaf = try page.LeafPage.validate(child_page_bytes);
-        try std.testing.expect(child_leaf.count() > 0);
+        const right_child_page_bytes = try db.readPageAlloc(std.testing.allocator, right_child_page_id);
+        defer std.testing.allocator.free(right_child_page_bytes);
 
-        const child_max = try child_leaf.entry(child_leaf.count() - 1);
-        try std.testing.expectEqualSlices(u8, child_max.key, branch_entry.key);
+        const right_child_leaf = try page.LeafPage.validate(right_child_page_bytes);
+        try std.testing.expect(right_child_leaf.count() > 0);
+
+        const child_min = try right_child_leaf.entry(0);
+        try std.testing.expectEqualSlices(u8, child_min.key, branch_entry.key);
     }
 }
 
@@ -763,7 +768,7 @@ test "put splits a full root leaf into a branch root" {
     try expectBranchRootMatchesChildren(reopened);
 }
 
-test "put updates a branch-root leaf child without changing its upper bound" {
+test "put updates a branch-root finite-left child without changing its fence" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -777,9 +782,8 @@ test "put updates a branch-root leaf child without changing its upper bound" {
         .count = 0,
         .order = 0,
     }, &.{
-        .{ .key = "beta", .child_page_id = 3 },
-        .{ .key = "omega", .child_page_id = 4 },
-    });
+        .{ .key = "gamma", .child_page_id = 3 },
+    }, 4);
 
     const left_leaf = try encodeLeafFixture(3, &.{
         .{ .key = "alpha", .value = "one", .flags = 0 },
@@ -814,10 +818,11 @@ test "put updates a branch-root leaf child without changing its upper bound" {
     defer std.testing.allocator.free(root_page);
     const branch_page = try page.BranchPage.validate(root_page);
     const first = try branch_page.entry(0);
-    try std.testing.expectEqualSlices(u8, "beta", first.key);
+    try std.testing.expectEqualSlices(u8, "gamma", first.key);
+    try std.testing.expectEqual(@as(u64, 5), first.child_page_id);
 }
 
-test "put appends past the largest branch upper bound into the rightmost child" {
+test "put appends past finite fences into the rightmost child" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -831,9 +836,8 @@ test "put appends past the largest branch upper bound into the rightmost child" 
         .count = 0,
         .order = 0,
     }, &.{
-        .{ .key = "beta", .child_page_id = 3 },
-        .{ .key = "omega", .child_page_id = 4 },
-    });
+        .{ .key = "gamma", .child_page_id = 3 },
+    }, 4);
 
     const left_leaf = try encodeLeafFixture(3, &.{
         .{ .key = "alpha", .value = "one", .flags = 0 },
@@ -863,8 +867,9 @@ test "put appends past the largest branch upper bound into the rightmost child" 
     const root_page = try db.readPageAlloc(std.testing.allocator, db.root_page_id);
     defer std.testing.allocator.free(root_page);
     const branch_page = try page.BranchPage.validate(root_page);
-    const second = try branch_page.entry(1);
-    try std.testing.expectEqualSlices(u8, "zzzz", second.key);
+    const first = try branch_page.entry(0);
+    try std.testing.expectEqualSlices(u8, "gamma", first.key);
+    try std.testing.expectEqual(@as(u64, 5), branch_page.rightmostChildPageId());
 }
 
 test "put rejects unsupported branch child split before changing commit state" {
@@ -904,9 +909,8 @@ test "put rejects unsupported branch child split before changing commit state" {
         .count = 0,
         .order = 0,
     }, &.{
-        .{ .key = left_entries.items[left_entries.items.len - 1].key, .child_page_id = 3 },
-        .{ .key = right_entries.items[right_entries.items.len - 1].key, .child_page_id = 4 },
-    });
+        .{ .key = right_entries.items[0].key, .child_page_id = 3 },
+    }, 4);
 
     try writeTreeDatabase(path, 2, &.{
         branch_root[0..],

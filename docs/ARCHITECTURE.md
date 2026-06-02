@@ -123,14 +123,24 @@ Among them, `allocator state page` is the preferred direction for this project b
 
 A `branch page` stores only routing information and does not store values directly. Each element should contain at least:
 
-- separator key
-- child page ID
+- exclusive fence key
+- left child page ID
 
 Semantically:
 
-- the key is used to decide which child node a lookup should descend into
+- `header.count` is the number of finite exclusive fences
+- the child count is `header.count + 1`
+- each finite fence stores the left child before that fence
+- `rightmost_child_page_id` stores the final child after all finite fences
+- the fence key itself belongs to the child on its right
 - values do not appear in branch pages
 - child pointers in branch pages point to lower-level branch or leaf pages
+
+The branch page data region starts with a fixed `rightmost_child_page_id`,
+followed by `header.count` fence slots. Branch pages use a data-header layout
+flag for this exclusive-fence format; older inclusive upper-bound branch pages
+are not compatible and should be rejected instead of interpreted as the new
+layout.
 
 This naturally makes the entire tree suitable for range scans and ordered traversal.
 
