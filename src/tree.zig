@@ -11,6 +11,7 @@ pub const TreeLookupError = error{
 pub const TreeWriteError = error{
     EmptyBranchRoot,
     EmptyLeafSplit,
+    UnsupportedBranchSplit,
     UnsupportedChildSplit,
     UnsupportedTreeDepth,
 };
@@ -34,6 +35,12 @@ const RoutedChild = union(enum) {
 const RoutedPage = struct {
     child: RoutedChild,
     page_id: u64,
+};
+
+const SplitLeafPages = struct {
+    left_page: []const u8,
+    right_page: []const u8,
+    split_index: usize,
 };
 
 pub fn lookup(db: *db_mod.DB, allocator: std.mem.Allocator, key: []const u8) !?[]u8 {
@@ -252,30 +259,26 @@ fn writeBranchRootPut(
         child_leaf.header.order,
         next_child_entries.items,
     ) catch |err| switch (err) {
-        error.PageFull => return TreeWriteError.UnsupportedChildSplit,
+        error.PageFull => return try splitBranchChildLeaf(
+            db,
+            allocator,
+            root_branch,
+            routed_child.child,
+            child_leaf.header.order,
+            next_child_entries.items,
+        ),
         else => return err,
     };
 
-    var branch_entries = std.ArrayList(page.BranchEntry).empty;
-    var index: u16 = 0;
-    while (index < root_branch.count()) : (index += 1) {
-        const existing = try root_branch.entry(index);
-        if (routed_child.child == .finite_left and routed_child.child.finite_left == index) {
-            try branch_entries.append(allocator, .{
-                .key = try allocator.dupe(u8, existing.key),
-                .child_page_id = new_child_id,
-            });
-        } else {
-            try branch_entries.append(allocator, .{
-                .key = try allocator.dupe(u8, existing.key),
-                .child_page_id = existing.child_page_id,
-            });
-        }
-    }
-    const rightmost_child_page_id = switch (routed_child.child) {
-        .finite_left => root_branch.rightmostChildPageId(),
-        .rightmost => new_child_id,
-    };
+    var branch_entries = try collectBranchFiniteEntries(allocator, root_branch);
+    defer deinitBranchEntries(&branch_entries, allocator);
+
+    const rightmost_child_page_id = replaceBranchChild(
+        branch_entries.items,
+        root_branch.rightmostChildPageId(),
+        routed_child.child,
+        new_child_id,
+    );
 
     const new_root_page = encodeBranchPageAlloc(
         allocator,
@@ -298,6 +301,208 @@ fn writeBranchRootPut(
         .high_water_mark = new_root_id,
         .pages = pending_pages,
     };
+}
+
+fn splitBranchChildLeaf(
+    db: *db_mod.DB,
+    allocator: std.mem.Allocator,
+    root_branch: page.BranchPage,
+    routed_child: RoutedChild,
+    leaf_order: u8,
+    entries: []const page.LeafEntry,
+) !WriteResult {
+    const left_id = db.high_water_mark + 1;
+    const right_id = db.high_water_mark + 2;
+    const root_id = db.high_water_mark + 3;
+
+    const split_pages = try encodeSplitLeafPages(
+        allocator,
+        db.page_size,
+        left_id,
+        right_id,
+        leaf_order,
+        entries,
+    );
+
+    var branch_entries = collectBranchFiniteEntries(allocator, root_branch) catch |err| {
+        allocator.free(split_pages.left_page);
+        allocator.free(split_pages.right_page);
+        return err;
+    };
+    defer deinitBranchEntries(&branch_entries, allocator);
+
+    const rightmost_child_page_id = replaceBranchChildAndInsertFence(
+        &branch_entries,
+        allocator,
+        root_branch.rightmostChildPageId(),
+        routed_child,
+        left_id,
+        minKey(entries[split_pages.split_index..]),
+        right_id,
+    ) catch |err| {
+        allocator.free(split_pages.left_page);
+        allocator.free(split_pages.right_page);
+        return err;
+    };
+
+    const new_root_page = encodeBranchPageAlloc(
+        allocator,
+        db.page_size,
+        root_id,
+        root_branch.header.order,
+        branch_entries.items,
+        rightmost_child_page_id,
+    ) catch |err| {
+        allocator.free(split_pages.left_page);
+        allocator.free(split_pages.right_page);
+        return switch (err) {
+            error.PageFull => TreeWriteError.UnsupportedBranchSplit,
+            else => err,
+        };
+    };
+
+    const pending_pages = try allocator.alloc(PendingPage, 3);
+    pending_pages[0] = .{ .page_id = left_id, .bytes = split_pages.left_page };
+    pending_pages[1] = .{ .page_id = right_id, .bytes = split_pages.right_page };
+    pending_pages[2] = .{ .page_id = root_id, .bytes = new_root_page };
+
+    return .{
+        .root_page_id = root_id,
+        .high_water_mark = root_id,
+        .pages = pending_pages,
+    };
+}
+
+fn encodeSplitLeafPages(
+    allocator: std.mem.Allocator,
+    page_size: u32,
+    left_id: u64,
+    right_id: u64,
+    leaf_order: u8,
+    entries: []const page.LeafEntry,
+) !SplitLeafPages {
+    if (entries.len < 2) return TreeWriteError.EmptyLeafSplit;
+
+    var split_index: usize = 1;
+    while (split_index < entries.len) : (split_index += 1) {
+        const left_page = encodeLeafPageAlloc(
+            allocator,
+            page_size,
+            left_id,
+            leaf_order,
+            entries[0..split_index],
+        ) catch |err| switch (err) {
+            error.PageFull => continue,
+            else => return err,
+        };
+
+        const right_page = encodeLeafPageAlloc(
+            allocator,
+            page_size,
+            right_id,
+            leaf_order,
+            entries[split_index..],
+        ) catch |err| switch (err) {
+            error.PageFull => {
+                allocator.free(left_page);
+                continue;
+            },
+            else => {
+                allocator.free(left_page);
+                return err;
+            },
+        };
+
+        return .{
+            .left_page = left_page,
+            .right_page = right_page,
+            .split_index = split_index,
+        };
+    }
+
+    return error.PageFull;
+}
+
+fn collectBranchFiniteEntries(
+    allocator: std.mem.Allocator,
+    branch_page: page.BranchPage,
+) !std.ArrayList(page.BranchEntry) {
+    var branch_entries = std.ArrayList(page.BranchEntry).empty;
+    errdefer deinitBranchEntries(&branch_entries, allocator);
+
+    var index: u16 = 0;
+    while (index < branch_page.count()) : (index += 1) {
+        const existing = try branch_page.entry(index);
+        const key = try allocator.dupe(u8, existing.key);
+        branch_entries.append(allocator, .{
+            .key = key,
+            .child_page_id = existing.child_page_id,
+        }) catch |err| {
+            allocator.free(key);
+            return err;
+        };
+    }
+
+    return branch_entries;
+}
+
+fn deinitBranchEntries(entries: *std.ArrayList(page.BranchEntry), allocator: std.mem.Allocator) void {
+    for (entries.items) |entry| {
+        allocator.free(entry.key);
+    }
+    entries.deinit(allocator);
+}
+
+fn replaceBranchChild(
+    entries: []page.BranchEntry,
+    rightmost_child_page_id: u64,
+    routed_child: RoutedChild,
+    new_child_page_id: u64,
+) u64 {
+    return switch (routed_child) {
+        .finite_left => |index| blk: {
+            entries[index].child_page_id = new_child_page_id;
+            break :blk rightmost_child_page_id;
+        },
+        .rightmost => new_child_page_id,
+    };
+}
+
+fn replaceBranchChildAndInsertFence(
+    entries: *std.ArrayList(page.BranchEntry),
+    allocator: std.mem.Allocator,
+    rightmost_child_page_id: u64,
+    routed_child: RoutedChild,
+    left_page_id: u64,
+    new_fence_key: []const u8,
+    right_page_id: u64,
+) !u64 {
+    switch (routed_child) {
+        .finite_left => |index| {
+            const insertion_index: usize = index;
+            const key = try allocator.dupe(u8, new_fence_key);
+            entries.insert(allocator, insertion_index, .{
+                .key = key,
+                .child_page_id = left_page_id,
+            }) catch |err| {
+                allocator.free(key);
+                return err;
+            };
+            entries.items[insertion_index + 1].child_page_id = right_page_id;
+            return rightmost_child_page_id;
+        },
+        .rightmost => {
+            const key = try allocator.dupe(u8, new_fence_key);
+            entries.append(allocator, .{
+                .key = key,
+                .child_page_id = left_page_id,
+            }) catch |err| {
+                allocator.free(key);
+                return err;
+            };
+            return right_page_id;
+        },
+    }
 }
 
 fn collectUpdatedLeafEntries(
