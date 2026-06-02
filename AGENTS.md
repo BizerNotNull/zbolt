@@ -6,6 +6,7 @@ Guidance for Codex and other AI coding agents working in this repository.
 
 When writing code in this repository:
 
+- Before developing any code, first sync the local code with [https://github.com/BizerNotNull/zbolt](https://github.com/BizerNotNull/zbolt).
 - Follow current Zig best practices for the active Zig version, using
   `context7` to verify language and standard library guidance when
   needed.
@@ -16,6 +17,11 @@ When writing code in this repository:
   structure.
 - Write code comments according to the
   `.agents/skills/code-comments/SKILLS.md` skill.
+- In code that is hard to follow or where a design choice is not
+  obvious, add concise comments that explain the intent, invariant, or
+  reason for the chosen approach.
+- Keep all tests at the end of the file after business code, and
+  separate them with a `======tests======` section marker.
 
 ## Commit Messages
 
