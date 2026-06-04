@@ -79,8 +79,14 @@ const WriteContext = struct {
     fn appendAllocatedPage(self: *WriteContext, page_id: u64, bytes: []const u8) !void {
         // Page IDs become committed only through the returned WriteResult; failed
         // writes may abandon this context without mutating DB state.
+        const header = try page.decodeHeader(bytes);
+        if (header.page_id != page_id) return error.InvalidPageLayout;
+
+        const span_size = try page.spanSize(self.db.page_size, header.order);
+        if (bytes.len != span_size) return error.InvalidPageLayout;
+
         std.debug.assert(page_id == try self.page_allocator.peekNextPageId());
-        const allocated_page_id = try self.page_allocator.allocateNext(0);
+        const allocated_page_id = try self.page_allocator.allocateNext(header.order);
         std.debug.assert(allocated_page_id == page_id);
         try self.pages.append(self.allocator, .{
             .page_id = page_id,
@@ -222,7 +228,20 @@ fn writeLeafPut(ctx: *WriteContext, leaf_page_bytes: []const u8, key: []const u8
         next_entries.items,
     ) catch |err| switch (err) {
         error.PageFull => {
-            if (next_entries.items.len == 1) return TreeWriteError.KeyValueTooLarge;
+            if (next_entries.items.len == 1) {
+                const grown_leaf = try encodeSingleLeafPageBestFitAlloc(
+                    ctx.allocator,
+                    ctx.db.page_size,
+                    page_id,
+                    leaf_page.header.order,
+                    next_entries.items,
+                );
+                try ctx.appendAllocatedPage(page_id, grown_leaf);
+                return .{ .one = .{
+                    .page_id = page_id,
+                    .max_key = maxKey(next_entries.items),
+                } };
+            }
             return try splitLeafPut(ctx, leaf_page.header.order, next_entries.items);
         },
         else => return err,
@@ -296,7 +315,7 @@ fn collectUpdatedBranchEntries(
 
 fn splitLeafPut(ctx: *WriteContext, leaf_order: u8, entries: []const page.LeafEntry) anyerror!PutResult {
     const left_id = try ctx.peekNextPageId();
-    const right_id = std.math.add(u64, left_id, 1) catch return error.PageIdOverflow;
+    const right_id = try siblingPageId(left_id, leaf_order);
     const split_pages = try splitLeafEntries(
         ctx.allocator,
         ctx.db.page_size,
@@ -317,7 +336,7 @@ fn splitLeafPut(ctx: *WriteContext, leaf_order: u8, entries: []const page.LeafEn
 
 fn splitBranchPut(ctx: *WriteContext, branch_order: u8, entries: []const page.BranchEntry) anyerror!PutResult {
     const left_id = try ctx.peekNextPageId();
-    const right_id = std.math.add(u64, left_id, 1) catch return error.PageIdOverflow;
+    const right_id = try siblingPageId(left_id, branch_order);
     const split_pages = try splitBranchEntries(
         ctx.allocator,
         ctx.db.page_size,
@@ -585,7 +604,8 @@ fn encodeLeafPageAlloc(
     order: u8,
     entries: []const page.LeafEntry,
 ) ![]u8 {
-    const page_bytes = try allocator.alloc(u8, page_size);
+    const span_size = try page.spanSize(page_size, order);
+    const page_bytes = try allocator.alloc(u8, span_size);
     errdefer allocator.free(page_bytes);
     @memset(page_bytes, 0);
 
@@ -606,7 +626,8 @@ fn encodeBranchPageAlloc(
     order: u8,
     entries: []const page.BranchEntry,
 ) ![]u8 {
-    const page_bytes = try allocator.alloc(u8, page_size);
+    const span_size = try page.spanSize(page_size, order);
+    const page_bytes = try allocator.alloc(u8, span_size);
     errdefer allocator.free(page_bytes);
     @memset(page_bytes, 0);
 
@@ -618,6 +639,40 @@ fn encodeBranchPageAlloc(
     }, entries);
 
     return page_bytes;
+}
+
+fn encodeSingleLeafPageBestFitAlloc(
+    allocator: std.mem.Allocator,
+    page_size: u32,
+    page_id: u64,
+    min_order: u8,
+    entries: []const page.LeafEntry,
+) ![]u8 {
+    std.debug.assert(entries.len == 1);
+
+    const max_order = try page.maxOrderForSpanSize(page_size, std.math.maxInt(u16));
+    var order = min_order;
+    while (order <= max_order) : (order += 1) {
+        const leaf_bytes = encodeLeafPageAlloc(
+            allocator,
+            page_size,
+            page_id,
+            order,
+            entries,
+        ) catch |err| switch (err) {
+            error.PageFull => continue,
+            else => return err,
+        };
+
+        return leaf_bytes;
+    }
+
+    return TreeWriteError.KeyValueTooLarge;
+}
+
+fn siblingPageId(left_id: u64, order: u8) !u64 {
+    const left_span_pages = try page.spanPageCount(order);
+    return std.math.add(u64, left_id, left_span_pages) catch error.PageIdOverflow;
 }
 
 fn maxKey(entries: []const page.LeafEntry) []const u8 {
@@ -642,10 +697,10 @@ fn tempFilePath(buf: []u8, tmp_dir: std.Io.Dir, file_name: []const u8) ![]const 
     return std.fmt.bufPrint(buf, "{s}{c}{s}", .{ dir_path, std.fs.path.sep, file_name });
 }
 
-fn writePage(file: *std.Io.File, io: std.Io, page_id: u64, page_bytes: []const u8) !void {
+fn writePageObject(file: *std.Io.File, io: std.Io, base_page_size: u32, page_id: u64, page_bytes: []const u8) !void {
     var buffer: [256]u8 = undefined;
     var writer = file.writer(io, &buffer);
-    try writer.seekTo(page_id * page_bytes.len);
+    try writer.seekTo(try std.math.mul(u64, page_id, base_page_size));
     try writer.interface.writeAll(page_bytes);
     try writer.interface.flush();
 }
@@ -669,17 +724,22 @@ fn createDatabaseFile(path: []const u8, page_size: u32, root_page_id: u64, pages
     });
     defer file.close(io);
 
-    const high_water_mark = 2 + pages.len - 1;
+    var high_water_mark: u64 = 1;
+    for (pages) |page_bytes| {
+        high_water_mark += try page.spanPageCount((try page.decodeHeader(page_bytes)).order);
+    }
     const meta0_page = try encodeMetaPage(std.testing.allocator, page_size, root_page_id, high_water_mark);
     defer std.testing.allocator.free(meta0_page);
     const meta1_page = try encodeMetaPage(std.testing.allocator, page_size, root_page_id, high_water_mark);
     defer std.testing.allocator.free(meta1_page);
 
-    try writePage(&file, io, 0, meta0_page);
-    try writePage(&file, io, 1, meta1_page);
+    try writePageObject(&file, io, page_size, 0, meta0_page);
+    try writePageObject(&file, io, page_size, 1, meta1_page);
 
-    for (pages, 0..) |page_bytes, index| {
-        try writePage(&file, io, 2 + index, page_bytes);
+    var next_page_id: u64 = 2;
+    for (pages) |page_bytes| {
+        try writePageObject(&file, io, page_size, next_page_id, page_bytes);
+        next_page_id += try page.spanPageCount((try page.decodeHeader(page_bytes)).order);
     }
 }
 

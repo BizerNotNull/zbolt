@@ -31,6 +31,9 @@ pub const encodePageHeader = page.encodeHeader;
 pub const decodePageDataHeader = page.decodeDataHeader;
 pub const encodePageDataHeader = page.encodeDataHeader;
 pub const pageSpanSize = page.spanSize;
+pub const pageSpanPageCount = page.spanPageCount;
+pub const pageSpanEndPageId = page.spanEndPageId;
+pub const maxPageObjectOrderForSpanSize = page.maxOrderForSpanSize;
 pub const treeLookup = tree.lookup;
 
 pub const DB = @import("db.zig").DB;

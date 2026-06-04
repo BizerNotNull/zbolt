@@ -1,4 +1,5 @@
 const std = @import("std");
+const page = @import("page.zig");
 
 pub const Error = error{
     InvalidPageOrder,
@@ -25,7 +26,7 @@ pub const PageAllocator = struct {
     /// appends spans after the current high water mark; it does not reclaim,
     /// split, or merge free space.
     pub fn allocateNext(self: *PageAllocator, order: u8) Error!u64 {
-        const span_page_count = spanPageCount(order) catch return error.InvalidPageOrder;
+        const span_page_count = page.spanPageCount(order) catch return error.InvalidPageOrder;
         const start_page_id = try self.peekNextPageId();
         const last_page_offset = span_page_count - 1;
         const next_high_water_mark = std.math.add(u64, start_page_id, last_page_offset) catch return error.PageIdOverflow;
@@ -38,11 +39,6 @@ pub const PageAllocator = struct {
         return self.high_water_mark;
     }
 };
-
-fn spanPageCount(order: u8) Error!u64 {
-    if (order >= @bitSizeOf(u64)) return error.InvalidPageOrder;
-    return @as(u64, 1) << @intCast(order);
-}
 
 // ======tests======
 

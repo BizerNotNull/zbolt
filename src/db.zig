@@ -55,13 +55,13 @@ pub const DB = struct {
         // Dirty tree pages are written in child-to-root order, and the meta
         // page remains the only commit point visible during recovery.
         for (write_result.pages) |pending_page| {
-            try writePage(&self.file, io, pending_page.page_id, pending_page.bytes);
+            try writePageObject(&self.file, io, self.page_size, pending_page.page_id, pending_page.bytes);
         }
 
         const next_meta_slot = inactiveMetaSlot(self.meta_slot);
         // Meta pages act as the commit point. Writing the inactive slot last
         // keeps the previously selected snapshot available until this commit is durable.
-        try writePage(&self.file, io, metaSlotPageId(next_meta_slot), next_meta_page);
+        try writePageObject(&self.file, io, self.page_size, metaSlotPageId(next_meta_slot), next_meta_page);
 
         self.meta_slot = next_meta_slot;
         self.flags = next_meta.flags;
@@ -72,7 +72,7 @@ pub const DB = struct {
     }
 
     pub fn readPageAlloc(self: *DB, allocator: std.mem.Allocator, page_id: u64) ![]u8 {
-        return readPage(allocator, &self.file, self.io_threaded.io(), page_id, self.page_size);
+        return readPageObjectAlloc(allocator, &self.file, self.io_threaded.io(), page_id, self.page_size, self.high_water_mark);
     }
 };
 
@@ -159,23 +159,23 @@ fn initializeEmptyDatabase(db: *DB) !void {
 
     // TODO: atomic write for crash-safe, need to ponder neccessity on commit marker
     const io = db.io_threaded.io();
-    try writePage(&db.file, io, 0, meta0_page);
-    try writePage(&db.file, io, 1, meta1_page);
-    try writePage(&db.file, io, 2, root_page);
+    try writePageObject(&db.file, io, default_page_size, 0, meta0_page);
+    try writePageObject(&db.file, io, default_page_size, 1, meta1_page);
+    try writePageObject(&db.file, io, default_page_size, 2, root_page);
 }
 
 fn loadSelectedMeta(allocator: std.mem.Allocator, file: *std.Io.File, io: std.Io, page_size: u32) !meta.SelectedMeta {
-    const meta0_page = try readPage(allocator, file, io, 0, page_size);
+    const meta0_page = try readBasePageAlloc(allocator, file, io, 0, page_size);
     defer allocator.free(meta0_page);
 
-    const meta1_page = try readPage(allocator, file, io, 1, page_size);
+    const meta1_page = try readBasePageAlloc(allocator, file, io, 1, page_size);
     defer allocator.free(meta1_page);
 
     // TODO: parse meta pages need to be explicited decomposition
     return meta.selectNewestValid(meta0_page, meta1_page);
 }
 
-fn readPage(
+fn readBasePageAlloc(
     allocator: std.mem.Allocator,
     file: *const std.Io.File,
     io: std.Io,
@@ -187,18 +187,62 @@ fn readPage(
 
     var buffer: [256]u8 = undefined;
     var reader = file.reader(io, &buffer);
-    try reader.seekTo(page_id * page_size);
+    try reader.seekTo(try pageOffset(page_id, page_size));
     try reader.interface.readSliceAll(page_bytes);
 
     return page_bytes;
 }
 
-fn writePage(file: *std.Io.File, io: std.Io, page_id: u64, page_bytes: []const u8) !void {
+fn readPageObjectAlloc(
+    allocator: std.mem.Allocator,
+    file: *const std.Io.File,
+    io: std.Io,
+    page_id: u64,
+    base_page_size: u32,
+    high_water_mark: u64,
+) ![]u8 {
+    if (page_id > high_water_mark) return error.EntryOutOfBounds;
+
+    const first_page = try readBasePageAlloc(allocator, file, io, page_id, base_page_size);
+    errdefer allocator.free(first_page);
+
+    const header = try page.decodeHeader(first_page);
+    if (header.page_id != page_id) return error.InvalidPageLayout;
+
+    const max_order = try page.maxOrderForSpanSize(base_page_size, std.math.maxInt(u16));
+    if (header.order > max_order) return error.InvalidPageOrder;
+
+    const span_end = try page.spanEndPageId(page_id, header.order);
+    if (span_end > high_water_mark) return error.EntryOutOfBounds;
+
+    const span_size = try page.spanSize(base_page_size, header.order);
+    if (span_size == base_page_size) return first_page;
+
+    const object_bytes = try allocator.alloc(u8, span_size);
+    errdefer allocator.free(object_bytes);
+
+    std.mem.copyForwards(u8, object_bytes[0..base_page_size], first_page);
+    allocator.free(first_page);
+
+    var buffer: [256]u8 = undefined;
+    var reader = file.reader(io, &buffer);
+    const remaining_start_page_id = std.math.add(u64, page_id, 1) catch return error.PageIdOverflow;
+    try reader.seekTo(try pageOffset(remaining_start_page_id, base_page_size));
+    try reader.interface.readSliceAll(object_bytes[base_page_size..]);
+
+    return object_bytes;
+}
+
+fn writePageObject(file: *std.Io.File, io: std.Io, base_page_size: u32, page_id: u64, page_bytes: []const u8) !void {
     var buffer: [256]u8 = undefined;
     var writer = file.writer(io, &buffer);
-    try writer.seekTo(page_id * page_bytes.len);
+    try writer.seekTo(try pageOffset(page_id, base_page_size));
     try writer.interface.writeAll(page_bytes);
     try writer.interface.flush();
+}
+
+fn pageOffset(page_id: u64, base_page_size: u32) !u64 {
+    return std.math.mul(u64, page_id, base_page_size) catch error.PageIdOverflow;
 }
 
 fn allocateEmptyRootPage(allocator: std.mem.Allocator, page_size: u32, page_id: u64) ![]u8 {
@@ -264,9 +308,9 @@ fn bootstrapFile(path: []const u8) !void {
     const root_page = try allocateEmptyRootPage(std.testing.allocator, default_page_size, seeded_meta.root_page_id);
     defer std.testing.allocator.free(root_page);
 
-    try writePage(&file, io, 0, meta0_page);
-    try writePage(&file, io, 1, meta1_page);
-    try writePage(&file, io, 2, root_page);
+    try writePageObject(&file, io, default_page_size, 0, meta0_page);
+    try writePageObject(&file, io, default_page_size, 1, meta1_page);
+    try writePageObject(&file, io, default_page_size, 2, root_page);
 }
 
 fn writeSeededDatabase(path: []const u8, meta0: meta.Meta, meta1: meta.Meta) !void {
@@ -286,9 +330,9 @@ fn writeSeededDatabase(path: []const u8, meta0: meta.Meta, meta1: meta.Meta) !vo
     const root_page = try allocateEmptyRootPage(std.testing.allocator, root_size, 2);
     defer std.testing.allocator.free(root_page);
 
-    try writePage(&file, io, 0, meta0_page);
-    try writePage(&file, io, 1, meta1_page);
-    try writePage(&file, io, 2, root_page);
+    try writePageObject(&file, io, default_page_size, 0, meta0_page);
+    try writePageObject(&file, io, default_page_size, 1, meta1_page);
+    try writePageObject(&file, io, default_page_size, 2, root_page);
 }
 
 fn writeTreeDatabase(path: []const u8, root_page_id: u64, pages: []const []const u8) !void {
@@ -299,7 +343,10 @@ fn writeTreeDatabase(path: []const u8, root_page_id: u64, pages: []const []const
     });
     defer file.close(io);
 
-    const high_water_mark = 2 + pages.len - 1;
+    var high_water_mark: u64 = 1;
+    for (pages) |page_bytes| {
+        high_water_mark += try page.spanPageCount((try page.decodeHeader(page_bytes)).order);
+    }
     const seeded_meta = meta.Meta{
         .page_size = default_page_size,
         .flags = 0,
@@ -314,11 +361,13 @@ fn writeTreeDatabase(path: []const u8, root_page_id: u64, pages: []const []const
     const meta1_page = try meta.encode(std.testing.allocator, seeded_meta);
     defer std.testing.allocator.free(meta1_page);
 
-    try writePage(&file, io, 0, meta0_page);
-    try writePage(&file, io, 1, meta1_page);
+    try writePageObject(&file, io, default_page_size, 0, meta0_page);
+    try writePageObject(&file, io, default_page_size, 1, meta1_page);
 
-    for (pages, 0..) |page_bytes, index| {
-        try writePage(&file, io, 2 + index, page_bytes);
+    var next_page_id: u64 = 2;
+    for (pages) |page_bytes| {
+        try writePageObject(&file, io, default_page_size, next_page_id, page_bytes);
+        next_page_id += try page.spanPageCount((try page.decodeHeader(page_bytes)).order);
     }
 }
 
@@ -654,10 +703,10 @@ test "open writes identical valid meta pages on bootstrap" {
     const db = try open(std.testing.allocator, path);
     defer db.close();
 
-    const meta0_page = try readPage(std.testing.allocator, &db.file, db.io_threaded.io(), 0, default_page_size);
+    const meta0_page = try readBasePageAlloc(std.testing.allocator, &db.file, db.io_threaded.io(), 0, default_page_size);
     defer std.testing.allocator.free(meta0_page);
 
-    const meta1_page = try readPage(std.testing.allocator, &db.file, db.io_threaded.io(), 1, default_page_size);
+    const meta1_page = try readBasePageAlloc(std.testing.allocator, &db.file, db.io_threaded.io(), 1, default_page_size);
     defer std.testing.allocator.free(meta1_page);
 
     const decoded0 = try meta.decode(meta0_page);
@@ -685,7 +734,7 @@ test "open bootstraps a valid empty leaf root page" {
     const db = try open(std.testing.allocator, path);
     defer db.close();
 
-    const root_page = try readPage(std.testing.allocator, &db.file, db.io_threaded.io(), 2, default_page_size);
+    const root_page = try readBasePageAlloc(std.testing.allocator, &db.file, db.io_threaded.io(), 2, default_page_size);
     defer std.testing.allocator.free(root_page);
 
     const leaf_page = try page.LeafPage.validate(root_page);
@@ -751,13 +800,13 @@ test "open prefers only valid meta when the other one is invalid" {
         var file = try std.Io.Dir.openFileAbsolute(io, path, .{ .mode = .read_write });
         defer file.close(io);
 
-        const page_bytes = try readPage(std.testing.allocator, &file, io, 1, default_page_size);
+        const page_bytes = try readBasePageAlloc(std.testing.allocator, &file, io, 1, default_page_size);
         defer std.testing.allocator.free(page_bytes);
 
         var invalid_page = try std.testing.allocator.dupe(u8, page_bytes);
         defer std.testing.allocator.free(invalid_page);
         invalid_page[12] ^= 0xFF;
-        try writePage(&file, io, 1, invalid_page);
+        try writePageObject(&file, io, default_page_size, 1, invalid_page);
     }
 
     const db = try open(std.testing.allocator, path);
@@ -828,16 +877,16 @@ test "open maps invalid meta recovery into centralized db error" {
         var file = try std.Io.Dir.openFileAbsolute(io, path, .{ .mode = .read_write });
         defer file.close(io);
 
-        var meta0_page = try readPage(std.testing.allocator, &file, io, 0, default_page_size);
+        var meta0_page = try readBasePageAlloc(std.testing.allocator, &file, io, 0, default_page_size);
         defer std.testing.allocator.free(meta0_page);
-        var meta1_page = try readPage(std.testing.allocator, &file, io, 1, default_page_size);
+        var meta1_page = try readBasePageAlloc(std.testing.allocator, &file, io, 1, default_page_size);
         defer std.testing.allocator.free(meta1_page);
 
         meta0_page[8] ^= 0xFF;
         meta1_page[8] ^= 0xFF;
 
-        try writePage(&file, io, 0, meta0_page);
-        try writePage(&file, io, 1, meta1_page);
+        try writePageObject(&file, io, default_page_size, 0, meta0_page);
+        try writePageObject(&file, io, default_page_size, 1, meta1_page);
     }
 
     try std.testing.expectError(errors.DbOpenError.InvalidDatabaseFile, open(std.testing.allocator, path));
@@ -1419,11 +1468,232 @@ test "put rejects non-tree root pages" {
             .upper = default_page_size,
             .flags = 0,
         });
-        try writePage(&file, io, 2, branch_root[0..]);
+        try writePageObject(&file, io, default_page_size, 2, branch_root[0..]);
     }
 
     const db = try open(std.testing.allocator, path);
     defer db.close();
 
     try std.testing.expectError(error.UnexpectedPageType, db.put("alpha", "one"));
+}
+
+fn encodeLeafObjectFixture(allocator: std.mem.Allocator, page_id: u64, order: u8, entries: []const page.LeafEntry) ![]u8 {
+    const span_size = try page.spanSize(default_page_size, order);
+    const leaf_page = try allocator.alloc(u8, span_size);
+    errdefer allocator.free(leaf_page);
+    @memset(leaf_page, 0);
+
+    _ = try page.LeafPage.encodeInto(leaf_page, .{
+        .page_id = page_id,
+        .page_type = .leaf,
+        .count = 0,
+        .order = order,
+    }, entries);
+
+    return leaf_page;
+}
+
+test "writePageObject stores order one and two objects at base-page offsets" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path = try tempFilePath(&path_buf, tmp.dir, "page-object-offsets.db");
+
+    const io = std.testing.io;
+    var file = try std.Io.Dir.createFileAbsolute(io, path, .{
+        .read = true,
+        .truncate = true,
+    });
+    defer file.close(io);
+
+    const order1_page = try encodeLeafObjectFixture(std.testing.allocator, 2, 1, &.{
+        .{ .key = "a", .value = "one", .flags = 0 },
+    });
+    defer std.testing.allocator.free(order1_page);
+
+    const order2_page = try encodeLeafObjectFixture(std.testing.allocator, 4, 2, &.{
+        .{ .key = "b", .value = "two", .flags = 0 },
+    });
+    defer std.testing.allocator.free(order2_page);
+
+    try writePageObject(&file, io, default_page_size, 2, order1_page);
+    try writePageObject(&file, io, default_page_size, 4, order2_page);
+
+    const read_order1 = try readPageObjectAlloc(std.testing.allocator, &file, io, 2, default_page_size, 7);
+    defer std.testing.allocator.free(read_order1);
+    try std.testing.expectEqual(order1_page.len, read_order1.len);
+    try std.testing.expectEqualSlices(u8, order1_page, read_order1);
+
+    const read_order2 = try readPageObjectAlloc(std.testing.allocator, &file, io, 4, default_page_size, 7);
+    defer std.testing.allocator.free(read_order2);
+    try std.testing.expectEqual(order2_page.len, read_order2.len);
+    try std.testing.expectEqualSlices(u8, order2_page, read_order2);
+}
+
+test "writePageObject writes order zero page after a higher-order object" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path = try tempFilePath(&path_buf, tmp.dir, "page-object-after-high-order.db");
+
+    const io = std.testing.io;
+    var file = try std.Io.Dir.createFileAbsolute(io, path, .{
+        .read = true,
+        .truncate = true,
+    });
+    defer file.close(io);
+
+    const order1_page = try encodeLeafObjectFixture(std.testing.allocator, 2, 1, &.{
+        .{ .key = "wide", .value = "left", .flags = 0 },
+    });
+    defer std.testing.allocator.free(order1_page);
+    const order0_page = try encodeLeafObjectFixture(std.testing.allocator, 4, 0, &.{
+        .{ .key = "tail", .value = "right", .flags = 0 },
+    });
+    defer std.testing.allocator.free(order0_page);
+
+    try writePageObject(&file, io, default_page_size, 2, order1_page);
+    try writePageObject(&file, io, default_page_size, 4, order0_page);
+
+    const read_tail = try readPageObjectAlloc(std.testing.allocator, &file, io, 4, default_page_size, 4);
+    defer std.testing.allocator.free(read_tail);
+    const tail = try page.LeafPage.validate(read_tail);
+    const entry = try tail.entry(0);
+    try std.testing.expectEqualSlices(u8, "tail", entry.key);
+    try std.testing.expectEqualSlices(u8, "right", entry.value);
+}
+
+test "put stores a single large value in a higher-order root leaf across reopen" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path = try tempFilePath(&path_buf, tmp.dir, "put-large-root-leaf.db");
+
+    var large_value = [_]u8{'L'} ** 7000;
+
+    {
+        const db = try open(std.testing.allocator, path);
+        defer db.close();
+
+        try db.put("large", large_value[0..]);
+        try std.testing.expectEqual(@as(u64, 3), db.root_page_id);
+        try std.testing.expectEqual(@as(u64, 4), db.high_water_mark);
+
+        const root_page = try db.readPageAlloc(std.testing.allocator, db.root_page_id);
+        defer std.testing.allocator.free(root_page);
+        const root_header = try page.decodeHeader(root_page);
+        try std.testing.expectEqual(@as(u8, 1), root_header.order);
+    }
+
+    const reopened = try open(std.testing.allocator, path);
+    defer reopened.close();
+
+    const value = (try reopened.get(std.testing.allocator, "large")).?;
+    defer std.testing.allocator.free(value);
+    try std.testing.expectEqualSlices(u8, large_value[0..], value);
+}
+
+test "put rejects a single value larger than the u16-bounded tree page span" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path = try tempFilePath(&path_buf, tmp.dir, "put-too-large-root-leaf.db");
+
+    const db = try open(std.testing.allocator, path);
+    defer db.close();
+
+    const huge_value = try std.testing.allocator.alloc(u8, 40000);
+    defer std.testing.allocator.free(huge_value);
+    @memset(huge_value, 'H');
+
+    try std.testing.expectError(error.KeyValueTooLarge, db.put("huge", huge_value));
+}
+
+test "readPageAlloc rejects page object order beyond the tree layout limit" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path = try tempFilePath(&path_buf, tmp.dir, "bad-page-object-order.db");
+
+    try bootstrapFile(path);
+
+    {
+        const io = std.testing.io;
+        var file = try std.Io.Dir.openFileAbsolute(io, path, .{ .mode = .read_write });
+        defer file.close(io);
+
+        var root_page = [_]u8{0} ** default_page_size;
+        try page.LeafPage.init(root_page[0..], .{
+            .page_id = 2,
+            .page_type = .leaf,
+            .count = 0,
+            .order = 4,
+        });
+        try writePageObject(&file, io, default_page_size, 2, root_page[0..]);
+    }
+
+    const db = try open(std.testing.allocator, path);
+    defer db.close();
+
+    try std.testing.expectError(error.InvalidPageOrder, db.readPageAlloc(std.testing.allocator, 2));
+}
+
+test "readPageAlloc rejects page object spans beyond the high water mark" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path = try tempFilePath(&path_buf, tmp.dir, "page-object-past-hwm.db");
+
+    try bootstrapFile(path);
+
+    {
+        const io = std.testing.io;
+        var file = try std.Io.Dir.openFileAbsolute(io, path, .{ .mode = .read_write });
+        defer file.close(io);
+
+        const root_page = try encodeLeafObjectFixture(std.testing.allocator, 2, 1, &.{});
+        defer std.testing.allocator.free(root_page);
+        try writePageObject(&file, io, default_page_size, 2, root_page);
+    }
+
+    const db = try open(std.testing.allocator, path);
+    defer db.close();
+
+    try std.testing.expectError(error.EntryOutOfBounds, db.readPageAlloc(std.testing.allocator, 2));
+}
+
+test "readPageAlloc rejects page objects whose header id does not match the requested id" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path = try tempFilePath(&path_buf, tmp.dir, "page-object-id-mismatch.db");
+
+    try bootstrapFile(path);
+
+    {
+        const io = std.testing.io;
+        var file = try std.Io.Dir.openFileAbsolute(io, path, .{ .mode = .read_write });
+        defer file.close(io);
+
+        var root_page = [_]u8{0} ** default_page_size;
+        try page.LeafPage.init(root_page[0..], .{
+            .page_id = 3,
+            .page_type = .leaf,
+            .count = 0,
+            .order = 0,
+        });
+        try writePageObject(&file, io, default_page_size, 2, root_page[0..]);
+    }
+
+    const db = try open(std.testing.allocator, path);
+    defer db.close();
+
+    try std.testing.expectError(error.InvalidPageLayout, db.readPageAlloc(std.testing.allocator, 2));
 }

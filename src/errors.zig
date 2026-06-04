@@ -14,6 +14,8 @@ pub const MetaError = error{
 pub const PageError = error{
     InvalidPageType,
     InvalidBasePageSize,
+    InvalidPageOrder,
+    PageIdOverflow,
     PageTooSmall,
     SpanSizeOverflow,
 };
