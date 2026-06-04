@@ -11,8 +11,9 @@ pub const TreeLookupError = error{
 pub const TreeWriteError = error{
     EmptyBranchRoot,
     EmptyLeafSplit,
-    UnsupportedChildSplit,
-    UnsupportedTreeDepth,
+    KeyValueTooLarge,
+    BranchEntryTooLarge,
+    PageOverflowNoValidSplit,
 };
 
 pub const PendingPage = struct {
@@ -33,6 +34,59 @@ const SplitLeafPages = struct {
     right_max_key: []const u8,
 };
 
+const SplitBranchPages = struct {
+    left_page: []const u8,
+    right_page: []const u8,
+    left_max_key: []const u8,
+    right_max_key: []const u8,
+};
+
+const ChildRef = struct {
+    page_id: u64,
+    max_key: []const u8,
+};
+
+const PutResult = union(enum) {
+    one: ChildRef,
+    split: struct {
+        left: ChildRef,
+        right: ChildRef,
+    },
+};
+
+const WriteContext = struct {
+    db: *db_mod.DB,
+    allocator: std.mem.Allocator,
+    temp_allocator: std.mem.Allocator,
+    last_allocated_page_id: u64,
+    pages: std.ArrayList(PendingPage),
+
+    fn init(db: *db_mod.DB, allocator: std.mem.Allocator, temp_allocator: std.mem.Allocator) WriteContext {
+        return .{
+            .db = db,
+            .allocator = allocator,
+            .temp_allocator = temp_allocator,
+            .last_allocated_page_id = db.high_water_mark,
+            .pages = .empty,
+        };
+    }
+
+    fn peekNextPageId(self: WriteContext) u64 {
+        return self.last_allocated_page_id + 1;
+    }
+
+    fn appendAllocatedPage(self: *WriteContext, page_id: u64, bytes: []const u8) !void {
+        // Page IDs become committed only through the returned WriteResult; failed
+        // writes may abandon this context without mutating DB state.
+        std.debug.assert(page_id == self.last_allocated_page_id + 1);
+        self.last_allocated_page_id = page_id;
+        try self.pages.append(self.allocator, .{
+            .page_id = page_id,
+            .bytes = bytes,
+        });
+    }
+};
+
 pub fn lookup(db: *db_mod.DB, allocator: std.mem.Allocator, key: []const u8) !?[]u8 {
     var page_id = db.root_page_id;
 
@@ -44,7 +98,7 @@ pub fn lookup(db: *db_mod.DB, allocator: std.mem.Allocator, key: []const u8) !?[
         switch (header.page_type) {
             .branch => {
                 const branch_page = try page.BranchPage.validate(page_bytes);
-                page_id = try selectChild(branch_page, key);
+                page_id = (try selectChildForLookup(branch_page, key)) orelse return null;
             },
             .leaf => {
                 const leaf_page = try page.LeafPage.validate(page_bytes);
@@ -61,11 +115,32 @@ pub fn writePut(db: *db_mod.DB, allocator: std.mem.Allocator, key: []const u8, v
     const root_page_bytes = try readTreePage(db, allocator, db.root_page_id);
     defer allocator.free(root_page_bytes);
 
-    const header = try page.decodeHeader(root_page_bytes);
-    return switch (header.page_type) {
-        .leaf => try writeRootLeafPut(db, allocator, root_page_bytes, key, value),
-        .branch => try writeBranchRootPut(db, allocator, root_page_bytes, key, value),
-        else => error.UnexpectedPageType,
+    var temp_arena = std.heap.ArenaAllocator.init(allocator);
+    defer temp_arena.deinit();
+
+    var ctx = WriteContext.init(db, allocator, temp_arena.allocator());
+    const root_result = try writeNodePut(&ctx, root_page_bytes, key, value);
+
+    const root_page_id = switch (root_result) {
+        .one => |child| child.page_id,
+        .split => |children| blk: {
+            // Non-root branch splits bubble upward as child refs. Only the original
+            // root split creates a new branch root and increases tree height.
+            const root_id = ctx.peekNextPageId();
+            const root_entries = [_]page.BranchEntry{
+                .{ .key = children.left.max_key, .child_page_id = children.left.page_id },
+                .{ .key = children.right.max_key, .child_page_id = children.right.page_id },
+            };
+            const root_page = try encodeBranchPageAlloc(allocator, db.page_size, root_id, 0, &root_entries);
+            try ctx.appendAllocatedPage(root_id, root_page);
+            break :blk root_id;
+        },
+    };
+
+    return .{
+        .root_page_id = root_page_id,
+        .high_water_mark = ctx.last_allocated_page_id,
+        .pages = ctx.pages.items,
     };
 }
 
@@ -73,7 +148,7 @@ fn readTreePage(db: *db_mod.DB, allocator: std.mem.Allocator, page_id: u64) ![]u
     return db.readPageAlloc(allocator, page_id);
 }
 
-fn selectChild(branch_page: page.BranchPage, key: []const u8) !u64 {
+fn selectChildForLookup(branch_page: page.BranchPage, key: []const u8) !?u64 {
     var index: u16 = 0;
     while (index < branch_page.count()) : (index += 1) {
         const entry = try branch_page.entry(index);
@@ -84,9 +159,7 @@ fn selectChild(branch_page: page.BranchPage, key: []const u8) !u64 {
         }
     }
 
-    // A branch page that cannot route a search key violates the stored
-    // upper-bound invariant rather than representing a normal lookup miss.
-    return TreeLookupError.CorruptTreePath;
+    return null;
 }
 
 fn selectChildIndexForPut(branch_page: page.BranchPage, key: []const u8) !u16 {
@@ -123,234 +196,142 @@ fn findInLeaf(leaf_page: page.LeafPage, allocator: std.mem.Allocator, key: []con
     return null;
 }
 
-fn writeRootLeafPut(
-    db: *db_mod.DB,
-    allocator: std.mem.Allocator,
-    root_page_bytes: []const u8,
-    key: []const u8,
-    value: []const u8,
-) !WriteResult {
-    const root_leaf = try page.LeafPage.validate(root_page_bytes);
-
-    var next_entries = std.ArrayList(page.LeafEntry).empty;
-    try collectUpdatedLeafEntries(&next_entries, root_leaf, allocator, key, value);
-
-    const next_root_page_id = db.high_water_mark + 1;
-    const next_root_page = encodeLeafPageAlloc(
-        allocator,
-        db.page_size,
-        next_root_page_id,
-        root_leaf.header.order,
-        next_entries.items,
-    ) catch |err| switch (err) {
-        error.PageFull => return try splitRootLeaf(db, allocator, root_leaf.header.order, next_entries.items),
-        else => return err,
-    };
-
-    const pending_pages = try allocator.alloc(PendingPage, 1);
-    pending_pages[0] = .{ .page_id = next_root_page_id, .bytes = next_root_page };
-
-    return .{
-        .root_page_id = next_root_page_id,
-        .high_water_mark = next_root_page_id,
-        .pages = pending_pages,
+fn writeNodePut(ctx: *WriteContext, node_page_bytes: []const u8, key: []const u8, value: []const u8) anyerror!PutResult {
+    const header = try page.decodeHeader(node_page_bytes);
+    return switch (header.page_type) {
+        .leaf => try writeLeafPut(ctx, node_page_bytes, key, value),
+        .branch => try writeBranchPut(ctx, node_page_bytes, key, value),
+        else => error.UnexpectedPageType,
     };
 }
 
-fn splitRootLeaf(
-    db: *db_mod.DB,
-    allocator: std.mem.Allocator,
-    leaf_order: u8,
-    entries: []const page.LeafEntry,
-) !WriteResult {
-    const left_id = db.high_water_mark + 1;
-    const right_id = db.high_water_mark + 2;
-    const root_id = db.high_water_mark + 3;
+fn writeLeafPut(ctx: *WriteContext, leaf_page_bytes: []const u8, key: []const u8, value: []const u8) anyerror!PutResult {
+    const leaf_page = try page.LeafPage.validate(leaf_page_bytes);
 
+    var next_entries = std.ArrayList(page.LeafEntry).empty;
+    try collectUpdatedLeafEntries(&next_entries, leaf_page, ctx.temp_allocator, key, value);
+
+    const page_id = ctx.peekNextPageId();
+    const leaf_bytes = encodeLeafPageAlloc(
+        ctx.allocator,
+        ctx.db.page_size,
+        page_id,
+        leaf_page.header.order,
+        next_entries.items,
+    ) catch |err| switch (err) {
+        error.PageFull => {
+            if (next_entries.items.len == 1) return TreeWriteError.KeyValueTooLarge;
+            return try splitLeafPut(ctx, leaf_page.header.order, next_entries.items);
+        },
+        else => return err,
+    };
+
+    try ctx.appendAllocatedPage(page_id, leaf_bytes);
+    return .{ .one = .{
+        .page_id = page_id,
+        .max_key = maxKey(next_entries.items),
+    } };
+}
+
+fn writeBranchPut(ctx: *WriteContext, branch_page_bytes: []const u8, key: []const u8, value: []const u8) anyerror!PutResult {
+    const branch_page = try page.BranchPage.validate(branch_page_bytes);
+    const child_index = try selectChildIndexForPut(branch_page, key);
+    const child_entry = try branch_page.entry(child_index);
+
+    const child_page_bytes = try readTreePage(ctx.db, ctx.allocator, child_entry.child_page_id);
+    defer ctx.allocator.free(child_page_bytes);
+
+    const child_result = try writeNodePut(ctx, child_page_bytes, key, value);
+
+    var next_entries = std.ArrayList(page.BranchEntry).empty;
+    try collectUpdatedBranchEntries(&next_entries, branch_page, ctx.temp_allocator, child_index, child_result);
+
+    const page_id = ctx.peekNextPageId();
+    const branch_bytes = encodeBranchPageAlloc(
+        ctx.allocator,
+        ctx.db.page_size,
+        page_id,
+        branch_page.header.order,
+        next_entries.items,
+    ) catch |err| switch (err) {
+        error.PageFull => {
+            if (next_entries.items.len == 1) return TreeWriteError.BranchEntryTooLarge;
+            return try splitBranchPut(ctx, branch_page.header.order, next_entries.items);
+        },
+        else => return err,
+    };
+
+    try ctx.appendAllocatedPage(page_id, branch_bytes);
+    return .{ .one = .{
+        .page_id = page_id,
+        .max_key = branchEntriesMaxKey(next_entries.items),
+    } };
+}
+
+fn collectUpdatedBranchEntries(
+    entries: *std.ArrayList(page.BranchEntry),
+    branch_page: page.BranchPage,
+    allocator: std.mem.Allocator,
+    child_index: u16,
+    child_result: PutResult,
+) !void {
+    var index: u16 = 0;
+    while (index < branch_page.count()) : (index += 1) {
+        const existing = try branch_page.entry(index);
+        if (index == child_index) {
+            switch (child_result) {
+                .one => |child| try appendBranchEntry(entries, allocator, child.max_key, child.page_id),
+                .split => |children| {
+                    try appendBranchEntry(entries, allocator, children.left.max_key, children.left.page_id);
+                    try appendBranchEntry(entries, allocator, children.right.max_key, children.right.page_id);
+                },
+            }
+        } else {
+            try appendBranchEntry(entries, allocator, existing.key, existing.child_page_id);
+        }
+    }
+}
+
+fn splitLeafPut(ctx: *WriteContext, leaf_order: u8, entries: []const page.LeafEntry) anyerror!PutResult {
+    const left_id = ctx.peekNextPageId();
+    const right_id = left_id + 1;
     const split_pages = try splitLeafEntries(
-        allocator,
-        db.page_size,
+        ctx.allocator,
+        ctx.db.page_size,
         left_id,
         right_id,
         leaf_order,
         entries,
     );
 
-    const branch_entries = [_]page.BranchEntry{
-        .{ .key = split_pages.left_max_key, .child_page_id = left_id },
-        .{ .key = split_pages.right_max_key, .child_page_id = right_id },
-    };
-    const root_page = encodeBranchPageAlloc(allocator, db.page_size, root_id, 0, &branch_entries) catch |err| {
-        allocator.free(split_pages.left_page);
-        allocator.free(split_pages.right_page);
-        return err;
-    };
+    try ctx.appendAllocatedPage(left_id, split_pages.left_page);
+    try ctx.appendAllocatedPage(right_id, split_pages.right_page);
 
-    const pending_pages = try allocator.alloc(PendingPage, 3);
-    pending_pages[0] = .{ .page_id = left_id, .bytes = split_pages.left_page };
-    pending_pages[1] = .{ .page_id = right_id, .bytes = split_pages.right_page };
-    pending_pages[2] = .{ .page_id = root_id, .bytes = root_page };
-
-    return .{
-        .root_page_id = root_id,
-        .high_water_mark = root_id,
-        .pages = pending_pages,
-    };
+    return .{ .split = .{
+        .left = .{ .page_id = left_id, .max_key = split_pages.left_max_key },
+        .right = .{ .page_id = right_id, .max_key = split_pages.right_max_key },
+    } };
 }
 
-fn writeBranchRootPut(
-    db: *db_mod.DB,
-    allocator: std.mem.Allocator,
-    root_page_bytes: []const u8,
-    key: []const u8,
-    value: []const u8,
-) !WriteResult {
-    const root_branch = try page.BranchPage.validate(root_page_bytes);
-    const child_index = try selectChildIndexForPut(root_branch, key);
-    const child_entry = try root_branch.entry(child_index);
-
-    const child_page_bytes = try readTreePage(db, allocator, child_entry.child_page_id);
-    defer allocator.free(child_page_bytes);
-
-    const child_header = try page.decodeHeader(child_page_bytes);
-    if (child_header.page_type != .leaf) return TreeWriteError.UnsupportedTreeDepth;
-
-    const child_leaf = try page.LeafPage.validate(child_page_bytes);
-    var next_child_entries = std.ArrayList(page.LeafEntry).empty;
-    try collectUpdatedLeafEntries(&next_child_entries, child_leaf, allocator, key, value);
-
-    const new_child_id = db.high_water_mark + 1;
-    const new_root_id = db.high_water_mark + 2;
-    const new_child_page = encodeLeafPageAlloc(
-        allocator,
-        db.page_size,
-        new_child_id,
-        child_leaf.header.order,
-        next_child_entries.items,
-    ) catch |err| switch (err) {
-        error.PageFull => return try writeBranchRootPutWithChildSplit(
-            db,
-            allocator,
-            root_branch,
-            child_index,
-            child_leaf.header.order,
-            next_child_entries.items,
-        ),
-        else => return err,
-    };
-
-    var branch_entries = std.ArrayList(page.BranchEntry).empty;
-    var index: u16 = 0;
-    while (index < root_branch.count()) : (index += 1) {
-        const existing = try root_branch.entry(index);
-        if (index == child_index) {
-            try branch_entries.append(allocator, .{
-                .key = maxKey(next_child_entries.items),
-                .child_page_id = new_child_id,
-            });
-        } else {
-            try branch_entries.append(allocator, .{
-                .key = try allocator.dupe(u8, existing.key),
-                .child_page_id = existing.child_page_id,
-            });
-        }
-    }
-
-    const new_root_page = encodeBranchPageAlloc(
-        allocator,
-        db.page_size,
-        new_root_id,
-        root_branch.header.order,
-        branch_entries.items,
-    ) catch |err| {
-        allocator.free(new_child_page);
-        return err;
-    };
-
-    const pending_pages = try allocator.alloc(PendingPage, 2);
-    pending_pages[0] = .{ .page_id = new_child_id, .bytes = new_child_page };
-    pending_pages[1] = .{ .page_id = new_root_id, .bytes = new_root_page };
-
-    return .{
-        .root_page_id = new_root_id,
-        .high_water_mark = new_root_id,
-        .pages = pending_pages,
-    };
-}
-
-fn writeBranchRootPutWithChildSplit(
-    db: *db_mod.DB,
-    allocator: std.mem.Allocator,
-    root_branch: page.BranchPage,
-    child_index: u16,
-    leaf_order: u8,
-    next_child_entries: []const page.LeafEntry,
-) !WriteResult {
-    const left_id = db.high_water_mark + 1;
-    const right_id = db.high_water_mark + 2;
-    const root_id = db.high_water_mark + 3;
-
-    const split_pages = try splitLeafEntries(
-        allocator,
-        db.page_size,
+fn splitBranchPut(ctx: *WriteContext, branch_order: u8, entries: []const page.BranchEntry) anyerror!PutResult {
+    const left_id = ctx.peekNextPageId();
+    const right_id = left_id + 1;
+    const split_pages = try splitBranchEntries(
+        ctx.allocator,
+        ctx.db.page_size,
         left_id,
         right_id,
-        leaf_order,
-        next_child_entries,
+        branch_order,
+        entries,
     );
 
-    var branch_entries = std.ArrayList(page.BranchEntry).empty;
-    var index: u16 = 0;
-    while (index < root_branch.count()) : (index += 1) {
-        const existing = try root_branch.entry(index);
-        if (index == child_index) {
-            try branch_entries.append(allocator, .{
-                .key = split_pages.left_max_key,
-                .child_page_id = left_id,
-            });
-            try branch_entries.append(allocator, .{
-                .key = split_pages.right_max_key,
-                .child_page_id = right_id,
-            });
-        } else {
-            try branch_entries.append(allocator, .{
-                .key = try allocator.dupe(u8, existing.key),
-                .child_page_id = existing.child_page_id,
-            });
-        }
-    }
+    try ctx.appendAllocatedPage(left_id, split_pages.left_page);
+    try ctx.appendAllocatedPage(right_id, split_pages.right_page);
 
-    const root_page = encodeBranchPageAlloc(
-        allocator,
-        db.page_size,
-        root_id,
-        root_branch.header.order,
-        branch_entries.items,
-    ) catch |err| switch (err) {
-        error.PageFull => {
-            allocator.free(split_pages.left_page);
-            allocator.free(split_pages.right_page);
-            // Child leaf split is supported only while the branch root still fits.
-            // Needing to split the branch/root is the next unsupported propagation step.
-            return TreeWriteError.UnsupportedChildSplit;
-        },
-        else => {
-            allocator.free(split_pages.left_page);
-            allocator.free(split_pages.right_page);
-            return err;
-        },
-    };
-
-    const pending_pages = try allocator.alloc(PendingPage, 3);
-    pending_pages[0] = .{ .page_id = left_id, .bytes = split_pages.left_page };
-    pending_pages[1] = .{ .page_id = right_id, .bytes = split_pages.right_page };
-    pending_pages[2] = .{ .page_id = root_id, .bytes = root_page };
-
-    return .{
-        .root_page_id = root_id,
-        .high_water_mark = root_id,
-        .pages = pending_pages,
-    };
+    return .{ .split = .{
+        .left = .{ .page_id = left_id, .max_key = split_pages.left_max_key },
+        .right = .{ .page_id = right_id, .max_key = split_pages.right_max_key },
+    } };
 }
 
 fn splitLeafEntries(
@@ -361,50 +342,180 @@ fn splitLeafEntries(
     leaf_order: u8,
     entries: []const page.LeafEntry,
 ) !SplitLeafPages {
-    if (entries.len < 2) return TreeWriteError.EmptyLeafSplit;
+    if (entries.len < 2) return TreeWriteError.KeyValueTooLarge;
 
-    var split_index: usize = 1;
-    while (split_index < entries.len) : (split_index += 1) {
-        const left_entries = entries[0..split_index];
-        const right_entries = entries[split_index..];
+    const midpoint = entries.len / 2;
+    var distance: usize = 0;
+    while (distance < entries.len) : (distance += 1) {
+        if (midpoint >= distance) {
+            if (try trySplitLeafAt(
+                allocator,
+                page_size,
+                left_id,
+                right_id,
+                leaf_order,
+                entries,
+                midpoint - distance,
+            )) |split_pages| return split_pages;
+        }
 
-        const left_page = encodeLeafPageAlloc(
-            allocator,
-            page_size,
-            left_id,
-            leaf_order,
-            left_entries,
-        ) catch |err| switch (err) {
-            error.PageFull => continue,
-            else => return err,
-        };
-
-        const right_page = encodeLeafPageAlloc(
-            allocator,
-            page_size,
-            right_id,
-            leaf_order,
-            right_entries,
-        ) catch |err| switch (err) {
-            error.PageFull => {
-                allocator.free(left_page);
-                continue;
-            },
-            else => {
-                allocator.free(left_page);
-                return err;
-            },
-        };
-
-        return .{
-            .left_page = left_page,
-            .right_page = right_page,
-            .left_max_key = maxKey(left_entries),
-            .right_max_key = maxKey(right_entries),
-        };
+        const right_candidate = midpoint + distance + 1;
+        if (right_candidate < entries.len) {
+            if (try trySplitLeafAt(
+                allocator,
+                page_size,
+                left_id,
+                right_id,
+                leaf_order,
+                entries,
+                right_candidate,
+            )) |split_pages| return split_pages;
+        }
     }
 
-    return error.PageFull;
+    return TreeWriteError.PageOverflowNoValidSplit;
+}
+
+fn trySplitLeafAt(
+    allocator: std.mem.Allocator,
+    page_size: u32,
+    left_id: u64,
+    right_id: u64,
+    leaf_order: u8,
+    entries: []const page.LeafEntry,
+    split_index: usize,
+) !?SplitLeafPages {
+    if (split_index == 0 or split_index >= entries.len) return null;
+
+    const left_entries = entries[0..split_index];
+    const right_entries = entries[split_index..];
+
+    const left_page = encodeLeafPageAlloc(
+        allocator,
+        page_size,
+        left_id,
+        leaf_order,
+        left_entries,
+    ) catch |err| switch (err) {
+        error.PageFull => return null,
+        else => return err,
+    };
+
+    const right_page = encodeLeafPageAlloc(
+        allocator,
+        page_size,
+        right_id,
+        leaf_order,
+        right_entries,
+    ) catch |err| switch (err) {
+        error.PageFull => {
+            allocator.free(left_page);
+            return null;
+        },
+        else => {
+            allocator.free(left_page);
+            return err;
+        },
+    };
+
+    return .{
+        .left_page = left_page,
+        .right_page = right_page,
+        .left_max_key = maxKey(left_entries),
+        .right_max_key = maxKey(right_entries),
+    };
+}
+
+fn splitBranchEntries(
+    allocator: std.mem.Allocator,
+    page_size: u32,
+    left_id: u64,
+    right_id: u64,
+    branch_order: u8,
+    entries: []const page.BranchEntry,
+) !SplitBranchPages {
+    if (entries.len < 2) return TreeWriteError.BranchEntryTooLarge;
+
+    const midpoint = entries.len / 2;
+    var distance: usize = 0;
+    while (distance < entries.len) : (distance += 1) {
+        if (midpoint >= distance) {
+            if (try trySplitBranchAt(
+                allocator,
+                page_size,
+                left_id,
+                right_id,
+                branch_order,
+                entries,
+                midpoint - distance,
+            )) |split_pages| return split_pages;
+        }
+
+        const right_candidate = midpoint + distance + 1;
+        if (right_candidate < entries.len) {
+            if (try trySplitBranchAt(
+                allocator,
+                page_size,
+                left_id,
+                right_id,
+                branch_order,
+                entries,
+                right_candidate,
+            )) |split_pages| return split_pages;
+        }
+    }
+
+    return TreeWriteError.PageOverflowNoValidSplit;
+}
+
+fn trySplitBranchAt(
+    allocator: std.mem.Allocator,
+    page_size: u32,
+    left_id: u64,
+    right_id: u64,
+    branch_order: u8,
+    entries: []const page.BranchEntry,
+    split_index: usize,
+) !?SplitBranchPages {
+    if (split_index == 0 or split_index >= entries.len) return null;
+
+    const left_entries = entries[0..split_index];
+    const right_entries = entries[split_index..];
+
+    const left_page = encodeBranchPageAlloc(
+        allocator,
+        page_size,
+        left_id,
+        branch_order,
+        left_entries,
+    ) catch |err| switch (err) {
+        error.PageFull => return null,
+        else => return err,
+    };
+
+    const right_page = encodeBranchPageAlloc(
+        allocator,
+        page_size,
+        right_id,
+        branch_order,
+        right_entries,
+    ) catch |err| switch (err) {
+        error.PageFull => {
+            allocator.free(left_page);
+            return null;
+        },
+        else => {
+            allocator.free(left_page);
+            return err;
+        },
+    };
+
+    return .{
+        .left_page = left_page,
+        .right_page = right_page,
+        .left_max_key = branchEntriesMaxKey(left_entries),
+        .right_max_key = branchEntriesMaxKey(right_entries),
+    };
 }
 
 fn collectUpdatedLeafEntries(
@@ -450,6 +561,18 @@ fn appendLeafEntry(
         .key = try allocator.dupe(u8, key),
         .value = try allocator.dupe(u8, value),
         .flags = flags,
+    });
+}
+
+fn appendBranchEntry(
+    entries: *std.ArrayList(page.BranchEntry),
+    allocator: std.mem.Allocator,
+    key: []const u8,
+    child_page_id: u64,
+) !void {
+    try entries.append(allocator, .{
+        .key = try allocator.dupe(u8, key),
+        .child_page_id = child_page_id,
     });
 }
 
@@ -500,7 +623,12 @@ fn maxKey(entries: []const page.LeafEntry) []const u8 {
     return entries[entries.len - 1].key;
 }
 
-// ======tests=====
+fn branchEntriesMaxKey(entries: []const page.BranchEntry) []const u8 {
+    std.debug.assert(entries.len > 0);
+    return entries[entries.len - 1].key;
+}
+
+// ======tests======
 
 // Test helpers build on-disk fixtures that exercise the real `DB.open` and
 // `DB.get` path without mixing fixture details into the production API.
@@ -755,7 +883,7 @@ test "lookup returns null after descending through branch pages" {
     try std.testing.expect(value == null);
 }
 
-test "lookup rejects branch paths whose upper-bounds cannot route the key" {
+test "lookup returns null when the key is beyond the root upper bound" {
     const page_size = test_page_size;
     var branch_page_bytes = [_]u8{0} ** page_size;
     _ = try page.BranchPage.encodeInto(branch_page_bytes[0..], .{
@@ -787,7 +915,9 @@ test "lookup rejects branch paths whose upper-bounds cannot route the key" {
     });
     defer db.close();
 
-    try std.testing.expectError(TreeLookupError.CorruptTreePath, lookup(db, std.testing.allocator, "omega"));
+    const value = try lookup(db, std.testing.allocator, "omega");
+    defer if (value) |owned| std.testing.allocator.free(owned);
+    try std.testing.expect(value == null);
 }
 
 test "lookup rejects root pages that are neither branch nor leaf" {
