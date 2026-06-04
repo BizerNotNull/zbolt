@@ -406,7 +406,189 @@ fn expectBranchUpperBoundKeysAreReadable(db: *DB) !void {
     }
 }
 
-// ======tests=====
+fn expectThreeLevelBranchRootMatchesLeaves(db: *DB, expected_root_id: u64) !void {
+    try std.testing.expectEqual(expected_root_id, db.root_page_id);
+
+    const root_page = try db.readPageAlloc(std.testing.allocator, db.root_page_id);
+    defer std.testing.allocator.free(root_page);
+
+    const root_branch = try page.BranchPage.validate(root_page);
+    try std.testing.expectEqual(@as(u16, 2), root_branch.count());
+
+    var root_index: u16 = 0;
+    while (root_index < root_branch.count()) : (root_index += 1) {
+        const root_entry = try root_branch.entry(root_index);
+        const branch_child_page = try db.readPageAlloc(std.testing.allocator, root_entry.child_page_id);
+        defer std.testing.allocator.free(branch_child_page);
+
+        const branch_child = try page.BranchPage.validate(branch_child_page);
+        try std.testing.expect(branch_child.count() > 0);
+
+        const branch_child_max = try branch_child.entry(branch_child.count() - 1);
+        try std.testing.expectEqualSlices(u8, branch_child_max.key, root_entry.key);
+
+        var child_index: u16 = 0;
+        while (child_index < branch_child.count()) : (child_index += 1) {
+            const branch_entry = try branch_child.entry(child_index);
+            const leaf_page_bytes = try db.readPageAlloc(std.testing.allocator, branch_entry.child_page_id);
+            defer std.testing.allocator.free(leaf_page_bytes);
+
+            const leaf = try page.LeafPage.validate(leaf_page_bytes);
+            try std.testing.expect(leaf.count() > 0);
+
+            const leaf_max = try leaf.entry(leaf.count() - 1);
+            try std.testing.expectEqualSlices(u8, leaf_max.key, branch_entry.key);
+
+            const value = try db.get(std.testing.allocator, branch_entry.key);
+            defer if (value) |owned| std.testing.allocator.free(owned);
+            try std.testing.expect(value != null);
+        }
+    }
+}
+
+const TreeBounds = struct {
+    min_key: []const u8,
+    max_key: []const u8,
+    leaf_depth: u32,
+};
+
+fn assertTreeInvariants(db: *DB) !void {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var reachable = std.ArrayList(u64).empty;
+    _ = try assertSubtreeInvariants(
+        db,
+        arena.allocator(),
+        &reachable,
+        db.root_page_id,
+        0,
+        null,
+        null,
+    );
+}
+
+fn assertSubtreeInvariants(
+    db: *DB,
+    allocator: std.mem.Allocator,
+    reachable: *std.ArrayList(u64),
+    page_id: u64,
+    depth: u32,
+    lower_exclusive: ?[]const u8,
+    upper_inclusive: ?[]const u8,
+) anyerror!TreeBounds {
+    try std.testing.expect(page_id <= db.high_water_mark);
+    for (reachable.items) |seen| {
+        try std.testing.expect(seen != page_id);
+    }
+    try reachable.append(allocator, page_id);
+
+    const page_bytes = try db.readPageAlloc(std.testing.allocator, page_id);
+    defer std.testing.allocator.free(page_bytes);
+
+    const header = try page.decodeHeader(page_bytes);
+    return switch (header.page_type) {
+        .leaf => blk: {
+            const leaf_page = try page.LeafPage.validate(page_bytes);
+            break :blk try assertLeafInvariants(allocator, leaf_page, depth, lower_exclusive, upper_inclusive);
+        },
+        .branch => blk: {
+            const branch_page = try page.BranchPage.validate(page_bytes);
+            break :blk try assertBranchInvariants(db, allocator, reachable, branch_page, depth, lower_exclusive, upper_inclusive);
+        },
+        else => error.UnexpectedPageType,
+    };
+}
+
+fn assertLeafInvariants(
+    allocator: std.mem.Allocator,
+    leaf_page: page.LeafPage,
+    depth: u32,
+    lower_exclusive: ?[]const u8,
+    upper_inclusive: ?[]const u8,
+) !TreeBounds {
+    try std.testing.expect(leaf_page.count() > 0);
+
+    var previous_key: ?[]const u8 = null;
+    var index: u16 = 0;
+    while (index < leaf_page.count()) : (index += 1) {
+        const entry = try leaf_page.entry(index);
+        try expectKeyInRange(entry.key, lower_exclusive, upper_inclusive);
+        if (previous_key) |previous| {
+            try std.testing.expect(std.mem.order(u8, previous, entry.key) == .lt);
+        }
+        previous_key = entry.key;
+    }
+
+    const first = try leaf_page.entry(0);
+    const last = try leaf_page.entry(leaf_page.count() - 1);
+    return .{
+        .min_key = try allocator.dupe(u8, first.key),
+        .max_key = try allocator.dupe(u8, last.key),
+        .leaf_depth = depth,
+    };
+}
+
+fn assertBranchInvariants(
+    db: *DB,
+    allocator: std.mem.Allocator,
+    reachable: *std.ArrayList(u64),
+    branch_page: page.BranchPage,
+    depth: u32,
+    lower_exclusive: ?[]const u8,
+    upper_inclusive: ?[]const u8,
+) anyerror!TreeBounds {
+    try std.testing.expect(branch_page.count() > 0);
+
+    var previous_upper = lower_exclusive;
+    var previous_leaf_depth: ?u32 = null;
+    var min_key: ?[]const u8 = null;
+    var max_key: ?[]const u8 = null;
+
+    var index: u16 = 0;
+    while (index < branch_page.count()) : (index += 1) {
+        const entry = try branch_page.entry(index);
+        try expectKeyInRange(entry.key, previous_upper, upper_inclusive);
+
+        const child_bounds = try assertSubtreeInvariants(
+            db,
+            allocator,
+            reachable,
+            entry.child_page_id,
+            depth + 1,
+            previous_upper,
+            entry.key,
+        );
+        try std.testing.expectEqualSlices(u8, child_bounds.max_key, entry.key);
+
+        if (previous_leaf_depth) |leaf_depth| {
+            try std.testing.expectEqual(leaf_depth, child_bounds.leaf_depth);
+        } else {
+            previous_leaf_depth = child_bounds.leaf_depth;
+            min_key = child_bounds.min_key;
+        }
+
+        previous_upper = entry.key;
+        max_key = child_bounds.max_key;
+    }
+
+    return .{
+        .min_key = min_key.?,
+        .max_key = max_key.?,
+        .leaf_depth = previous_leaf_depth.?,
+    };
+}
+
+fn expectKeyInRange(key: []const u8, lower_exclusive: ?[]const u8, upper_inclusive: ?[]const u8) !void {
+    if (lower_exclusive) |lower| {
+        try std.testing.expect(std.mem.order(u8, lower, key) == .lt);
+    }
+    if (upper_inclusive) |upper| {
+        try std.testing.expect(std.mem.order(u8, key, upper) != .gt);
+    }
+}
+
+// ======tests======
 
 test "open returns DB for an existing file" {
     var tmp = std.testing.tmpDir(.{});
@@ -969,7 +1151,7 @@ test "put splits a full branch child leaf and updates the branch root" {
     try expectBranchUpperBoundKeysAreReadable(reopened);
 }
 
-test "put rejects child split when the branch root would also split" {
+test "put splits branch root after a child leaf split fills the root" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -1066,35 +1248,149 @@ test "put rejects child split when the branch root would also split" {
         const db = try open(std.testing.allocator, path);
         defer db.close();
 
-        const old_root_page_id = db.root_page_id;
         const old_high_water_mark = db.high_water_mark;
         const old_txid = db.txid;
-        const old_meta_slot = db.meta_slot;
 
         var value_buf: [160]u8 = undefined;
-        try std.testing.expectError(
-            tree.TreeWriteError.UnsupportedChildSplit,
-            db.put("zzzz", fillFixedValue(&value_buf, 'y')),
-        );
+        try db.put("zzzz", fillFixedValue(&value_buf, 'y'));
 
-        try std.testing.expectEqual(old_root_page_id, db.root_page_id);
-        try std.testing.expectEqual(old_high_water_mark, db.high_water_mark);
-        try std.testing.expectEqual(old_txid, db.txid);
-        try std.testing.expectEqual(old_meta_slot, db.meta_slot);
+        try std.testing.expectEqual(old_txid + 1, db.txid);
+        try std.testing.expectEqual(old_high_water_mark + 5, db.root_page_id);
+        try std.testing.expectEqual(old_high_water_mark + 5, db.high_water_mark);
+        try expectThreeLevelBranchRootMatchesLeaves(db, old_high_water_mark + 5);
+
+        try expectDbValue(db, "k0000", "v");
+        try expectDbValue(db, "k0237", "v");
+        try expectDbValue(db, "k0238", fillFixedValue(&value_buf, 'x'));
+        try expectDbValue(db, "k0260", fillFixedValue(&value_buf, 'x'));
+        try expectDbValue(db, "zzzz", fillFixedValue(&value_buf, 'y'));
+    }
+
+    {
+        const reopened = try open(std.testing.allocator, path);
+        defer reopened.close();
+
+        try std.testing.expectEqual(@as(u64, 246), reopened.root_page_id);
+        try std.testing.expectEqual(@as(u64, 246), reopened.high_water_mark);
+        try std.testing.expectEqual(@as(u64, 1), reopened.txid);
+        try expectThreeLevelBranchRootMatchesLeaves(reopened, 246);
+        try assertTreeInvariants(reopened);
+
+        var value_buf: [160]u8 = undefined;
+        try expectDbValue(reopened, "k0000", "v");
+        try expectDbValue(reopened, "k0237", "v");
+        try expectDbValue(reopened, "k0238", fillFixedValue(&value_buf, 'x'));
+        try expectDbValue(reopened, "k0260", fillFixedValue(&value_buf, 'x'));
+        try expectDbValue(reopened, "zzzz", fillFixedValue(&value_buf, 'y'));
+
+        try reopened.put("k0000", "updated");
+        try reopened.put("zzzzz", "tail");
+        try reopened.put("a0000", "head");
+        var huge_value = [_]u8{'h'} ** 3500;
+        try reopened.put("k0238", huge_value[0..]);
+        try expectDbValue(reopened, "a0000", "head");
+        try expectDbValue(reopened, "k0000", "updated");
+        try expectDbValue(reopened, "k0238", huge_value[0..]);
+        try expectDbValue(reopened, "zzzzz", "tail");
+        try assertTreeInvariants(reopened);
+    }
+
+    const final_reopen = try open(std.testing.allocator, path);
+    defer final_reopen.close();
+    var huge_value = [_]u8{'h'} ** 3500;
+    try expectDbValue(final_reopen, "a0000", "head");
+    try expectDbValue(final_reopen, "k0000", "updated");
+    try expectDbValue(final_reopen, "k0238", huge_value[0..]);
+    try expectDbValue(final_reopen, "zzzzz", "tail");
+    try assertTreeInvariants(final_reopen);
+}
+
+test "put matches deterministic oracle across reopen cycles" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path = try tempFilePath(&path_buf, tmp.dir, "put-oracle.db");
+
+    const key_count = 96;
+    var present = [_]bool{false} ** key_count;
+    var expected_len = [_]usize{0} ** key_count;
+    var expected_byte = [_]u8{0} ** key_count;
+    var state: u64 = 0xB01DBA5E;
+
+    {
+        var db = try open(std.testing.allocator, path);
+
+        var op_index: usize = 0;
+        while (op_index < 260) : (op_index += 1) {
+            const raw = nextPseudoRandom(&state);
+            const key_index = raw % key_count;
+            const value_len = 12 + ((raw >> 8) % 190);
+            const value_byte: u8 = @intCast('a' + (raw % 23));
+
+            var key_buf: [5]u8 = undefined;
+            const key = try generatedKey(&key_buf, key_index);
+            const value = try std.testing.allocator.alloc(u8, value_len);
+            defer std.testing.allocator.free(value);
+            @memset(value, value_byte);
+
+            try db.put(key, value);
+            present[key_index] = true;
+            expected_len[key_index] = value_len;
+            expected_byte[key_index] = value_byte;
+
+            if (op_index % 29 == 28) {
+                try assertOracleMatches(db, &present, &expected_len, &expected_byte);
+                try assertTreeInvariants(db);
+                db.close();
+                db = try open(std.testing.allocator, path);
+            }
+        }
+
+        try assertOracleMatches(db, &present, &expected_len, &expected_byte);
+        try assertTreeInvariants(db);
+        db.close();
     }
 
     const reopened = try open(std.testing.allocator, path);
     defer reopened.close();
+    try assertOracleMatches(reopened, &present, &expected_len, &expected_byte);
+    try assertTreeInvariants(reopened);
+}
 
-    try std.testing.expectEqual(@as(u64, 2), reopened.root_page_id);
-    try std.testing.expectEqual(@as(u64, 241), reopened.high_water_mark);
-    try std.testing.expectEqual(@as(u64, 0), reopened.txid);
-    try expectBranchRootMatchesChildren(reopened, branch_entry_count);
+fn nextPseudoRandom(state: *u64) usize {
+    state.* = state.* *% 6364136223846793005 +% 1442695040888963407;
+    return @intCast(state.* >> 16);
+}
 
-    var last_key_buf: [5]u8 = undefined;
-    const last_key = try generatedKey(&last_key_buf, branch_entry_count + 21);
-    var value_buf: [160]u8 = undefined;
-    try expectDbValue(reopened, last_key, fillFixedValue(&value_buf, 'x'));
+fn assertOracleMatches(
+    db: *DB,
+    present: *const [96]bool,
+    expected_len: *const [96]usize,
+    expected_byte: *const [96]u8,
+) !void {
+    var index: usize = 0;
+    while (index < present.len) : (index += 1) {
+        var key_buf: [5]u8 = undefined;
+        const key = try generatedKey(&key_buf, index);
+        const value = try db.get(std.testing.allocator, key);
+        defer if (value) |owned| std.testing.allocator.free(owned);
+
+        if (present[index]) {
+            try std.testing.expect(value != null);
+            try std.testing.expectEqual(expected_len[index], value.?.len);
+            if (value.?.len > 0) {
+                try std.testing.expectEqual(expected_byte[index], value.?[0]);
+                try std.testing.expectEqual(expected_byte[index], value.?[value.?.len - 1]);
+            }
+        } else {
+            try std.testing.expect(value == null);
+        }
+    }
+
+    const missing = try db.get(std.testing.allocator, "zz-nope");
+    defer if (missing) |owned| std.testing.allocator.free(owned);
+    try std.testing.expect(missing == null);
 }
 
 test "put rejects non-tree root pages" {
