@@ -30,3 +30,8 @@ pub const DbOpenError = error{
     InvalidDatabaseFile,
     DatabaseFileTooSmall,
 };
+
+pub const StorageError = error{
+    PageLengthMismatch,
+    PageOffsetOverflow,
+};

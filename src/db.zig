@@ -2,6 +2,7 @@ const std = @import("std");
 const errors = @import("errors.zig");
 const meta = @import("meta.zig");
 const page = @import("page.zig");
+const storage = @import("storage.zig");
 const tree = @import("tree.zig");
 
 const default_page_size: u32 = 4096;
@@ -55,13 +56,15 @@ pub const DB = struct {
         // Dirty tree pages are written in child-to-root order, and the meta
         // page remains the only commit point visible during recovery.
         for (write_result.pages) |pending_page| {
-            try writePage(&self.file, io, pending_page.page_id, pending_page.bytes);
+            try storage.writePage(&self.file, io, pending_page.page_id, self.page_size, pending_page.bytes);
         }
+        try storage.sync(self.file, io);
 
         const next_meta_slot = inactiveMetaSlot(self.meta_slot);
         // Meta pages act as the commit point. Writing the inactive slot last
         // keeps the previously selected snapshot available until this commit is durable.
-        try writePage(&self.file, io, metaSlotPageId(next_meta_slot), next_meta_page);
+        try storage.writePage(&self.file, io, metaSlotPageId(next_meta_slot), self.page_size, next_meta_page);
+        try storage.sync(self.file, io);
 
         self.meta_slot = next_meta_slot;
         self.flags = next_meta.flags;
@@ -72,7 +75,7 @@ pub const DB = struct {
     }
 
     pub fn readPageAlloc(self: *DB, allocator: std.mem.Allocator, page_id: u64) ![]u8 {
-        return readPage(allocator, &self.file, self.io_threaded.io(), page_id, self.page_size);
+        return storage.readPageAlloc(allocator, &self.file, self.io_threaded.io(), page_id, self.page_size);
     }
 };
 
@@ -137,7 +140,6 @@ fn recoverOrInitialize(db: *DB) !void {
     db.txid = selected.meta.txid;
 }
 
-// TODO: plan to implement crash-safe base on commit marker
 fn initializeEmptyDatabase(db: *DB) !void {
     const initial_meta = meta.Meta{
         .page_size = default_page_size,
@@ -157,48 +159,25 @@ fn initializeEmptyDatabase(db: *DB) !void {
     const root_page = try allocateEmptyRootPage(db.allocator, default_page_size, initial_meta.root_page_id);
     defer db.allocator.free(root_page);
 
-    // TODO: atomic write for crash-safe, need to ponder neccessity on commit marker
     const io = db.io_threaded.io();
-    try writePage(&db.file, io, 0, meta0_page);
-    try writePage(&db.file, io, 1, meta1_page);
-    try writePage(&db.file, io, 2, root_page);
+    // A valid meta page is the recovery commit point, so the bootstrap root
+    // must reach durable storage before either meta page can reference it.
+    try storage.writePage(&db.file, io, initial_meta.root_page_id, default_page_size, root_page);
+    try storage.sync(db.file, io);
+    try storage.writePage(&db.file, io, 0, default_page_size, meta0_page);
+    try storage.writePage(&db.file, io, 1, default_page_size, meta1_page);
+    try storage.sync(db.file, io);
 }
 
 fn loadSelectedMeta(allocator: std.mem.Allocator, file: *std.Io.File, io: std.Io, page_size: u32) !meta.SelectedMeta {
-    const meta0_page = try readPage(allocator, file, io, 0, page_size);
+    const meta0_page = try storage.readPageAlloc(allocator, file, io, 0, page_size);
     defer allocator.free(meta0_page);
 
-    const meta1_page = try readPage(allocator, file, io, 1, page_size);
+    const meta1_page = try storage.readPageAlloc(allocator, file, io, 1, page_size);
     defer allocator.free(meta1_page);
 
     // TODO: parse meta pages need to be explicited decomposition
     return meta.selectNewestValid(meta0_page, meta1_page);
-}
-
-fn readPage(
-    allocator: std.mem.Allocator,
-    file: *const std.Io.File,
-    io: std.Io,
-    page_id: u64,
-    page_size: u32,
-) ![]u8 {
-    const page_bytes = try allocator.alloc(u8, page_size);
-    errdefer allocator.free(page_bytes);
-
-    var buffer: [256]u8 = undefined;
-    var reader = file.reader(io, &buffer);
-    try reader.seekTo(page_id * page_size);
-    try reader.interface.readSliceAll(page_bytes);
-
-    return page_bytes;
-}
-
-fn writePage(file: *std.Io.File, io: std.Io, page_id: u64, page_bytes: []const u8) !void {
-    var buffer: [256]u8 = undefined;
-    var writer = file.writer(io, &buffer);
-    try writer.seekTo(page_id * page_bytes.len);
-    try writer.interface.writeAll(page_bytes);
-    try writer.interface.flush();
 }
 
 fn allocateEmptyRootPage(allocator: std.mem.Allocator, page_size: u32, page_id: u64) ![]u8 {
@@ -264,9 +243,9 @@ fn bootstrapFile(path: []const u8) !void {
     const root_page = try allocateEmptyRootPage(std.testing.allocator, default_page_size, seeded_meta.root_page_id);
     defer std.testing.allocator.free(root_page);
 
-    try writePage(&file, io, 0, meta0_page);
-    try writePage(&file, io, 1, meta1_page);
-    try writePage(&file, io, 2, root_page);
+    try storage.writePage(&file, io, 0, default_page_size, meta0_page);
+    try storage.writePage(&file, io, 1, default_page_size, meta1_page);
+    try storage.writePage(&file, io, 2, default_page_size, root_page);
 }
 
 fn writeSeededDatabase(path: []const u8, meta0: meta.Meta, meta1: meta.Meta) !void {
@@ -286,9 +265,9 @@ fn writeSeededDatabase(path: []const u8, meta0: meta.Meta, meta1: meta.Meta) !vo
     const root_page = try allocateEmptyRootPage(std.testing.allocator, root_size, 2);
     defer std.testing.allocator.free(root_page);
 
-    try writePage(&file, io, 0, meta0_page);
-    try writePage(&file, io, 1, meta1_page);
-    try writePage(&file, io, 2, root_page);
+    try storage.writePage(&file, io, 0, meta0.page_size, meta0_page);
+    try storage.writePage(&file, io, 1, meta1.page_size, meta1_page);
+    try storage.writePage(&file, io, 2, root_size, root_page);
 }
 
 fn writeTreeDatabase(path: []const u8, root_page_id: u64, pages: []const []const u8) !void {
@@ -314,11 +293,11 @@ fn writeTreeDatabase(path: []const u8, root_page_id: u64, pages: []const []const
     const meta1_page = try meta.encode(std.testing.allocator, seeded_meta);
     defer std.testing.allocator.free(meta1_page);
 
-    try writePage(&file, io, 0, meta0_page);
-    try writePage(&file, io, 1, meta1_page);
+    try storage.writePage(&file, io, 0, default_page_size, meta0_page);
+    try storage.writePage(&file, io, 1, default_page_size, meta1_page);
 
     for (pages, 0..) |page_bytes, index| {
-        try writePage(&file, io, 2 + index, page_bytes);
+        try storage.writePage(&file, io, 2 + index, default_page_size, page_bytes);
     }
 }
 
@@ -654,10 +633,10 @@ test "open writes identical valid meta pages on bootstrap" {
     const db = try open(std.testing.allocator, path);
     defer db.close();
 
-    const meta0_page = try readPage(std.testing.allocator, &db.file, db.io_threaded.io(), 0, default_page_size);
+    const meta0_page = try storage.readPageAlloc(std.testing.allocator, &db.file, db.io_threaded.io(), 0, default_page_size);
     defer std.testing.allocator.free(meta0_page);
 
-    const meta1_page = try readPage(std.testing.allocator, &db.file, db.io_threaded.io(), 1, default_page_size);
+    const meta1_page = try storage.readPageAlloc(std.testing.allocator, &db.file, db.io_threaded.io(), 1, default_page_size);
     defer std.testing.allocator.free(meta1_page);
 
     const decoded0 = try meta.decode(meta0_page);
@@ -685,11 +664,36 @@ test "open bootstraps a valid empty leaf root page" {
     const db = try open(std.testing.allocator, path);
     defer db.close();
 
-    const root_page = try readPage(std.testing.allocator, &db.file, db.io_threaded.io(), 2, default_page_size);
+    const root_page = try storage.readPageAlloc(std.testing.allocator, &db.file, db.io_threaded.io(), 2, default_page_size);
     defer std.testing.allocator.free(root_page);
 
     const leaf_page = try page.LeafPage.validate(root_page);
     try std.testing.expectEqual(@as(u16, 0), leaf_page.count());
+}
+
+test "open rejects bootstrap root written without committed meta pages" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path = try tempFilePath(&path_buf, tmp.dir, "half-bootstrap.db");
+
+    const root_page = try allocateEmptyRootPage(std.testing.allocator, default_page_size, 2);
+    defer std.testing.allocator.free(root_page);
+
+    {
+        const io = std.testing.io;
+        var file = try std.Io.Dir.createFileAbsolute(io, path, .{
+            .read = true,
+            .truncate = true,
+        });
+        defer file.close(io);
+
+        try storage.writePage(&file, io, 2, default_page_size, root_page);
+        try storage.sync(file, io);
+    }
+
+    try std.testing.expectError(errors.DbOpenError.InvalidDatabaseFile, open(std.testing.allocator, path));
 }
 
 test "open recovers cached state from an existing valid database" {
@@ -751,13 +755,13 @@ test "open prefers only valid meta when the other one is invalid" {
         var file = try std.Io.Dir.openFileAbsolute(io, path, .{ .mode = .read_write });
         defer file.close(io);
 
-        const page_bytes = try readPage(std.testing.allocator, &file, io, 1, default_page_size);
+        const page_bytes = try storage.readPageAlloc(std.testing.allocator, &file, io, 1, default_page_size);
         defer std.testing.allocator.free(page_bytes);
 
         var invalid_page = try std.testing.allocator.dupe(u8, page_bytes);
         defer std.testing.allocator.free(invalid_page);
         invalid_page[12] ^= 0xFF;
-        try writePage(&file, io, 1, invalid_page);
+        try storage.writePage(&file, io, 1, default_page_size, invalid_page);
     }
 
     const db = try open(std.testing.allocator, path);
@@ -828,16 +832,16 @@ test "open maps invalid meta recovery into centralized db error" {
         var file = try std.Io.Dir.openFileAbsolute(io, path, .{ .mode = .read_write });
         defer file.close(io);
 
-        var meta0_page = try readPage(std.testing.allocator, &file, io, 0, default_page_size);
+        var meta0_page = try storage.readPageAlloc(std.testing.allocator, &file, io, 0, default_page_size);
         defer std.testing.allocator.free(meta0_page);
-        var meta1_page = try readPage(std.testing.allocator, &file, io, 1, default_page_size);
+        var meta1_page = try storage.readPageAlloc(std.testing.allocator, &file, io, 1, default_page_size);
         defer std.testing.allocator.free(meta1_page);
 
         meta0_page[8] ^= 0xFF;
         meta1_page[8] ^= 0xFF;
 
-        try writePage(&file, io, 0, meta0_page);
-        try writePage(&file, io, 1, meta1_page);
+        try storage.writePage(&file, io, 0, default_page_size, meta0_page);
+        try storage.writePage(&file, io, 1, default_page_size, meta1_page);
     }
 
     try std.testing.expectError(errors.DbOpenError.InvalidDatabaseFile, open(std.testing.allocator, path));
@@ -869,6 +873,102 @@ test "put commits a new root leaf and updates selected meta" {
     try std.testing.expectEqual(@as(u64, 3), selected.meta.root_page_id);
     try std.testing.expectEqual(@as(u64, 3), selected.meta.high_water_mark);
     try std.testing.expectEqual(@as(u64, 1), selected.meta.txid);
+}
+
+test "reopen ignores dirty pages written before meta switch" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path = try tempFilePath(&path_buf, tmp.dir, "dirty-before-meta.db");
+
+    {
+        const db = try open(std.testing.allocator, path);
+        defer db.close();
+
+        try db.put("alpha", "one");
+        const old_root_page_id = db.root_page_id;
+        const old_high_water_mark = db.high_water_mark;
+        const old_txid = db.txid;
+
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+
+        const write_result = try tree.writePut(db, arena.allocator(), "beta", "two");
+        const io = db.io_threaded.io();
+        for (write_result.pages) |pending_page| {
+            try storage.writePage(&db.file, io, pending_page.page_id, db.page_size, pending_page.bytes);
+        }
+        try storage.sync(db.file, io);
+
+        try std.testing.expectEqual(old_root_page_id, db.root_page_id);
+        try std.testing.expectEqual(old_high_water_mark, db.high_water_mark);
+        try std.testing.expectEqual(old_txid, db.txid);
+    }
+
+    const reopened = try open(std.testing.allocator, path);
+    defer reopened.close();
+
+    try std.testing.expectEqual(@as(u64, 3), reopened.root_page_id);
+    try std.testing.expectEqual(@as(u64, 3), reopened.high_water_mark);
+    try std.testing.expectEqual(@as(u64, 1), reopened.txid);
+
+    try expectDbValue(reopened, "alpha", "one");
+    const beta = try reopened.get(std.testing.allocator, "beta");
+    defer if (beta) |owned| std.testing.allocator.free(owned);
+    try std.testing.expect(beta == null);
+}
+
+test "reopen selects inactive meta after data pages and meta are durable" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path = try tempFilePath(&path_buf, tmp.dir, "meta-after-data.db");
+
+    {
+        const db = try open(std.testing.allocator, path);
+        defer db.close();
+
+        try db.put("alpha", "one");
+
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+
+        const write_result = try tree.writePut(db, arena.allocator(), "beta", "two");
+        const next_meta = meta.Meta{
+            .page_size = db.page_size,
+            .flags = db.flags,
+            .root_page_id = write_result.root_page_id,
+            .allocator_root = db.allocator_root,
+            .high_water_mark = write_result.high_water_mark,
+            .txid = db.txid + 1,
+        };
+        const next_meta_page = try meta.encode(std.testing.allocator, next_meta);
+        defer std.testing.allocator.free(next_meta_page);
+
+        const io = db.io_threaded.io();
+        for (write_result.pages) |pending_page| {
+            try storage.writePage(&db.file, io, pending_page.page_id, db.page_size, pending_page.bytes);
+        }
+        try storage.sync(db.file, io);
+
+        const next_meta_slot = inactiveMetaSlot(db.meta_slot);
+        try storage.writePage(&db.file, io, metaSlotPageId(next_meta_slot), db.page_size, next_meta_page);
+        try storage.sync(db.file, io);
+
+        try std.testing.expectEqual(@as(u64, 3), db.root_page_id);
+        try std.testing.expectEqual(@as(u64, 1), db.txid);
+    }
+
+    const reopened = try open(std.testing.allocator, path);
+    defer reopened.close();
+
+    try std.testing.expectEqual(@as(u64, 4), reopened.root_page_id);
+    try std.testing.expectEqual(@as(u64, 4), reopened.high_water_mark);
+    try std.testing.expectEqual(@as(u64, 2), reopened.txid);
+    try expectDbValue(reopened, "alpha", "one");
+    try expectDbValue(reopened, "beta", "two");
 }
 
 test "put inserts in sorted order and overwrites existing keys across reopen" {
@@ -1419,7 +1519,7 @@ test "put rejects non-tree root pages" {
             .upper = default_page_size,
             .flags = 0,
         });
-        try writePage(&file, io, 2, branch_root[0..]);
+        try storage.writePage(&file, io, 2, default_page_size, branch_root[0..]);
     }
 
     const db = try open(std.testing.allocator, path);
