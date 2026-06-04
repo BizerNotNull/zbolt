@@ -40,6 +40,7 @@ pub const LayoutError = errors.PageLayoutError;
 
 pub const leaf = @import("page/leaf.zig");
 pub const branch = @import("page/branch.zig");
+pub const allocator = @import("page/allocator.zig");
 
 pub const LeafEntry = leaf.Entry;
 pub const LeafEntryView = leaf.EntryView;
@@ -47,6 +48,8 @@ pub const LeafPage = leaf.LeafPage;
 pub const BranchEntry = branch.Entry;
 pub const BranchEntryView = branch.EntryView;
 pub const BranchPage = branch.BranchPage;
+pub const AllocatorEntry = allocator.Entry;
+pub const AllocatorPage = allocator.AllocatorPage;
 
 pub fn encodeHeader(page_bytes: []u8, header: Header) Error!void {
     if (page_bytes.len < header_size) return error.PageTooSmall;
