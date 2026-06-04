@@ -10,6 +10,8 @@ pub const Error = error{
     OutOfMemory,
     InvalidFreeBlock,
     FreeBlockOverlap,
+    InvalidAllocatorState,
+    AllocatorStateTooLarge,
 };
 
 const FreeBlockKey = struct {
@@ -123,6 +125,77 @@ pub const PageAllocator = struct {
         return self.free_index.contains(.{ .page_id = page_id, .order = order });
     }
 
+    pub fn freeBlockCount(self: PageAllocator) Error!usize {
+        var count: usize = 0;
+        for (self.free_lists) |free_list| {
+            count = std.math.add(usize, count, free_list.items.len) catch return error.AllocatorStateTooLarge;
+        }
+        return count;
+    }
+
+    pub fn allocatorStateOrder(self: PageAllocator, base_page_size: u32) (Error || page.Error)!u8 {
+        const required_size = page.allocator.bytesNeededForEntries(try self.freeBlockCount()) catch return error.AllocatorStateTooLarge;
+        return orderForSize(base_page_size, required_size);
+    }
+
+    pub fn encodeStatePageAlloc(
+        self: PageAllocator,
+        backing_allocator: std.mem.Allocator,
+        base_page_size: u32,
+        page_id: u64,
+        order: u8,
+    ) (Error || page.Error || page.LayoutError)![]u8 {
+        const span_size = try page.spanSize(base_page_size, order);
+        const state_page = try backing_allocator.alloc(u8, span_size);
+        errdefer backing_allocator.free(state_page);
+
+        var entries = std.ArrayList(page.AllocatorEntry).empty;
+        defer entries.deinit(backing_allocator);
+        try self.appendStateEntries(backing_allocator, &entries);
+
+        _ = page.AllocatorPage.encodeInto(state_page, .{
+            .page_id = page_id,
+            .page_type = .allocator,
+            .count = 0,
+            .order = order,
+        }, entries.items) catch |err| switch (err) {
+            error.AllocatorStateTooLarge => return error.AllocatorStateTooLarge,
+            error.InvalidAllocatorState => return error.InvalidAllocatorState,
+            else => |other| return other,
+        };
+
+        return state_page;
+    }
+
+    pub fn restoreFromStatePage(
+        backing_allocator: std.mem.Allocator,
+        state_page_bytes: []const u8,
+        high_water_mark: u64,
+        allocator_root: u64,
+    ) (Error || page.Error || page.LayoutError)!PageAllocator {
+        const allocator_page = page.AllocatorPage.validate(state_page_bytes) catch |err| switch (err) {
+            error.InvalidAllocatorState => return error.InvalidAllocatorState,
+            error.AllocatorStateTooLarge => return error.AllocatorStateTooLarge,
+            else => |other| return other,
+        };
+        if (allocator_page.header.page_id != allocator_root) return error.InvalidAllocatorState;
+
+        const allocator_span_end = page.spanEndPageId(allocator_root, allocator_page.header.order) catch return error.InvalidAllocatorState;
+        if (allocator_span_end > high_water_mark) return error.InvalidAllocatorState;
+
+        var restored = PageAllocator.init(backing_allocator, high_water_mark);
+        errdefer restored.deinit(backing_allocator);
+
+        var index: u32 = 0;
+        while (index < allocator_page.count()) : (index += 1) {
+            const entry = try allocator_page.entry(index);
+            try restored.insertRestoredFreeBlock(backing_allocator, entry.page_id, entry.order, allocator_root, allocator_page.header.order);
+        }
+
+        try restored.validateCanonicalFreeLists();
+        return restored;
+    }
+
     fn findFreeOrder(self: PageAllocator, order: u8) Error!?u8 {
         _ = try checkedSpanPageCount(order);
 
@@ -185,6 +258,66 @@ pub const PageAllocator = struct {
             .order = order,
             .index = index,
         });
+    }
+
+    fn appendStateEntries(
+        self: PageAllocator,
+        backing_allocator: std.mem.Allocator,
+        entries: *std.ArrayList(page.AllocatorEntry),
+    ) Error!void {
+        for (self.free_lists, 0..) |free_list, order_index| {
+            const order = @as(u8, @intCast(order_index));
+            for (free_list.items) |page_id| {
+                try entries.append(backing_allocator, .{
+                    .page_id = page_id,
+                    .order = order,
+                });
+            }
+        }
+    }
+
+    fn insertRestoredFreeBlock(
+        self: *PageAllocator,
+        backing_allocator: std.mem.Allocator,
+        page_id: u64,
+        order: u8,
+        allocator_root: u64,
+        allocator_order: u8,
+    ) Error!void {
+        try self.validateReleasableBlock(page_id, order);
+        if (spansOverlap(page_id, order, allocator_root, allocator_order)) return error.InvalidAllocatorState;
+        if (self.free_index.contains(.{ .page_id = page_id, .order = order })) return error.InvalidAllocatorState;
+        if (self.findOverlappingFreeBlock(page_id, order) != null) return error.InvalidAllocatorState;
+        if (self.containsBuddyFreeBlock(page_id, order)) return error.InvalidAllocatorState;
+
+        const order_index = @as(usize, order);
+        const index = self.free_lists[order_index].items.len;
+        try self.free_lists[order_index].append(backing_allocator, page_id);
+        errdefer _ = self.free_lists[order_index].pop();
+
+        try self.free_index.put(.{ .page_id = page_id, .order = order }, .{
+            .order = order,
+            .index = index,
+        });
+    }
+
+    fn containsBuddyFreeBlock(self: PageAllocator, page_id: u64, order: u8) bool {
+        const buddy_page_id = buddyPageId(page_id, order) catch return true;
+        return self.free_index.contains(.{ .page_id = buddy_page_id, .order = order });
+    }
+
+    fn validateCanonicalFreeLists(self: PageAllocator) Error!void {
+        var index_count: usize = 0;
+        for (self.free_lists, 0..) |free_list, order_index| {
+            const order = @as(u8, @intCast(order_index));
+            for (free_list.items, 0..) |page_id, index| {
+                const location = self.free_index.get(.{ .page_id = page_id, .order = order }) orelse return error.InvalidAllocatorState;
+                if (location.order != order or location.index != index) return error.InvalidAllocatorState;
+                if (self.containsBuddyFreeBlock(page_id, order)) return error.InvalidAllocatorState;
+                index_count += 1;
+            }
+        }
+        if (index_count != self.free_index.count()) return error.InvalidAllocatorState;
     }
 
     fn removeFreeBlock(self: *PageAllocator, order: u8, index: usize) u64 {
@@ -252,6 +385,17 @@ pub fn isAlignedToOrder(page_id: u64, order: u8) Error!bool {
     return offset % span_page_count == 0;
 }
 
+pub fn orderForSize(base_page_size: u32, required_size: usize) (Error || page.Error)!u8 {
+    if (!std.math.isPowerOfTwo(base_page_size)) return error.InvalidBasePageSize;
+
+    var order: u8 = 0;
+    while (order < allocator_max_order) : (order += 1) {
+        if (try page.spanSize(base_page_size, order) >= required_size) return order;
+    }
+
+    return error.AllocatorStateTooLarge;
+}
+
 fn emptyFreeLists() [allocator_max_order]std.ArrayList(u64) {
     return [_]std.ArrayList(u64){.empty} ** allocator_max_order;
 }
@@ -294,6 +438,14 @@ fn largestGapBlockOrder(start_page_id: u64, end_page_id: u64) Error!u8 {
     }
 
     return order;
+}
+
+fn spansOverlap(left_page_id: u64, left_order: u8, right_page_id: u64, right_order: u8) bool {
+    const left_span = checkedSpanPageCount(left_order) catch return true;
+    const right_span = checkedSpanPageCount(right_order) catch return true;
+    const left_end = spanEndPageId(left_page_id, left_span) catch return true;
+    const right_end = spanEndPageId(right_page_id, right_span) catch return true;
+    return left_page_id <= right_end and right_page_id <= left_end;
 }
 
 // ======tests======
@@ -478,4 +630,80 @@ test "clone isolates allocator mutations" {
 
     try std.testing.expectEqual(@as(u64, 4), try cloned.allocate(std.testing.allocator, 1));
     try std.testing.expect(page_allocator.containsFreeBlock(4, 1));
+}
+
+fn encodeAllocatorStateFixture(root_page_id: u64, order: u8, entries: []const page.AllocatorEntry) ![]u8 {
+    const bytes = try std.testing.allocator.alloc(u8, try page.spanSize(4096, order));
+    errdefer std.testing.allocator.free(bytes);
+    _ = try page.AllocatorPage.encodeInto(bytes, .{
+        .page_id = root_page_id,
+        .page_type = .allocator,
+        .count = 0,
+        .order = order,
+    }, entries);
+    return bytes;
+}
+
+test "allocator state round trips free lists without release merging" {
+    var page_allocator = PageAllocator.init(std.testing.allocator, 9);
+    defer page_allocator.deinit(std.testing.allocator);
+    try page_allocator.release(std.testing.allocator, 4, 1);
+    try page_allocator.release(std.testing.allocator, 8, 1);
+
+    const state_page = try page_allocator.encodeStatePageAlloc(std.testing.allocator, 4096, 6, 0);
+    defer std.testing.allocator.free(state_page);
+
+    var restored = try PageAllocator.restoreFromStatePage(std.testing.allocator, state_page, 9, 6);
+    defer restored.deinit(std.testing.allocator);
+
+    try std.testing.expect(restored.containsFreeBlock(4, 1));
+    try std.testing.expect(restored.containsFreeBlock(8, 1));
+    try std.testing.expectEqual(@as(u64, 9), restored.currentHighWaterMark());
+}
+
+test "allocator state restore rejects duplicate free blocks" {
+    const state_page = try encodeAllocatorStateFixture(6, 0, &.{
+        .{ .page_id = 4, .order = 0 },
+        .{ .page_id = 4, .order = 0 },
+    });
+    defer std.testing.allocator.free(state_page);
+
+    try std.testing.expectError(error.InvalidAllocatorState, PageAllocator.restoreFromStatePage(std.testing.allocator, state_page, 8, 6));
+}
+
+test "allocator state restore rejects overlapping free blocks" {
+    const state_page = try encodeAllocatorStateFixture(8, 0, &.{
+        .{ .page_id = 4, .order = 1 },
+        .{ .page_id = 5, .order = 0 },
+    });
+    defer std.testing.allocator.free(state_page);
+
+    try std.testing.expectError(error.InvalidAllocatorState, PageAllocator.restoreFromStatePage(std.testing.allocator, state_page, 8, 8));
+}
+
+test "allocator state restore rejects unaligned and out of range blocks" {
+    const unaligned_page = try encodeAllocatorStateFixture(8, 0, &.{.{ .page_id = 3, .order = 1 }});
+    defer std.testing.allocator.free(unaligned_page);
+    try std.testing.expectError(error.InvalidFreeBlock, PageAllocator.restoreFromStatePage(std.testing.allocator, unaligned_page, 8, 8));
+
+    const out_of_range_page = try encodeAllocatorStateFixture(8, 0, &.{.{ .page_id = 9, .order = 0 }});
+    defer std.testing.allocator.free(out_of_range_page);
+    try std.testing.expectError(error.InvalidFreeBlock, PageAllocator.restoreFromStatePage(std.testing.allocator, out_of_range_page, 8, 8));
+}
+
+test "allocator state restore rejects free blocks covering allocator page span" {
+    const state_page = try encodeAllocatorStateFixture(6, 0, &.{.{ .page_id = 6, .order = 0 }});
+    defer std.testing.allocator.free(state_page);
+
+    try std.testing.expectError(error.InvalidAllocatorState, PageAllocator.restoreFromStatePage(std.testing.allocator, state_page, 8, 6));
+}
+
+test "allocator state restore rejects canonical buddy pairs" {
+    const state_page = try encodeAllocatorStateFixture(8, 0, &.{
+        .{ .page_id = 4, .order = 0 },
+        .{ .page_id = 5, .order = 0 },
+    });
+    defer std.testing.allocator.free(state_page);
+
+    try std.testing.expectError(error.InvalidAllocatorState, PageAllocator.restoreFromStatePage(std.testing.allocator, state_page, 8, 8));
 }

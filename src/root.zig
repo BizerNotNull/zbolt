@@ -49,4 +49,5 @@ test {
     _ = @import("tree.zig");
     _ = @import("page/leaf.zig");
     _ = @import("page/branch.zig");
+    _ = @import("page/allocator.zig");
 }
