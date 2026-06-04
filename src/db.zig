@@ -1,5 +1,6 @@
 const std = @import("std");
 const errors = @import("errors.zig");
+const allocator_mod = @import("allocator.zig");
 const meta = @import("meta.zig");
 const page = @import("page.zig");
 const tree = @import("tree.zig");
@@ -18,10 +19,12 @@ pub const DB = struct {
     root_page_id: u64,
     allocator_root: u64,
     high_water_mark: u64,
+    page_allocator: allocator_mod.PageAllocator,
     txid: u64,
 
     pub fn close(self: *DB) void {
         self.file.close(self.io_threaded.io());
+        self.page_allocator.deinit(self.allocator);
         self.allocator.free(self.path);
         self.io_threaded.deinit();
         self.allocator.destroy(self);
@@ -38,7 +41,10 @@ pub const DB = struct {
         defer arena.deinit();
 
         const allocator = arena.allocator();
-        const write_result = try tree.writePut(self, allocator, key, value);
+        var working_page_allocator = try self.page_allocator.clone(self.allocator);
+        errdefer working_page_allocator.deinit(self.allocator);
+
+        const write_result = try tree.writePut(self, allocator, &working_page_allocator, key, value);
 
         const next_meta = meta.Meta{
             .page_size = self.page_size,
@@ -68,6 +74,9 @@ pub const DB = struct {
         self.root_page_id = next_meta.root_page_id;
         self.allocator_root = next_meta.allocator_root;
         self.high_water_mark = next_meta.high_water_mark;
+        var previous_page_allocator = self.page_allocator;
+        self.page_allocator = working_page_allocator;
+        previous_page_allocator.deinit(self.allocator);
         self.txid = next_meta.txid;
     }
 
@@ -91,10 +100,12 @@ pub fn open(allocator: std.mem.Allocator, path: []const u8) !*DB {
         .root_page_id = 0,
         .allocator_root = 0,
         .high_water_mark = 0,
+        .page_allocator = allocator_mod.PageAllocator.init(allocator, 0),
         .txid = 0,
     };
     errdefer allocator.free(db.path);
     errdefer db.io_threaded.deinit();
+    errdefer db.page_allocator.deinit(allocator);
 
     const io = db.io_threaded.io();
 
@@ -134,6 +145,7 @@ fn recoverOrInitialize(db: *DB) !void {
     db.root_page_id = selected.meta.root_page_id;
     db.allocator_root = selected.meta.allocator_root;
     db.high_water_mark = selected.meta.high_water_mark;
+    db.page_allocator.high_water_mark = selected.meta.high_water_mark;
     db.txid = selected.meta.txid;
 }
 
@@ -1579,8 +1591,9 @@ test "put stores a single large value in a higher-order root leaf across reopen"
         defer db.close();
 
         try db.put("large", large_value[0..]);
-        try std.testing.expectEqual(@as(u64, 3), db.root_page_id);
-        try std.testing.expectEqual(@as(u64, 4), db.high_water_mark);
+        try std.testing.expectEqual(@as(u64, 4), db.root_page_id);
+        try std.testing.expectEqual(@as(u64, 5), db.high_water_mark);
+        try std.testing.expect(db.page_allocator.containsFreeBlock(3, 0));
 
         const root_page = try db.readPageAlloc(std.testing.allocator, db.root_page_id);
         defer std.testing.allocator.free(root_page);
@@ -1594,6 +1607,77 @@ test "put stores a single large value in a higher-order root leaf across reopen"
     const value = (try reopened.get(std.testing.allocator, "large")).?;
     defer std.testing.allocator.free(value);
     try std.testing.expectEqualSlices(u8, large_value[0..], value);
+}
+
+test "put failure does not commit working allocator state" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path = try tempFilePath(&path_buf, tmp.dir, "put-too-large-keeps-allocator.db");
+
+    const db = try open(std.testing.allocator, path);
+    defer db.close();
+
+    const initial_high_water_mark = db.high_water_mark;
+    const initial_txid = db.txid;
+    const huge_value = try std.testing.allocator.alloc(u8, 70000);
+    defer std.testing.allocator.free(huge_value);
+    @memset(huge_value, 'H');
+
+    try std.testing.expectError(error.KeyValueTooLarge, db.put("huge", huge_value));
+    try std.testing.expectEqual(initial_high_water_mark, db.high_water_mark);
+    try std.testing.expectEqual(initial_txid, db.txid);
+    try std.testing.expect(!db.page_allocator.containsFreeBlock(3, 0));
+
+    var large_value = [_]u8{'L'} ** 7000;
+    try db.put("large", large_value[0..]);
+    try std.testing.expectEqual(@as(u64, 4), db.root_page_id);
+    try std.testing.expectEqual(@as(u64, 5), db.high_water_mark);
+    try std.testing.expect(db.page_allocator.containsFreeBlock(3, 0));
+}
+
+test "root leaf split uses actual non adjacent allocated page ids" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path = try tempFilePath(&path_buf, tmp.dir, "put-root-split-non-adjacent-free.db");
+
+    const db = try open(std.testing.allocator, path);
+    defer db.close();
+
+    var value_buf: [160]u8 = undefined;
+    const value = fillFixedValue(&value_buf, 'x');
+
+    var index: usize = 0;
+    while (index < 23) : (index += 1) {
+        var key_buf: [5]u8 = undefined;
+        const key = try generatedKey(&key_buf, index);
+        try db.put(key, value);
+    }
+
+    db.high_water_mark = 52;
+    db.page_allocator.high_water_mark = 52;
+    try db.page_allocator.release(db.allocator, 50, 0);
+    try db.page_allocator.release(db.allocator, 52, 0);
+
+    var key_buf: [5]u8 = undefined;
+    const split_key = try generatedKey(&key_buf, 23);
+    try db.put(split_key, value);
+
+    const root_page = try db.readPageAlloc(std.testing.allocator, db.root_page_id);
+    defer std.testing.allocator.free(root_page);
+    const root_branch = try page.BranchPage.validate(root_page);
+    try std.testing.expectEqual(@as(u16, 2), root_branch.count());
+
+    const left_entry = try root_branch.entry(0);
+    const right_entry = try root_branch.entry(1);
+    try std.testing.expect(left_entry.child_page_id == 50 or left_entry.child_page_id == 52);
+    try std.testing.expect(right_entry.child_page_id == 50 or right_entry.child_page_id == 52);
+    try std.testing.expect(left_entry.child_page_id != right_entry.child_page_id);
+    try std.testing.expect(left_entry.child_page_id + 1 != right_entry.child_page_id);
+    try std.testing.expect(right_entry.child_page_id + 1 != left_entry.child_page_id);
 }
 
 test "put rejects a single value larger than the u16-bounded tree page span" {
