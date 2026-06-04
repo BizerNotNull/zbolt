@@ -1,4 +1,5 @@
 const std = @import("std");
+const page_allocator_mod = @import("allocator.zig");
 const meta = @import("meta.zig");
 const page = @import("page.zig");
 const db_mod = @import("db.zig");
@@ -58,7 +59,7 @@ const WriteContext = struct {
     db: *db_mod.DB,
     allocator: std.mem.Allocator,
     temp_allocator: std.mem.Allocator,
-    last_allocated_page_id: u64,
+    page_allocator: page_allocator_mod.PageAllocator,
     pages: std.ArrayList(PendingPage),
 
     fn init(db: *db_mod.DB, allocator: std.mem.Allocator, temp_allocator: std.mem.Allocator) WriteContext {
@@ -66,20 +67,21 @@ const WriteContext = struct {
             .db = db,
             .allocator = allocator,
             .temp_allocator = temp_allocator,
-            .last_allocated_page_id = db.high_water_mark,
+            .page_allocator = page_allocator_mod.PageAllocator.init(db.high_water_mark),
             .pages = .empty,
         };
     }
 
-    fn peekNextPageId(self: WriteContext) u64 {
-        return self.last_allocated_page_id + 1;
+    fn peekNextPageId(self: WriteContext) !u64 {
+        return self.page_allocator.peekNextPageId();
     }
 
     fn appendAllocatedPage(self: *WriteContext, page_id: u64, bytes: []const u8) !void {
         // Page IDs become committed only through the returned WriteResult; failed
         // writes may abandon this context without mutating DB state.
-        std.debug.assert(page_id == self.last_allocated_page_id + 1);
-        self.last_allocated_page_id = page_id;
+        std.debug.assert(page_id == try self.page_allocator.peekNextPageId());
+        const allocated_page_id = try self.page_allocator.allocateNext(0);
+        std.debug.assert(allocated_page_id == page_id);
         try self.pages.append(self.allocator, .{
             .page_id = page_id,
             .bytes = bytes,
@@ -126,7 +128,7 @@ pub fn writePut(db: *db_mod.DB, allocator: std.mem.Allocator, key: []const u8, v
         .split => |children| blk: {
             // Non-root branch splits bubble upward as child refs. Only the original
             // root split creates a new branch root and increases tree height.
-            const root_id = ctx.peekNextPageId();
+            const root_id = try ctx.peekNextPageId();
             const root_entries = [_]page.BranchEntry{
                 .{ .key = children.left.max_key, .child_page_id = children.left.page_id },
                 .{ .key = children.right.max_key, .child_page_id = children.right.page_id },
@@ -139,7 +141,7 @@ pub fn writePut(db: *db_mod.DB, allocator: std.mem.Allocator, key: []const u8, v
 
     return .{
         .root_page_id = root_page_id,
-        .high_water_mark = ctx.last_allocated_page_id,
+        .high_water_mark = ctx.page_allocator.currentHighWaterMark(),
         .pages = ctx.pages.items,
     };
 }
@@ -211,7 +213,7 @@ fn writeLeafPut(ctx: *WriteContext, leaf_page_bytes: []const u8, key: []const u8
     var next_entries = std.ArrayList(page.LeafEntry).empty;
     try collectUpdatedLeafEntries(&next_entries, leaf_page, ctx.temp_allocator, key, value);
 
-    const page_id = ctx.peekNextPageId();
+    const page_id = try ctx.peekNextPageId();
     const leaf_bytes = encodeLeafPageAlloc(
         ctx.allocator,
         ctx.db.page_size,
@@ -246,7 +248,7 @@ fn writeBranchPut(ctx: *WriteContext, branch_page_bytes: []const u8, key: []cons
     var next_entries = std.ArrayList(page.BranchEntry).empty;
     try collectUpdatedBranchEntries(&next_entries, branch_page, ctx.temp_allocator, child_index, child_result);
 
-    const page_id = ctx.peekNextPageId();
+    const page_id = try ctx.peekNextPageId();
     const branch_bytes = encodeBranchPageAlloc(
         ctx.allocator,
         ctx.db.page_size,
@@ -293,8 +295,8 @@ fn collectUpdatedBranchEntries(
 }
 
 fn splitLeafPut(ctx: *WriteContext, leaf_order: u8, entries: []const page.LeafEntry) anyerror!PutResult {
-    const left_id = ctx.peekNextPageId();
-    const right_id = left_id + 1;
+    const left_id = try ctx.peekNextPageId();
+    const right_id = std.math.add(u64, left_id, 1) catch return error.PageIdOverflow;
     const split_pages = try splitLeafEntries(
         ctx.allocator,
         ctx.db.page_size,
@@ -314,8 +316,8 @@ fn splitLeafPut(ctx: *WriteContext, leaf_order: u8, entries: []const page.LeafEn
 }
 
 fn splitBranchPut(ctx: *WriteContext, branch_order: u8, entries: []const page.BranchEntry) anyerror!PutResult {
-    const left_id = ctx.peekNextPageId();
-    const right_id = left_id + 1;
+    const left_id = try ctx.peekNextPageId();
+    const right_id = std.math.add(u64, left_id, 1) catch return error.PageIdOverflow;
     const split_pages = try splitBranchEntries(
         ctx.allocator,
         ctx.db.page_size,
