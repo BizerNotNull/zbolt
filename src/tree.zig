@@ -28,6 +28,11 @@ pub const WriteResult = struct {
     pages: []const PendingPage,
 };
 
+pub const ReadSnapshot = struct {
+    root_page_id: u64,
+    high_water_mark: u64,
+};
+
 const SplitLeafPages = struct {
     left_page: []u8,
     right_page: []u8,
@@ -98,10 +103,17 @@ const WriteContext = struct {
 };
 
 pub fn lookup(db: *db_mod.DB, allocator: std.mem.Allocator, key: []const u8) !?[]u8 {
-    var page_id = db.root_page_id;
+    return lookupSnapshot(db, allocator, .{
+        .root_page_id = db.root_page_id,
+        .high_water_mark = db.high_water_mark,
+    }, key);
+}
+
+pub fn lookupSnapshot(db: *db_mod.DB, allocator: std.mem.Allocator, snapshot: ReadSnapshot, key: []const u8) !?[]u8 {
+    var page_id = snapshot.root_page_id;
 
     while (true) {
-        const page_bytes = try readTreePage(db, allocator, page_id);
+        const page_bytes = try readTreePageSnapshot(db, allocator, snapshot, page_id);
         defer allocator.free(page_bytes);
 
         const header = try page.decodeHeader(page_bytes);
@@ -161,6 +173,10 @@ pub fn writePut(
 
 fn readTreePage(db: *db_mod.DB, allocator: std.mem.Allocator, page_id: u64) ![]u8 {
     return db.readPageAlloc(allocator, page_id);
+}
+
+fn readTreePageSnapshot(db: *db_mod.DB, allocator: std.mem.Allocator, snapshot: ReadSnapshot, page_id: u64) ![]u8 {
+    return db.readPageAllocAtHighWater(allocator, page_id, snapshot.high_water_mark);
 }
 
 fn selectChildForLookup(branch_page: page.BranchPage, key: []const u8) !?u64 {
