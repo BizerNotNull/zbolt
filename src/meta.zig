@@ -130,7 +130,7 @@ fn readInt(comptime T: type, page: []const u8, offset: usize) T {
     return std.mem.readInt(T, &bytes, .little);
 }
 
-// ======tests=====
+// ======tests======
 
 test "encode decode round trip preserves fields" {
     const meta = Meta{

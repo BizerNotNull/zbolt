@@ -40,6 +40,7 @@ pub const LayoutError = errors.PageLayoutError;
 
 pub const leaf = @import("page/leaf.zig");
 pub const branch = @import("page/branch.zig");
+pub const allocator = @import("page/allocator.zig");
 
 pub const LeafEntry = leaf.Entry;
 pub const LeafEntryView = leaf.EntryView;
@@ -47,6 +48,8 @@ pub const LeafPage = leaf.LeafPage;
 pub const BranchEntry = branch.Entry;
 pub const BranchEntryView = branch.EntryView;
 pub const BranchPage = branch.BranchPage;
+pub const AllocatorEntry = allocator.Entry;
+pub const AllocatorPage = allocator.AllocatorPage;
 
 pub fn encodeHeader(page_bytes: []u8, header: Header) Error!void {
     if (page_bytes.len < header_size) return error.PageTooSmall;
@@ -121,17 +124,38 @@ pub fn validateRange(page_len: usize, offset: usize, len: usize) LayoutError!voi
     if (end > page_len) return error.EntryOutOfBounds;
 }
 
+pub fn spanPageCount(order: u8) Error!u64 {
+    if (order >= @bitSizeOf(u64)) return error.InvalidPageOrder;
+    return @as(u64, 1) << @intCast(order);
+}
+
+pub fn spanEndPageId(start_page_id: u64, order: u8) Error!u64 {
+    const page_count = try spanPageCount(order);
+    return std.math.add(u64, start_page_id, page_count - 1) catch error.PageIdOverflow;
+}
+
 pub fn spanSize(base_page_size: u32, order: u8) Error!usize {
     if (!std.math.isPowerOfTwo(base_page_size)) return error.InvalidBasePageSize;
 
-    var result = @as(u64, base_page_size);
-    var i: u8 = 0;
-    while (i < order) : (i += 1) {
-        const doubled = std.math.mul(u64, result, 2) catch return error.SpanSizeOverflow;
-        result = doubled;
-    }
+    const page_count = try spanPageCount(order);
+    const result = std.math.mul(u64, base_page_size, page_count) catch return error.SpanSizeOverflow;
 
     return std.math.cast(usize, result) orelse return error.SpanSizeOverflow;
+}
+
+pub fn maxOrderForSpanSize(base_page_size: u32, max_span_size: usize) Error!u8 {
+    if (!std.math.isPowerOfTwo(base_page_size)) return error.InvalidBasePageSize;
+    if (base_page_size > max_span_size) return error.InvalidBasePageSize;
+
+    var order: u8 = 0;
+    while (true) {
+        const next_order = order + 1;
+        if (next_order >= @bitSizeOf(u64)) return order;
+
+        const next_size = spanSize(base_page_size, next_order) catch return order;
+        if (next_size > max_span_size) return order;
+        order = next_order;
+    }
 }
 
 pub fn writeInt(comptime T: type, page_bytes: []u8, offset: usize, value: T) void {
@@ -156,7 +180,7 @@ fn decodePageType(raw: u8) Error!PageType {
     };
 }
 
-// ======tests=====
+// ======tests======
 
 test "encodeHeader decodeHeader round trip preserves fields" {
     var page_bytes = [_]u8{0} ** 64;
@@ -224,6 +248,24 @@ test "spanSize uses base page size when order is zero" {
     try std.testing.expectEqual(@as(usize, 4096), try spanSize(4096, 0));
 }
 
+test "spanPageCount shifts by order" {
+    try std.testing.expectEqual(@as(u64, 1), try spanPageCount(0));
+    try std.testing.expectEqual(@as(u64, 2), try spanPageCount(1));
+    try std.testing.expectEqual(@as(u64, 4), try spanPageCount(2));
+}
+
+test "spanPageCount rejects invalid order" {
+    try std.testing.expectError(error.InvalidPageOrder, spanPageCount(64));
+}
+
+test "spanEndPageId returns inclusive end page id" {
+    try std.testing.expectEqual(@as(u64, 11), try spanEndPageId(8, 2));
+}
+
+test "spanEndPageId rejects page id overflow" {
+    try std.testing.expectError(error.PageIdOverflow, spanEndPageId(std.math.maxInt(u64), 1));
+}
+
 test "spanSize shifts by order" {
     try std.testing.expectEqual(@as(usize, 32768), try spanSize(4096, 3));
 }
@@ -234,6 +276,11 @@ test "spanSize rejects non power of two base page size" {
 
 test "spanSize rejects overflow" {
     try std.testing.expectError(error.SpanSizeOverflow, spanSize(1 << 31, 33));
+}
+
+test "maxOrderForSpanSize derives u16-bounded tree span" {
+    try std.testing.expectEqual(@as(u8, 3), try maxOrderForSpanSize(4096, std.math.maxInt(u16)));
+    try std.testing.expectError(error.InvalidBasePageSize, maxOrderForSpanSize(65536, std.math.maxInt(u16)));
 }
 
 test "decodeHeader leaves payload bytes untouched" {

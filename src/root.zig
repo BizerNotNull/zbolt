@@ -1,3 +1,4 @@
+pub const allocator = @import("allocator.zig");
 pub const meta = @import("meta.zig");
 pub const page = @import("page.zig");
 pub const tree = @import("tree.zig");
@@ -9,6 +10,8 @@ pub const PageError = page.Error;
 pub const PageLayoutError = page.LayoutError;
 pub const DbOpenError = errors.DbOpenError;
 pub const StorageError = storage.Error;
+pub const PageAllocator = allocator.PageAllocator;
+pub const PageAllocatorError = allocator.Error;
 pub const TreeLookupError = tree.TreeLookupError;
 pub const TreeWriteError = tree.TreeWriteError;
 pub const MetaSlot = meta.MetaSlot;
@@ -30,14 +33,18 @@ pub const encodePageHeader = page.encodeHeader;
 pub const decodePageDataHeader = page.decodeDataHeader;
 pub const encodePageDataHeader = page.encodeDataHeader;
 pub const pageSpanSize = page.spanSize;
+pub const pageSpanPageCount = page.spanPageCount;
+pub const pageSpanEndPageId = page.spanEndPageId;
+pub const maxPageObjectOrderForSpanSize = page.maxOrderForSpanSize;
 pub const treeLookup = tree.lookup;
 
 pub const DB = @import("db.zig").DB;
 pub const open = @import("db.zig").open;
 
-// ======tests=====
+// ======tests======
 
 test {
+    _ = @import("allocator.zig");
     _ = @import("db.zig");
     _ = @import("meta.zig");
     _ = @import("page.zig");
@@ -45,4 +52,5 @@ test {
     _ = @import("tree.zig");
     _ = @import("page/leaf.zig");
     _ = @import("page/branch.zig");
+    _ = @import("page/allocator.zig");
 }

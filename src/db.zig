@@ -1,5 +1,6 @@
 const std = @import("std");
 const errors = @import("errors.zig");
+const allocator_mod = @import("allocator.zig");
 const meta = @import("meta.zig");
 const page = @import("page.zig");
 const storage = @import("storage.zig");
@@ -7,6 +8,19 @@ const tree = @import("tree.zig");
 
 const default_page_size: u32 = 4096;
 const bootstrap_page_count: u64 = 3;
+const allocator_state_max_span_size: usize = 16 * 1024 * 1024;
+
+const MaterializedAllocatorState = struct {
+    page_id: u64,
+    bytes: []u8,
+    page_allocator: allocator_mod.PageAllocator,
+};
+
+const RecoverableSnapshot = struct {
+    slot: meta.MetaSlot,
+    meta: meta.Meta,
+    page_allocator: allocator_mod.PageAllocator,
+};
 
 pub const DB = struct {
     allocator: std.mem.Allocator,
@@ -19,10 +33,12 @@ pub const DB = struct {
     root_page_id: u64,
     allocator_root: u64,
     high_water_mark: u64,
+    page_allocator: allocator_mod.PageAllocator,
     txid: u64,
 
     pub fn close(self: *DB) void {
         self.file.close(self.io_threaded.io());
+        self.page_allocator.deinit(self.allocator);
         self.allocator.free(self.path);
         self.io_threaded.deinit();
         self.allocator.destroy(self);
@@ -39,14 +55,23 @@ pub const DB = struct {
         defer arena.deinit();
 
         const allocator = arena.allocator();
-        const write_result = try tree.writePut(self, allocator, key, value);
+        var working_page_allocator = try self.page_allocator.clone(self.allocator);
+        errdefer working_page_allocator.deinit(self.allocator);
+
+        const write_result = try tree.writePut(self, allocator, &working_page_allocator, key, value);
+
+        const baseline_page_allocator = working_page_allocator;
+        working_page_allocator = movedPageAllocator(self.allocator);
+        var allocator_state = try self.materializeAllocatorStatePage(baseline_page_allocator);
+        defer self.allocator.free(allocator_state.bytes);
+        errdefer allocator_state.page_allocator.deinit(self.allocator);
 
         const next_meta = meta.Meta{
             .page_size = self.page_size,
             .flags = self.flags,
             .root_page_id = write_result.root_page_id,
-            .allocator_root = self.allocator_root,
-            .high_water_mark = write_result.high_water_mark,
+            .allocator_root = allocator_state.page_id,
+            .high_water_mark = allocator_state.page_allocator.currentHighWaterMark(),
             .txid = self.txid + 1,
         };
         const next_meta_page = try meta.encode(self.allocator, next_meta);
@@ -56,14 +81,15 @@ pub const DB = struct {
         // Dirty tree pages are written in child-to-root order, and the meta
         // page remains the only commit point visible during recovery.
         for (write_result.pages) |pending_page| {
-            try storage.writePage(&self.file, io, pending_page.page_id, self.page_size, pending_page.bytes);
+            try storage.writePageObject(&self.file, io, self.page_size, pending_page.page_id, pending_page.bytes);
         }
+        try storage.writePageObject(&self.file, io, self.page_size, allocator_state.page_id, allocator_state.bytes);
         try storage.sync(self.file, io);
 
         const next_meta_slot = inactiveMetaSlot(self.meta_slot);
         // Meta pages act as the commit point. Writing the inactive slot last
         // keeps the previously selected snapshot available until this commit is durable.
-        try storage.writePage(&self.file, io, metaSlotPageId(next_meta_slot), self.page_size, next_meta_page);
+        try storage.writePageObject(&self.file, io, self.page_size, metaSlotPageId(next_meta_slot), next_meta_page);
         try storage.sync(self.file, io);
 
         self.meta_slot = next_meta_slot;
@@ -71,11 +97,47 @@ pub const DB = struct {
         self.root_page_id = next_meta.root_page_id;
         self.allocator_root = next_meta.allocator_root;
         self.high_water_mark = next_meta.high_water_mark;
+        var previous_page_allocator = self.page_allocator;
+        self.page_allocator = allocator_state.page_allocator;
+        previous_page_allocator.deinit(self.allocator);
+        allocator_state.page_allocator = movedPageAllocator(self.allocator);
         self.txid = next_meta.txid;
     }
 
     pub fn readPageAlloc(self: *DB, allocator: std.mem.Allocator, page_id: u64) ![]u8 {
-        return storage.readPageAlloc(allocator, &self.file, self.io_threaded.io(), page_id, self.page_size);
+        return readTreePageObjectAlloc(allocator, &self.file, self.io_threaded.io(), page_id, self.page_size, self.high_water_mark);
+    }
+
+    fn materializeAllocatorStatePage(self: *DB, baseline_page_allocator: allocator_mod.PageAllocator) !MaterializedAllocatorState {
+        var baseline = baseline_page_allocator;
+        errdefer baseline.deinit(self.allocator);
+
+        var desired_order = try baseline.allocatorStateOrder(self.page_size);
+        while (true) {
+            var candidate = try baseline.clone(self.allocator);
+            errdefer candidate.deinit(self.allocator);
+
+            const page_id = try candidate.allocate(self.allocator, desired_order);
+            const required_order = try candidate.allocatorStateOrder(self.page_size);
+            if (required_order <= desired_order) {
+                const state_page = try candidate.encodeStatePageAlloc(self.allocator, self.page_size, page_id, desired_order);
+                errdefer self.allocator.free(state_page);
+
+                baseline.deinit(self.allocator);
+                baseline = movedPageAllocator(self.allocator);
+                const final_candidate = candidate;
+                candidate = movedPageAllocator(self.allocator);
+                return .{
+                    .page_id = page_id,
+                    .bytes = state_page,
+                    .page_allocator = final_candidate,
+                };
+            }
+
+            candidate.deinit(self.allocator);
+            candidate = movedPageAllocator(self.allocator);
+            desired_order = required_order;
+        }
     }
 };
 
@@ -94,10 +156,12 @@ pub fn open(allocator: std.mem.Allocator, path: []const u8) !*DB {
         .root_page_id = 0,
         .allocator_root = 0,
         .high_water_mark = 0,
+        .page_allocator = allocator_mod.PageAllocator.init(allocator, 0),
         .txid = 0,
     };
     errdefer allocator.free(db.path);
     errdefer db.io_threaded.deinit();
+    errdefer db.page_allocator.deinit(allocator);
 
     const io = db.io_threaded.io();
 
@@ -126,10 +190,11 @@ fn recoverOrInitialize(db: *DB) !void {
         return errors.DbOpenError.DatabaseFileTooSmall;
     }
 
-    const selected = loadSelectedMeta(db.allocator, &db.file, io, default_page_size) catch |err| switch (err) {
+    var selected = loadNewestRecoverableSnapshot(db.allocator, &db.file, io, default_page_size) catch |err| switch (err) {
         error.NoValidMetaPage => return errors.DbOpenError.InvalidDatabaseFile,
         else => return err,
     };
+    errdefer selected.page_allocator.deinit(db.allocator);
 
     db.meta_slot = selected.slot;
     db.page_size = selected.meta.page_size;
@@ -137,6 +202,10 @@ fn recoverOrInitialize(db: *DB) !void {
     db.root_page_id = selected.meta.root_page_id;
     db.allocator_root = selected.meta.allocator_root;
     db.high_water_mark = selected.meta.high_water_mark;
+    var previous_page_allocator = db.page_allocator;
+    db.page_allocator = selected.page_allocator;
+    previous_page_allocator.deinit(db.allocator);
+    selected.page_allocator = movedPageAllocator(db.allocator);
     db.txid = selected.meta.txid;
 }
 
@@ -162,10 +231,10 @@ fn initializeEmptyDatabase(db: *DB) !void {
     const io = db.io_threaded.io();
     // A valid meta page is the recovery commit point, so the bootstrap root
     // must reach durable storage before either meta page can reference it.
-    try storage.writePage(&db.file, io, initial_meta.root_page_id, default_page_size, root_page);
+    try storage.writePageObject(&db.file, io, default_page_size, initial_meta.root_page_id, root_page);
     try storage.sync(db.file, io);
-    try storage.writePage(&db.file, io, 0, default_page_size, meta0_page);
-    try storage.writePage(&db.file, io, 1, default_page_size, meta1_page);
+    try storage.writePageObject(&db.file, io, default_page_size, 0, meta0_page);
+    try storage.writePageObject(&db.file, io, default_page_size, 1, meta1_page);
     try storage.sync(db.file, io);
 }
 
@@ -178,6 +247,155 @@ fn loadSelectedMeta(allocator: std.mem.Allocator, file: *std.Io.File, io: std.Io
 
     // TODO: parse meta pages need to be explicited decomposition
     return meta.selectNewestValid(meta0_page, meta1_page);
+}
+
+fn loadNewestRecoverableSnapshot(allocator: std.mem.Allocator, file: *std.Io.File, io: std.Io, page_size: u32) !RecoverableSnapshot {
+    const meta0_page = try storage.readPageAlloc(allocator, file, io, 0, page_size);
+    defer allocator.free(meta0_page);
+
+    const meta1_page = try storage.readPageAlloc(allocator, file, io, 1, page_size);
+    defer allocator.free(meta1_page);
+
+    const snapshot0 = loadRecoverableSnapshotForMeta(allocator, file, io, meta.MetaSlot.meta0, meta0_page) catch |err| switch (err) {
+        error.InvalidMagic,
+        error.InvalidVersion,
+        error.InvalidChecksum,
+        error.InvalidPageSize,
+        error.PageTooSmall,
+        error.PageLengthMismatch,
+        error.RootPageOutOfRange,
+        error.AllocatorRootOutOfRange,
+        error.InvalidAllocatorState,
+        error.AllocatorStateTooLarge,
+        error.InvalidPageType,
+        error.InvalidBasePageSize,
+        error.InvalidPageOrder,
+        error.PageIdOverflow,
+        error.SpanSizeOverflow,
+        error.UnexpectedPageType,
+        error.InvalidPageLayout,
+        error.EntryOutOfBounds,
+        error.EntriesNotSorted,
+        error.PageFull,
+        error.InvalidFreeBlock,
+        error.FreeBlockOverlap,
+        => null,
+        else => return err,
+    };
+    const snapshot1 = loadRecoverableSnapshotForMeta(allocator, file, io, meta.MetaSlot.meta1, meta1_page) catch |err| switch (err) {
+        error.InvalidMagic,
+        error.InvalidVersion,
+        error.InvalidChecksum,
+        error.InvalidPageSize,
+        error.PageTooSmall,
+        error.PageLengthMismatch,
+        error.RootPageOutOfRange,
+        error.AllocatorRootOutOfRange,
+        error.InvalidAllocatorState,
+        error.AllocatorStateTooLarge,
+        error.InvalidPageType,
+        error.InvalidBasePageSize,
+        error.InvalidPageOrder,
+        error.PageIdOverflow,
+        error.SpanSizeOverflow,
+        error.UnexpectedPageType,
+        error.InvalidPageLayout,
+        error.EntryOutOfBounds,
+        error.EntriesNotSorted,
+        error.PageFull,
+        error.InvalidFreeBlock,
+        error.FreeBlockOverlap,
+        => null,
+        else => return err,
+    };
+
+    if (snapshot0 == null and snapshot1 == null) return error.NoValidMetaPage;
+    if (snapshot0 != null and snapshot1 == null) return snapshot0.?;
+    if (snapshot0 == null and snapshot1 != null) return snapshot1.?;
+
+    if (snapshot0.?.meta.txid >= snapshot1.?.meta.txid) {
+        var older = snapshot1.?;
+        older.page_allocator.deinit(allocator);
+        return snapshot0.?;
+    }
+
+    var older = snapshot0.?;
+    older.page_allocator.deinit(allocator);
+    return snapshot1.?;
+}
+
+fn loadRecoverableSnapshotForMeta(
+    allocator: std.mem.Allocator,
+    file: *std.Io.File,
+    io: std.Io,
+    slot: meta.MetaSlot,
+    meta_page: []const u8,
+) !RecoverableSnapshot {
+    const decoded_meta = try meta.decode(meta_page);
+
+    const page_allocator = if (decoded_meta.allocator_root == 0)
+        allocator_mod.PageAllocator.init(allocator, decoded_meta.high_water_mark)
+    else blk: {
+        const state_page = try readAllocatorStatePageObjectAlloc(
+            allocator,
+            file,
+            io,
+            decoded_meta.allocator_root,
+            decoded_meta.page_size,
+            decoded_meta.high_water_mark,
+        );
+        defer allocator.free(state_page);
+        break :blk try allocator_mod.PageAllocator.restoreFromStatePage(
+            allocator,
+            state_page,
+            decoded_meta.high_water_mark,
+            decoded_meta.allocator_root,
+        );
+    };
+
+    return .{
+        .slot = slot,
+        .meta = decoded_meta,
+        .page_allocator = page_allocator,
+    };
+}
+
+fn readTreePageObjectAlloc(
+    allocator: std.mem.Allocator,
+    file: *const std.Io.File,
+    io: std.Io,
+    page_id: u64,
+    base_page_size: u32,
+    high_water_mark: u64,
+) ![]u8 {
+    return storage.readPageObjectAlloc(
+        allocator,
+        file,
+        io,
+        page_id,
+        base_page_size,
+        high_water_mark,
+        try page.maxOrderForSpanSize(base_page_size, std.math.maxInt(u16)),
+    );
+}
+
+fn readAllocatorStatePageObjectAlloc(
+    allocator: std.mem.Allocator,
+    file: *const std.Io.File,
+    io: std.Io,
+    page_id: u64,
+    base_page_size: u32,
+    high_water_mark: u64,
+) ![]u8 {
+    return storage.readPageObjectAlloc(
+        allocator,
+        file,
+        io,
+        page_id,
+        base_page_size,
+        high_water_mark,
+        try allocator_mod.orderForSize(base_page_size, allocator_state_max_span_size),
+    );
 }
 
 fn allocateEmptyRootPage(allocator: std.mem.Allocator, page_size: u32, page_id: u64) ![]u8 {
@@ -195,6 +413,10 @@ fn allocateEmptyRootPage(allocator: std.mem.Allocator, page_size: u32, page_id: 
     });
 
     return root_page;
+}
+
+fn movedPageAllocator(allocator: std.mem.Allocator) allocator_mod.PageAllocator {
+    return allocator_mod.PageAllocator.init(allocator, 0);
 }
 
 fn inactiveMetaSlot(slot: meta.MetaSlot) meta.MetaSlot {
@@ -243,9 +465,9 @@ fn bootstrapFile(path: []const u8) !void {
     const root_page = try allocateEmptyRootPage(std.testing.allocator, default_page_size, seeded_meta.root_page_id);
     defer std.testing.allocator.free(root_page);
 
-    try storage.writePage(&file, io, 0, default_page_size, meta0_page);
-    try storage.writePage(&file, io, 1, default_page_size, meta1_page);
-    try storage.writePage(&file, io, 2, default_page_size, root_page);
+    try storage.writePageObject(&file, io, default_page_size, 0, meta0_page);
+    try storage.writePageObject(&file, io, default_page_size, 1, meta1_page);
+    try storage.writePageObject(&file, io, default_page_size, 2, root_page);
 }
 
 fn writeSeededDatabase(path: []const u8, meta0: meta.Meta, meta1: meta.Meta) !void {
@@ -265,9 +487,9 @@ fn writeSeededDatabase(path: []const u8, meta0: meta.Meta, meta1: meta.Meta) !vo
     const root_page = try allocateEmptyRootPage(std.testing.allocator, root_size, 2);
     defer std.testing.allocator.free(root_page);
 
-    try storage.writePage(&file, io, 0, meta0.page_size, meta0_page);
-    try storage.writePage(&file, io, 1, meta1.page_size, meta1_page);
-    try storage.writePage(&file, io, 2, root_size, root_page);
+    try storage.writePageObject(&file, io, default_page_size, 0, meta0_page);
+    try storage.writePageObject(&file, io, default_page_size, 1, meta1_page);
+    try storage.writePageObject(&file, io, default_page_size, 2, root_page);
 }
 
 fn writeTreeDatabase(path: []const u8, root_page_id: u64, pages: []const []const u8) !void {
@@ -278,7 +500,10 @@ fn writeTreeDatabase(path: []const u8, root_page_id: u64, pages: []const []const
     });
     defer file.close(io);
 
-    const high_water_mark = 2 + pages.len - 1;
+    var high_water_mark: u64 = 1;
+    for (pages) |page_bytes| {
+        high_water_mark += try page.spanPageCount((try page.decodeHeader(page_bytes)).order);
+    }
     const seeded_meta = meta.Meta{
         .page_size = default_page_size,
         .flags = 0,
@@ -293,11 +518,13 @@ fn writeTreeDatabase(path: []const u8, root_page_id: u64, pages: []const []const
     const meta1_page = try meta.encode(std.testing.allocator, seeded_meta);
     defer std.testing.allocator.free(meta1_page);
 
-    try storage.writePage(&file, io, 0, default_page_size, meta0_page);
-    try storage.writePage(&file, io, 1, default_page_size, meta1_page);
+    try storage.writePageObject(&file, io, default_page_size, 0, meta0_page);
+    try storage.writePageObject(&file, io, default_page_size, 1, meta1_page);
 
-    for (pages, 0..) |page_bytes, index| {
-        try storage.writePage(&file, io, 2 + index, default_page_size, page_bytes);
+    var next_page_id: u64 = 2;
+    for (pages) |page_bytes| {
+        try storage.writePageObject(&file, io, default_page_size, next_page_id, page_bytes);
+        next_page_id += try page.spanPageCount((try page.decodeHeader(page_bytes)).order);
     }
 }
 
@@ -689,7 +916,7 @@ test "open rejects bootstrap root written without committed meta pages" {
         });
         defer file.close(io);
 
-        try storage.writePage(&file, io, 2, default_page_size, root_page);
+        try storage.writePageObject(&file, io, default_page_size, 2, root_page);
         try storage.sync(file, io);
     }
 
@@ -761,7 +988,7 @@ test "open prefers only valid meta when the other one is invalid" {
         var invalid_page = try std.testing.allocator.dupe(u8, page_bytes);
         defer std.testing.allocator.free(invalid_page);
         invalid_page[12] ^= 0xFF;
-        try storage.writePage(&file, io, 1, default_page_size, invalid_page);
+        try storage.writePageObject(&file, io, default_page_size, 1, invalid_page);
     }
 
     const db = try open(std.testing.allocator, path);
@@ -840,8 +1067,8 @@ test "open maps invalid meta recovery into centralized db error" {
         meta0_page[8] ^= 0xFF;
         meta1_page[8] ^= 0xFF;
 
-        try storage.writePage(&file, io, 0, default_page_size, meta0_page);
-        try storage.writePage(&file, io, 1, default_page_size, meta1_page);
+        try storage.writePageObject(&file, io, default_page_size, 0, meta0_page);
+        try storage.writePageObject(&file, io, default_page_size, 1, meta1_page);
     }
 
     try std.testing.expectError(errors.DbOpenError.InvalidDatabaseFile, open(std.testing.allocator, path));
@@ -861,7 +1088,8 @@ test "put commits a new root leaf and updates selected meta" {
 
     try std.testing.expectEqual(meta.MetaSlot.meta1, db.meta_slot);
     try std.testing.expectEqual(@as(u64, 3), db.root_page_id);
-    try std.testing.expectEqual(@as(u64, 3), db.high_water_mark);
+    try std.testing.expectEqual(@as(u64, 4), db.high_water_mark);
+    try std.testing.expectEqual(@as(u64, 4), db.allocator_root);
     try std.testing.expectEqual(@as(u64, 1), db.txid);
 
     const value = (try db.get(std.testing.allocator, "alpha")).?;
@@ -871,7 +1099,8 @@ test "put commits a new root leaf and updates selected meta" {
     const selected = try loadSelectedMeta(std.testing.allocator, &db.file, db.io_threaded.io(), db.page_size);
     try std.testing.expectEqual(meta.MetaSlot.meta1, selected.slot);
     try std.testing.expectEqual(@as(u64, 3), selected.meta.root_page_id);
-    try std.testing.expectEqual(@as(u64, 3), selected.meta.high_water_mark);
+    try std.testing.expectEqual(@as(u64, 4), selected.meta.allocator_root);
+    try std.testing.expectEqual(@as(u64, 4), selected.meta.high_water_mark);
     try std.testing.expectEqual(@as(u64, 1), selected.meta.txid);
 }
 
@@ -894,10 +1123,13 @@ test "reopen ignores dirty pages written before meta switch" {
         var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
         defer arena.deinit();
 
-        const write_result = try tree.writePut(db, arena.allocator(), "beta", "two");
+        var working_page_allocator = try db.page_allocator.clone(std.testing.allocator);
+        defer working_page_allocator.deinit(std.testing.allocator);
+
+        const write_result = try tree.writePut(db, arena.allocator(), &working_page_allocator, "beta", "two");
         const io = db.io_threaded.io();
         for (write_result.pages) |pending_page| {
-            try storage.writePage(&db.file, io, pending_page.page_id, db.page_size, pending_page.bytes);
+            try storage.writePageObject(&db.file, io, db.page_size, pending_page.page_id, pending_page.bytes);
         }
         try storage.sync(db.file, io);
 
@@ -910,7 +1142,7 @@ test "reopen ignores dirty pages written before meta switch" {
     defer reopened.close();
 
     try std.testing.expectEqual(@as(u64, 3), reopened.root_page_id);
-    try std.testing.expectEqual(@as(u64, 3), reopened.high_water_mark);
+    try std.testing.expectEqual(@as(u64, 4), reopened.high_water_mark);
     try std.testing.expectEqual(@as(u64, 1), reopened.txid);
 
     try expectDbValue(reopened, "alpha", "one");
@@ -919,7 +1151,7 @@ test "reopen ignores dirty pages written before meta switch" {
     try std.testing.expect(beta == null);
 }
 
-test "reopen selects inactive meta after data pages and meta are durable" {
+test "reopen selects inactive meta after data and allocator pages are durable" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -935,13 +1167,23 @@ test "reopen selects inactive meta after data pages and meta are durable" {
         var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
         defer arena.deinit();
 
-        const write_result = try tree.writePut(db, arena.allocator(), "beta", "two");
+        var working_page_allocator = try db.page_allocator.clone(std.testing.allocator);
+        errdefer working_page_allocator.deinit(std.testing.allocator);
+
+        const write_result = try tree.writePut(db, arena.allocator(), &working_page_allocator, "beta", "two");
+        const baseline_page_allocator = working_page_allocator;
+        working_page_allocator = movedPageAllocator(std.testing.allocator);
+
+        var allocator_state = try db.materializeAllocatorStatePage(baseline_page_allocator);
+        defer std.testing.allocator.free(allocator_state.bytes);
+        defer allocator_state.page_allocator.deinit(std.testing.allocator);
+
         const next_meta = meta.Meta{
             .page_size = db.page_size,
             .flags = db.flags,
             .root_page_id = write_result.root_page_id,
-            .allocator_root = db.allocator_root,
-            .high_water_mark = write_result.high_water_mark,
+            .allocator_root = allocator_state.page_id,
+            .high_water_mark = allocator_state.page_allocator.currentHighWaterMark(),
             .txid = db.txid + 1,
         };
         const next_meta_page = try meta.encode(std.testing.allocator, next_meta);
@@ -949,12 +1191,13 @@ test "reopen selects inactive meta after data pages and meta are durable" {
 
         const io = db.io_threaded.io();
         for (write_result.pages) |pending_page| {
-            try storage.writePage(&db.file, io, pending_page.page_id, db.page_size, pending_page.bytes);
+            try storage.writePageObject(&db.file, io, db.page_size, pending_page.page_id, pending_page.bytes);
         }
+        try storage.writePageObject(&db.file, io, db.page_size, allocator_state.page_id, allocator_state.bytes);
         try storage.sync(db.file, io);
 
         const next_meta_slot = inactiveMetaSlot(db.meta_slot);
-        try storage.writePage(&db.file, io, metaSlotPageId(next_meta_slot), db.page_size, next_meta_page);
+        try storage.writePageObject(&db.file, io, db.page_size, metaSlotPageId(next_meta_slot), next_meta_page);
         try storage.sync(db.file, io);
 
         try std.testing.expectEqual(@as(u64, 3), db.root_page_id);
@@ -964,8 +1207,8 @@ test "reopen selects inactive meta after data pages and meta are durable" {
     const reopened = try open(std.testing.allocator, path);
     defer reopened.close();
 
-    try std.testing.expectEqual(@as(u64, 4), reopened.root_page_id);
-    try std.testing.expectEqual(@as(u64, 4), reopened.high_water_mark);
+    try std.testing.expectEqual(@as(u64, 5), reopened.root_page_id);
+    try std.testing.expectEqual(@as(u64, 6), reopened.high_water_mark);
     try std.testing.expectEqual(@as(u64, 2), reopened.txid);
     try expectDbValue(reopened, "alpha", "one");
     try expectDbValue(reopened, "beta", "two");
@@ -987,8 +1230,8 @@ test "put inserts in sorted order and overwrites existing keys across reopen" {
         try db.put("beta", "updated");
 
         try std.testing.expectEqual(meta.MetaSlot.meta1, db.meta_slot);
-        try std.testing.expectEqual(@as(u64, 5), db.root_page_id);
-        try std.testing.expectEqual(@as(u64, 5), db.high_water_mark);
+        try std.testing.expectEqual(@as(u64, 7), db.root_page_id);
+        try std.testing.expectEqual(@as(u64, 8), db.high_water_mark);
         try std.testing.expectEqual(@as(u64, 3), db.txid);
     }
 
@@ -1039,7 +1282,7 @@ test "put splits a full root leaf into a branch root" {
             try db.put(key, value);
         }
 
-        try std.testing.expectEqual(@as(u64, 28), db.high_water_mark);
+        try std.testing.expectEqual(@as(u64, 52), db.high_water_mark);
         try std.testing.expectEqual(@as(u64, 24), db.txid);
         try expectBranchRootMatchesChildren(db, 2);
 
@@ -1105,7 +1348,7 @@ test "put updates a branch-root leaf child without changing its upper bound" {
     try db.put("alpha", "updated");
 
     try std.testing.expectEqual(@as(u64, 6), db.root_page_id);
-    try std.testing.expectEqual(@as(u64, 6), db.high_water_mark);
+    try std.testing.expectEqual(@as(u64, 7), db.high_water_mark);
     try std.testing.expectEqual(@as(u64, 1), db.txid);
 
     const value = (try db.get(std.testing.allocator, "alpha")).?;
@@ -1229,7 +1472,7 @@ test "put splits a full branch child leaf and updates the branch root" {
 
         try std.testing.expectEqual(old_txid + 1, db.txid);
         try std.testing.expectEqual(old_high_water_mark + 3, db.root_page_id);
-        try std.testing.expectEqual(old_high_water_mark + 3, db.high_water_mark);
+        try std.testing.expectEqual(old_high_water_mark + 4, db.high_water_mark);
         try expectBranchRootMatchesChildren(db, 3);
         try expectBranchUpperBoundKeysAreReadable(db);
 
@@ -1356,7 +1599,7 @@ test "put splits branch root after a child leaf split fills the root" {
 
         try std.testing.expectEqual(old_txid + 1, db.txid);
         try std.testing.expectEqual(old_high_water_mark + 5, db.root_page_id);
-        try std.testing.expectEqual(old_high_water_mark + 5, db.high_water_mark);
+        try std.testing.expectEqual(old_high_water_mark + 6, db.high_water_mark);
         try expectThreeLevelBranchRootMatchesLeaves(db, old_high_water_mark + 5);
 
         try expectDbValue(db, "k0000", "v");
@@ -1371,7 +1614,7 @@ test "put splits branch root after a child leaf split fills the root" {
         defer reopened.close();
 
         try std.testing.expectEqual(@as(u64, 246), reopened.root_page_id);
-        try std.testing.expectEqual(@as(u64, 246), reopened.high_water_mark);
+        try std.testing.expectEqual(@as(u64, 247), reopened.high_water_mark);
         try std.testing.expectEqual(@as(u64, 1), reopened.txid);
         try expectThreeLevelBranchRootMatchesLeaves(reopened, 246);
         try assertTreeInvariants(reopened);
@@ -1519,11 +1762,460 @@ test "put rejects non-tree root pages" {
             .upper = default_page_size,
             .flags = 0,
         });
-        try storage.writePage(&file, io, 2, default_page_size, branch_root[0..]);
+        try storage.writePageObject(&file, io, default_page_size, 2, branch_root[0..]);
     }
 
     const db = try open(std.testing.allocator, path);
     defer db.close();
 
     try std.testing.expectError(error.UnexpectedPageType, db.put("alpha", "one"));
+}
+
+fn encodeLeafObjectFixture(allocator: std.mem.Allocator, page_id: u64, order: u8, entries: []const page.LeafEntry) ![]u8 {
+    const span_size = try page.spanSize(default_page_size, order);
+    const leaf_page = try allocator.alloc(u8, span_size);
+    errdefer allocator.free(leaf_page);
+    @memset(leaf_page, 0);
+
+    _ = try page.LeafPage.encodeInto(leaf_page, .{
+        .page_id = page_id,
+        .page_type = .leaf,
+        .count = 0,
+        .order = order,
+    }, entries);
+
+    return leaf_page;
+}
+
+test "writePageObject stores order one and two objects at base-page offsets" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path = try tempFilePath(&path_buf, tmp.dir, "page-object-offsets.db");
+
+    const io = std.testing.io;
+    var file = try std.Io.Dir.createFileAbsolute(io, path, .{
+        .read = true,
+        .truncate = true,
+    });
+    defer file.close(io);
+
+    const order1_page = try encodeLeafObjectFixture(std.testing.allocator, 2, 1, &.{
+        .{ .key = "a", .value = "one", .flags = 0 },
+    });
+    defer std.testing.allocator.free(order1_page);
+
+    const order2_page = try encodeLeafObjectFixture(std.testing.allocator, 4, 2, &.{
+        .{ .key = "b", .value = "two", .flags = 0 },
+    });
+    defer std.testing.allocator.free(order2_page);
+
+    try storage.writePageObject(&file, io, default_page_size, 2, order1_page);
+    try storage.writePageObject(&file, io, default_page_size, 4, order2_page);
+
+    const read_order1 = try readTreePageObjectAlloc(std.testing.allocator, &file, io, 2, default_page_size, 7);
+    defer std.testing.allocator.free(read_order1);
+    try std.testing.expectEqual(order1_page.len, read_order1.len);
+    try std.testing.expectEqualSlices(u8, order1_page, read_order1);
+
+    const read_order2 = try readTreePageObjectAlloc(std.testing.allocator, &file, io, 4, default_page_size, 7);
+    defer std.testing.allocator.free(read_order2);
+    try std.testing.expectEqual(order2_page.len, read_order2.len);
+    try std.testing.expectEqualSlices(u8, order2_page, read_order2);
+}
+
+test "writePageObject writes order zero page after a higher-order object" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path = try tempFilePath(&path_buf, tmp.dir, "page-object-after-high-order.db");
+
+    const io = std.testing.io;
+    var file = try std.Io.Dir.createFileAbsolute(io, path, .{
+        .read = true,
+        .truncate = true,
+    });
+    defer file.close(io);
+
+    const order1_page = try encodeLeafObjectFixture(std.testing.allocator, 2, 1, &.{
+        .{ .key = "wide", .value = "left", .flags = 0 },
+    });
+    defer std.testing.allocator.free(order1_page);
+    const order0_page = try encodeLeafObjectFixture(std.testing.allocator, 4, 0, &.{
+        .{ .key = "tail", .value = "right", .flags = 0 },
+    });
+    defer std.testing.allocator.free(order0_page);
+
+    try storage.writePageObject(&file, io, default_page_size, 2, order1_page);
+    try storage.writePageObject(&file, io, default_page_size, 4, order0_page);
+
+    const read_tail = try readTreePageObjectAlloc(std.testing.allocator, &file, io, 4, default_page_size, 4);
+    defer std.testing.allocator.free(read_tail);
+    const tail = try page.LeafPage.validate(read_tail);
+    const entry = try tail.entry(0);
+    try std.testing.expectEqualSlices(u8, "tail", entry.key);
+    try std.testing.expectEqualSlices(u8, "right", entry.value);
+}
+
+test "put stores a single large value in a higher-order root leaf across reopen" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path = try tempFilePath(&path_buf, tmp.dir, "put-large-root-leaf.db");
+
+    var large_value = [_]u8{'L'} ** 7000;
+
+    {
+        const db = try open(std.testing.allocator, path);
+        defer db.close();
+
+        try db.put("large", large_value[0..]);
+        try std.testing.expectEqual(@as(u64, 4), db.root_page_id);
+        try std.testing.expectEqual(@as(u64, 5), db.high_water_mark);
+        try std.testing.expectEqual(@as(u64, 3), db.allocator_root);
+        try std.testing.expect(!db.page_allocator.containsFreeBlock(3, 0));
+
+        const root_page = try db.readPageAlloc(std.testing.allocator, db.root_page_id);
+        defer std.testing.allocator.free(root_page);
+        const root_header = try page.decodeHeader(root_page);
+        try std.testing.expectEqual(@as(u8, 1), root_header.order);
+    }
+
+    const reopened = try open(std.testing.allocator, path);
+    defer reopened.close();
+
+    const value = (try reopened.get(std.testing.allocator, "large")).?;
+    defer std.testing.allocator.free(value);
+    try std.testing.expectEqualSlices(u8, large_value[0..], value);
+}
+
+test "put failure does not commit working allocator state" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path = try tempFilePath(&path_buf, tmp.dir, "put-too-large-keeps-allocator.db");
+
+    const db = try open(std.testing.allocator, path);
+    defer db.close();
+
+    const initial_high_water_mark = db.high_water_mark;
+    const initial_txid = db.txid;
+    const huge_value = try std.testing.allocator.alloc(u8, 70000);
+    defer std.testing.allocator.free(huge_value);
+    @memset(huge_value, 'H');
+
+    try std.testing.expectError(error.KeyValueTooLarge, db.put("huge", huge_value));
+    try std.testing.expectEqual(initial_high_water_mark, db.high_water_mark);
+    try std.testing.expectEqual(initial_txid, db.txid);
+    try std.testing.expect(!db.page_allocator.containsFreeBlock(3, 0));
+
+    var large_value = [_]u8{'L'} ** 7000;
+    try db.put("large", large_value[0..]);
+    try std.testing.expectEqual(@as(u64, 4), db.root_page_id);
+    try std.testing.expectEqual(@as(u64, 5), db.high_water_mark);
+    try std.testing.expect(!db.page_allocator.containsFreeBlock(3, 0));
+}
+
+test "open keeps legacy allocator_root zero as empty free lists" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path = try tempFilePath(&path_buf, tmp.dir, "legacy-empty-allocator.db");
+    try bootstrapFile(path);
+
+    const db = try open(std.testing.allocator, path);
+    defer db.close();
+
+    try std.testing.expectEqual(@as(u64, 0), db.allocator_root);
+    try std.testing.expectEqual(@as(usize, 0), try db.page_allocator.freeBlockCount());
+}
+
+test "open restores older snapshot when newer allocator state is corrupt" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path = try tempFilePath(&path_buf, tmp.dir, "allocator-state-fallback.db");
+
+    {
+        const db = try open(std.testing.allocator, path);
+        defer db.close();
+        try db.put("old", "one");
+        try db.put("new", "two");
+
+        const newest_allocator_root = db.allocator_root;
+        const io = db.io_threaded.io();
+        var allocator_state = try readAllocatorStatePageObjectAlloc(
+            std.testing.allocator,
+            &db.file,
+            io,
+            newest_allocator_root,
+            db.page_size,
+            db.high_water_mark,
+        );
+        defer std.testing.allocator.free(allocator_state);
+
+        allocator_state[8] = @intFromEnum(page.PageType.leaf);
+        try storage.writePageObject(&db.file, io, db.page_size, newest_allocator_root, allocator_state);
+    }
+
+    const reopened = try open(std.testing.allocator, path);
+    defer reopened.close();
+
+    try std.testing.expectEqual(@as(u64, 1), reopened.txid);
+    try expectDbValue(reopened, "old", "one");
+    const value = try reopened.get(std.testing.allocator, "new");
+    defer if (value) |owned| std.testing.allocator.free(owned);
+    try std.testing.expect(value == null);
+}
+
+test "open ignores allocator state page that is not referenced by meta" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path = try tempFilePath(&path_buf, tmp.dir, "unreferenced-allocator-state.db");
+
+    {
+        const db = try open(std.testing.allocator, path);
+        defer db.close();
+        try db.put("old", "one");
+
+        var candidate = try db.page_allocator.clone(db.allocator);
+        defer candidate.deinit(db.allocator);
+        const unreferenced_root = try candidate.allocate(db.allocator, 0);
+        const state_page = try candidate.encodeStatePageAlloc(std.testing.allocator, db.page_size, unreferenced_root, 0);
+        defer std.testing.allocator.free(state_page);
+        try storage.writePageObject(&db.file, db.io_threaded.io(), db.page_size, unreferenced_root, state_page);
+    }
+
+    const reopened = try open(std.testing.allocator, path);
+    defer reopened.close();
+
+    try std.testing.expectEqual(@as(u64, 1), reopened.txid);
+    try expectDbValue(reopened, "old", "one");
+}
+
+test "open restores order greater than zero allocator state pages" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path = try tempFilePath(&path_buf, tmp.dir, "higher-order-allocator-state.db");
+
+    {
+        const db = try open(std.testing.allocator, path);
+        defer db.close();
+        db.page_allocator.high_water_mark = 2040;
+
+        var index: u64 = 0;
+        while (index < 510) : (index += 1) {
+            try db.page_allocator.release(db.allocator, 4 + index * 4, 0);
+        }
+
+        try db.put("alpha", "one");
+        const allocator_state = try db.readPageAlloc(std.testing.allocator, db.root_page_id);
+        defer std.testing.allocator.free(allocator_state);
+    }
+
+    const reopened = try open(std.testing.allocator, path);
+    defer reopened.close();
+
+    const state_page = try readAllocatorStatePageObjectAlloc(
+        std.testing.allocator,
+        &reopened.file,
+        reopened.io_threaded.io(),
+        reopened.allocator_root,
+        reopened.page_size,
+        reopened.high_water_mark,
+    );
+    defer std.testing.allocator.free(state_page);
+
+    const header = try page.decodeHeader(state_page);
+    try std.testing.expect(header.order > 0);
+    try expectDbValue(reopened, "alpha", "one");
+}
+
+test "allocator state fixed point retry discards failed candidate allocations" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path = try tempFilePath(&path_buf, tmp.dir, "allocator-state-fixed-point.db");
+
+    const db = try open(std.testing.allocator, path);
+    defer db.close();
+    db.page_allocator.high_water_mark = 2040;
+
+    var index: u64 = 0;
+    while (index < 510) : (index += 1) {
+        try db.page_allocator.release(db.allocator, 4 + index * 4, 0);
+    }
+
+    try db.put("alpha", "one");
+
+    const state_page = try readAllocatorStatePageObjectAlloc(
+        std.testing.allocator,
+        &db.file,
+        db.io_threaded.io(),
+        db.allocator_root,
+        db.page_size,
+        db.high_water_mark,
+    );
+    defer std.testing.allocator.free(state_page);
+
+    const header = try page.decodeHeader(state_page);
+    try std.testing.expectEqual(@as(u8, 2), header.order);
+    try std.testing.expect(db.page_allocator.containsFreeBlock(2041, 0));
+    try std.testing.expect(!db.page_allocator.containsFreeBlock(2042, 1));
+}
+
+test "root leaf split uses actual non adjacent allocated page ids" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path = try tempFilePath(&path_buf, tmp.dir, "put-root-split-non-adjacent-free.db");
+
+    const db = try open(std.testing.allocator, path);
+    defer db.close();
+
+    var value_buf: [160]u8 = undefined;
+    const value = fillFixedValue(&value_buf, 'x');
+
+    var index: usize = 0;
+    while (index < 23) : (index += 1) {
+        var key_buf: [5]u8 = undefined;
+        const key = try generatedKey(&key_buf, index);
+        try db.put(key, value);
+    }
+
+    db.high_water_mark = 52;
+    db.page_allocator.high_water_mark = 52;
+    try db.page_allocator.release(db.allocator, 50, 0);
+    try db.page_allocator.release(db.allocator, 52, 0);
+
+    var key_buf: [5]u8 = undefined;
+    const split_key = try generatedKey(&key_buf, 23);
+    try db.put(split_key, value);
+
+    const root_page = try db.readPageAlloc(std.testing.allocator, db.root_page_id);
+    defer std.testing.allocator.free(root_page);
+    const root_branch = try page.BranchPage.validate(root_page);
+    try std.testing.expectEqual(@as(u16, 2), root_branch.count());
+
+    const left_entry = try root_branch.entry(0);
+    const right_entry = try root_branch.entry(1);
+    try std.testing.expect(left_entry.child_page_id == 50 or left_entry.child_page_id == 52);
+    try std.testing.expect(right_entry.child_page_id == 50 or right_entry.child_page_id == 52);
+    try std.testing.expect(left_entry.child_page_id != right_entry.child_page_id);
+    try std.testing.expect(left_entry.child_page_id + 1 != right_entry.child_page_id);
+    try std.testing.expect(right_entry.child_page_id + 1 != left_entry.child_page_id);
+}
+
+test "put rejects a single value larger than the u16-bounded tree page span" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path = try tempFilePath(&path_buf, tmp.dir, "put-too-large-root-leaf.db");
+
+    const db = try open(std.testing.allocator, path);
+    defer db.close();
+
+    const huge_value = try std.testing.allocator.alloc(u8, 40000);
+    defer std.testing.allocator.free(huge_value);
+    @memset(huge_value, 'H');
+
+    try std.testing.expectError(error.KeyValueTooLarge, db.put("huge", huge_value));
+}
+
+test "readPageAlloc rejects page object order beyond the tree layout limit" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path = try tempFilePath(&path_buf, tmp.dir, "bad-page-object-order.db");
+
+    try bootstrapFile(path);
+
+    {
+        const io = std.testing.io;
+        var file = try std.Io.Dir.openFileAbsolute(io, path, .{ .mode = .read_write });
+        defer file.close(io);
+
+        var root_page = [_]u8{0} ** default_page_size;
+        try page.LeafPage.init(root_page[0..], .{
+            .page_id = 2,
+            .page_type = .leaf,
+            .count = 0,
+            .order = 4,
+        });
+        try storage.writePageObject(&file, io, default_page_size, 2, root_page[0..]);
+    }
+
+    const db = try open(std.testing.allocator, path);
+    defer db.close();
+
+    try std.testing.expectError(error.InvalidPageOrder, db.readPageAlloc(std.testing.allocator, 2));
+}
+
+test "readPageAlloc rejects page object spans beyond the high water mark" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path = try tempFilePath(&path_buf, tmp.dir, "page-object-past-hwm.db");
+
+    try bootstrapFile(path);
+
+    {
+        const io = std.testing.io;
+        var file = try std.Io.Dir.openFileAbsolute(io, path, .{ .mode = .read_write });
+        defer file.close(io);
+
+        const root_page = try encodeLeafObjectFixture(std.testing.allocator, 2, 1, &.{});
+        defer std.testing.allocator.free(root_page);
+        try storage.writePageObject(&file, io, default_page_size, 2, root_page);
+    }
+
+    const db = try open(std.testing.allocator, path);
+    defer db.close();
+
+    try std.testing.expectError(error.EntryOutOfBounds, db.readPageAlloc(std.testing.allocator, 2));
+}
+
+test "readPageAlloc rejects page objects whose header id does not match the requested id" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path = try tempFilePath(&path_buf, tmp.dir, "page-object-id-mismatch.db");
+
+    try bootstrapFile(path);
+
+    {
+        const io = std.testing.io;
+        var file = try std.Io.Dir.openFileAbsolute(io, path, .{ .mode = .read_write });
+        defer file.close(io);
+
+        var root_page = [_]u8{0} ** default_page_size;
+        try page.LeafPage.init(root_page[0..], .{
+            .page_id = 3,
+            .page_type = .leaf,
+            .count = 0,
+            .order = 0,
+        });
+        try storage.writePageObject(&file, io, default_page_size, 2, root_page[0..]);
+    }
+
+    const db = try open(std.testing.allocator, path);
+    defer db.close();
+
+    try std.testing.expectError(error.InvalidPageLayout, db.readPageAlloc(std.testing.allocator, 2));
 }
