@@ -36,8 +36,11 @@ pub const DB = struct {
     high_water_mark: u64,
     page_allocator: allocator_mod.PageAllocator,
     txid: u64,
+    write_tx_active: bool,
 
     pub fn close(self: *DB) void {
+        // Active WriteTx values borrow this DB and must be ended before close.
+        std.debug.assert(!self.write_tx_active);
         self.file.close(self.io_threaded.io());
         self.page_allocator.deinit(self.allocator);
         self.allocator.free(self.path);
@@ -65,59 +68,19 @@ pub const DB = struct {
         };
     }
 
+    /// Opens the single writer slot for one explicit write transaction.
+    pub fn beginWrite(self: *DB) !tx.WriteTx {
+        return tx.WriteTx.init(self);
+    }
+
     /// Commits a single-key update by copy-on-writing the affected tree path.
     pub fn put(self: *DB, key: []const u8, value: []const u8) !void {
-        var arena = std.heap.ArenaAllocator.init(self.allocator);
-        defer arena.deinit();
-
-        const allocator = arena.allocator();
-        var working_page_allocator = try self.page_allocator.clone(self.allocator);
-        errdefer working_page_allocator.deinit(self.allocator);
-
-        const write_result = try tree.writePut(self, allocator, &working_page_allocator, key, value);
-
-        const baseline_page_allocator = working_page_allocator;
-        working_page_allocator = movedPageAllocator(self.allocator);
-        var allocator_state = try self.materializeAllocatorStatePage(baseline_page_allocator);
-        defer self.allocator.free(allocator_state.bytes);
-        errdefer allocator_state.page_allocator.deinit(self.allocator);
-
-        const next_meta = meta.Meta{
-            .page_size = self.page_size,
-            .flags = self.flags,
-            .root_page_id = write_result.root_page_id,
-            .allocator_root = allocator_state.page_id,
-            .high_water_mark = allocator_state.page_allocator.currentHighWaterMark(),
-            .txid = self.txid + 1,
-        };
-        const next_meta_page = try meta.encode(self.allocator, next_meta);
-        defer self.allocator.free(next_meta_page);
-
-        const io = self.io_threaded.io();
-        // Dirty tree pages are written in child-to-root order, and the meta
-        // page remains the only commit point visible during recovery.
-        for (write_result.pages) |pending_page| {
-            try storage.writePageObject(&self.file, io, self.page_size, pending_page.page_id, pending_page.bytes);
+        var write_tx = try self.beginWrite();
+        {
+            errdefer write_tx.rollback() catch {};
+            try write_tx.put(key, value);
         }
-        try storage.writePageObject(&self.file, io, self.page_size, allocator_state.page_id, allocator_state.bytes);
-        try storage.sync(self.file, io);
-
-        const next_meta_slot = inactiveMetaSlot(self.meta_slot);
-        // Meta pages act as the commit point. Writing the inactive slot last
-        // keeps the previously selected snapshot available until this commit is durable.
-        try storage.writePageObject(&self.file, io, self.page_size, metaSlotPageId(next_meta_slot), next_meta_page);
-        try storage.sync(self.file, io);
-
-        self.meta_slot = next_meta_slot;
-        self.flags = next_meta.flags;
-        self.root_page_id = next_meta.root_page_id;
-        self.allocator_root = next_meta.allocator_root;
-        self.high_water_mark = next_meta.high_water_mark;
-        var previous_page_allocator = self.page_allocator;
-        self.page_allocator = allocator_state.page_allocator;
-        previous_page_allocator.deinit(self.allocator);
-        allocator_state.page_allocator = movedPageAllocator(self.allocator);
-        self.txid = next_meta.txid;
+        try write_tx.commit();
     }
 
     pub fn readPageAlloc(self: *DB, allocator: std.mem.Allocator, page_id: u64) ![]u8 {
@@ -128,7 +91,7 @@ pub const DB = struct {
         return readTreePageObjectAlloc(allocator, &self.file, self.io_threaded.io(), page_id, self.page_size, high_water_mark);
     }
 
-    fn materializeAllocatorStatePage(self: *DB, baseline_page_allocator: allocator_mod.PageAllocator) !MaterializedAllocatorState {
+    pub fn materializeAllocatorStatePage(self: *DB, baseline_page_allocator: allocator_mod.PageAllocator) !MaterializedAllocatorState {
         var baseline = baseline_page_allocator;
         errdefer baseline.deinit(self.allocator);
 
@@ -159,6 +122,23 @@ pub const DB = struct {
             desired_order = required_order;
         }
     }
+
+    pub fn applyCommittedState(
+        self: *DB,
+        next_meta_slot: meta.MetaSlot,
+        next_meta: meta.Meta,
+        next_page_allocator: allocator_mod.PageAllocator,
+    ) void {
+        self.meta_slot = next_meta_slot;
+        self.flags = next_meta.flags;
+        self.root_page_id = next_meta.root_page_id;
+        self.allocator_root = next_meta.allocator_root;
+        self.high_water_mark = next_meta.high_water_mark;
+        var previous_page_allocator = self.page_allocator;
+        self.page_allocator = next_page_allocator;
+        previous_page_allocator.deinit(self.allocator);
+        self.txid = next_meta.txid;
+    }
 };
 
 pub fn open(allocator: std.mem.Allocator, path: []const u8) !*DB {
@@ -178,6 +158,7 @@ pub fn open(allocator: std.mem.Allocator, path: []const u8) !*DB {
         .high_water_mark = 0,
         .page_allocator = allocator_mod.PageAllocator.init(allocator, 0),
         .txid = 0,
+        .write_tx_active = false,
     };
     errdefer allocator.free(db.path);
     errdefer db.io_threaded.deinit();
@@ -2313,4 +2294,143 @@ test "readPageAlloc rejects page objects whose header id does not match the requ
     defer db.close();
 
     try std.testing.expectError(error.InvalidPageLayout, db.readPageAlloc(std.testing.allocator, 2));
+}
+
+test "explicit write transaction commit persists a staged put" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path = try tempFilePath(&path_buf, tmp.dir, "write-tx-commit.db");
+
+    const db = try open(std.testing.allocator, path);
+    defer db.close();
+
+    var write_tx = try db.beginWrite();
+    try write_tx.put("alpha", "one");
+    try write_tx.commit();
+
+    try std.testing.expectEqual(@as(u64, 1), db.txid);
+    try expectDbValue(db, "alpha", "one");
+}
+
+test "explicit write transaction rollback discards staged pages and preserves committed state" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path = try tempFilePath(&path_buf, tmp.dir, "write-tx-rollback.db");
+
+    const db = try open(std.testing.allocator, path);
+    defer db.close();
+
+    const initial_txid = db.txid;
+    const initial_high_water_mark = db.high_water_mark;
+
+    var write_tx = try db.beginWrite();
+    try write_tx.put("alpha", "one");
+    try write_tx.rollback();
+
+    try std.testing.expectEqual(initial_txid, db.txid);
+    try std.testing.expectEqual(initial_high_water_mark, db.high_water_mark);
+    try std.testing.expect(!db.write_tx_active);
+
+    const value = try db.get(std.testing.allocator, "alpha");
+    defer if (value) |owned| std.testing.allocator.free(owned);
+    try std.testing.expect(value == null);
+}
+
+test "write transaction exposes a single writer slot" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path = try tempFilePath(&path_buf, tmp.dir, "write-tx-single-writer.db");
+
+    const db = try open(std.testing.allocator, path);
+    defer db.close();
+
+    var write_tx = try db.beginWrite();
+    defer write_tx.rollback() catch {};
+
+    try std.testing.expectError(tx.WriteTxError.WriteTransactionActive, db.beginWrite());
+}
+
+test "write transaction rejects a second put" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path = try tempFilePath(&path_buf, tmp.dir, "write-tx-single-put.db");
+
+    const db = try open(std.testing.allocator, path);
+    defer db.close();
+
+    var write_tx = try db.beginWrite();
+    defer write_tx.rollback() catch {};
+
+    try write_tx.put("alpha", "one");
+    try std.testing.expectError(tx.WriteTxError.WriteTransactionAlreadyUsed, write_tx.put("beta", "two"));
+}
+
+test "read transaction keeps its snapshot after an explicit write commit" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path = try tempFilePath(&path_buf, tmp.dir, "write-tx-read-snapshot.db");
+
+    const db = try open(std.testing.allocator, path);
+    defer db.close();
+
+    try db.put("alpha", "one");
+    var read_tx = db.beginRead();
+    defer read_tx.deinit();
+
+    var write_tx = try db.beginWrite();
+    try write_tx.put("beta", "two");
+    try write_tx.commit();
+
+    const snapshot_value = try read_tx.get(std.testing.allocator, "beta");
+    defer if (snapshot_value) |owned| std.testing.allocator.free(owned);
+    try std.testing.expect(snapshot_value == null);
+    try expectDbValue(db, "beta", "two");
+}
+
+test "commit failure releases the writer slot and leaves the transaction failed" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path = try tempFilePath(&path_buf, tmp.dir, "write-tx-commit-failure.db");
+
+    const db = try open(std.testing.allocator, path);
+    defer db.close();
+
+    var write_tx = try db.beginWrite();
+    try write_tx.put("alpha", "one");
+
+    const initial_txid = db.txid;
+    const initial_high_water_mark = db.high_water_mark;
+    const io = db.io_threaded.io();
+    db.file.close(io);
+
+    var commit_failed = false;
+    write_tx.commit() catch {
+        commit_failed = true;
+    };
+    try std.testing.expect(commit_failed);
+    try std.testing.expectEqual(initial_txid, db.txid);
+    try std.testing.expectEqual(initial_high_water_mark, db.high_water_mark);
+    try std.testing.expect(!db.write_tx_active);
+    try std.testing.expectError(tx.WriteTxError.WriteTransactionFailed, write_tx.put("beta", "two"));
+    try std.testing.expectError(tx.WriteTxError.WriteTransactionFailed, write_tx.commit());
+    try std.testing.expectError(tx.WriteTxError.WriteTransactionFailed, write_tx.rollback());
+
+    db.file = try std.Io.Dir.openFileAbsolute(io, db.path, .{ .mode = .read_write });
+
+    var next_write_tx = try db.beginWrite();
+    try next_write_tx.put("beta", "two");
+    try next_write_tx.commit();
+    try expectDbValue(db, "beta", "two");
 }
