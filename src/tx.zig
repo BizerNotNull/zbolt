@@ -52,12 +52,6 @@ pub const WriteTx = struct {
         failed,
     };
 
-    const MaterializedAllocatorState = struct {
-        page_id: u64,
-        bytes: []u8,
-        page_allocator: allocator_mod.PageAllocator,
-    };
-
     /// Write transactions borrow the DB handle, own their working state, and
     /// must be used through a single mutable binding without copying.
     pub fn init(db: *db_mod.DB) !WriteTx {
@@ -98,6 +92,19 @@ pub const WriteTx = struct {
         );
     }
 
+    /// Ends the transaction, rolling back an active write if the caller exits
+    /// without an explicit commit or rollback.
+    pub fn deinit(self: *WriteTx) void {
+        switch (self.state) {
+            .active => {
+                self.cleanupOwnedResources();
+                self.db.write_tx_active = false;
+                self.state = .rolled_back;
+            },
+            .committed, .rolled_back, .failed => {},
+        }
+    }
+
     pub fn commit(self: *WriteTx) !void {
         try self.ensureActiveForMutation();
         const write_result = self.write_result orelse return WriteTxError.NoPendingWrite;
@@ -107,9 +114,10 @@ pub const WriteTx = struct {
         self.working_page_allocator = movedPageAllocator(self.db.allocator);
         self.owns_working_page_allocator = false;
 
-        var allocator_state = try self.materializeAllocatorStatePage(baseline_page_allocator);
+        var allocator_state = try self.db.materializeAllocatorStatePage(baseline_page_allocator);
         defer self.db.allocator.free(allocator_state.bytes);
         errdefer allocator_state.page_allocator.deinit(self.db.allocator);
+        std.debug.assert(self.base_txid == self.db.txid);
 
         const next_meta = meta.Meta{
             .page_size = self.db.page_size,
@@ -117,7 +125,7 @@ pub const WriteTx = struct {
             .root_page_id = write_result.root_page_id,
             .allocator_root = allocator_state.page_id,
             .high_water_mark = allocator_state.page_allocator.currentHighWaterMark(),
-            .txid = self.base_txid + 1,
+            .txid = self.db.txid + 1,
         };
         const next_meta_page = try meta.encode(self.db.allocator, next_meta);
         defer self.db.allocator.free(next_meta_page);
@@ -181,38 +189,6 @@ pub const WriteTx = struct {
         if (self.owns_arena) {
             self.arena.deinit();
             self.owns_arena = false;
-        }
-    }
-
-    fn materializeAllocatorStatePage(self: *WriteTx, baseline_page_allocator: allocator_mod.PageAllocator) !MaterializedAllocatorState {
-        var baseline = baseline_page_allocator;
-        errdefer baseline.deinit(self.db.allocator);
-
-        var desired_order = try baseline.allocatorStateOrder(self.db.page_size);
-        while (true) {
-            var candidate = try baseline.clone(self.db.allocator);
-            errdefer candidate.deinit(self.db.allocator);
-
-            const page_id = try candidate.allocate(self.db.allocator, desired_order);
-            const required_order = try candidate.allocatorStateOrder(self.db.page_size);
-            if (required_order <= desired_order) {
-                const state_page = try candidate.encodeStatePageAlloc(self.db.allocator, self.db.page_size, page_id, desired_order);
-                errdefer self.db.allocator.free(state_page);
-
-                baseline.deinit(self.db.allocator);
-                baseline = movedPageAllocator(self.db.allocator);
-                const final_candidate = candidate;
-                candidate = movedPageAllocator(self.db.allocator);
-                return .{
-                    .page_id = page_id,
-                    .bytes = state_page,
-                    .page_allocator = final_candidate,
-                };
-            }
-
-            candidate.deinit(self.db.allocator);
-            candidate = movedPageAllocator(self.db.allocator);
-            desired_order = required_order;
         }
     }
 };

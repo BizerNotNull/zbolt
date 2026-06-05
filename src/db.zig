@@ -11,7 +11,7 @@ const default_page_size: u32 = 4096;
 const bootstrap_page_count: u64 = 3;
 const allocator_state_max_span_size: usize = 16 * 1024 * 1024;
 
-const MaterializedAllocatorState = struct {
+pub const MaterializedAllocatorState = struct {
     page_id: u64,
     bytes: []u8,
     page_allocator: allocator_mod.PageAllocator,
@@ -76,10 +76,8 @@ pub const DB = struct {
     /// Commits a single-key update by copy-on-writing the affected tree path.
     pub fn put(self: *DB, key: []const u8, value: []const u8) !void {
         var write_tx = try self.beginWrite();
-        {
-            errdefer write_tx.rollback() catch {};
-            try write_tx.put(key, value);
-        }
+        defer write_tx.deinit();
+        try write_tx.put(key, value);
         try write_tx.commit();
     }
 
@@ -2354,6 +2352,31 @@ test "write transaction exposes a single writer slot" {
     defer write_tx.rollback() catch {};
 
     try std.testing.expectError(tx.WriteTxError.WriteTransactionActive, db.beginWrite());
+}
+
+test "write transaction deinit releases the writer slot" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path = try tempFilePath(&path_buf, tmp.dir, "write-tx-deinit.db");
+
+    const db = try open(std.testing.allocator, path);
+    defer db.close();
+
+    {
+        var write_tx = try db.beginWrite();
+        try write_tx.put("alpha", "one");
+        write_tx.deinit();
+    }
+
+    try std.testing.expect(!db.write_tx_active);
+
+    var next_write_tx = try db.beginWrite();
+    defer next_write_tx.deinit();
+    try next_write_tx.put("beta", "two");
+    try next_write_tx.commit();
+    try expectDbValue(db, "beta", "two");
 }
 
 test "write transaction rejects a second put" {
