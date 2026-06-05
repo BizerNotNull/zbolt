@@ -88,55 +88,6 @@ pub const DB = struct {
     pub fn readPageAllocAtHighWater(self: *DB, allocator: std.mem.Allocator, page_id: u64, high_water_mark: u64) ![]u8 {
         return readTreePageObjectAlloc(allocator, &self.file, self.io_threaded.io(), page_id, self.page_size, high_water_mark);
     }
-
-    pub fn materializeAllocatorStatePage(self: *DB, baseline_page_allocator: allocator_mod.PageAllocator) !MaterializedAllocatorState {
-        var baseline = baseline_page_allocator;
-        errdefer baseline.deinit(self.allocator);
-
-        var desired_order = try baseline.allocatorStateOrder(self.page_size);
-        while (true) {
-            var candidate = try baseline.clone(self.allocator);
-            errdefer candidate.deinit(self.allocator);
-
-            const page_id = try candidate.allocate(self.allocator, desired_order);
-            const required_order = try candidate.allocatorStateOrder(self.page_size);
-            if (required_order <= desired_order) {
-                const state_page = try candidate.encodeStatePageAlloc(self.allocator, self.page_size, page_id, desired_order);
-                errdefer self.allocator.free(state_page);
-
-                baseline.deinit(self.allocator);
-                baseline = movedPageAllocator(self.allocator);
-                const final_candidate = candidate;
-                candidate = movedPageAllocator(self.allocator);
-                return .{
-                    .page_id = page_id,
-                    .bytes = state_page,
-                    .page_allocator = final_candidate,
-                };
-            }
-
-            candidate.deinit(self.allocator);
-            candidate = movedPageAllocator(self.allocator);
-            desired_order = required_order;
-        }
-    }
-
-    pub fn applyCommittedState(
-        self: *DB,
-        next_meta_slot: meta.MetaSlot,
-        next_meta: meta.Meta,
-        next_page_allocator: allocator_mod.PageAllocator,
-    ) void {
-        self.meta_slot = next_meta_slot;
-        self.flags = next_meta.flags;
-        self.root_page_id = next_meta.root_page_id;
-        self.allocator_root = next_meta.allocator_root;
-        self.high_water_mark = next_meta.high_water_mark;
-        var previous_page_allocator = self.page_allocator;
-        self.page_allocator = next_page_allocator;
-        previous_page_allocator.deinit(self.allocator);
-        self.txid = next_meta.txid;
-    }
 };
 
 pub fn open(allocator: std.mem.Allocator, path: []const u8) !*DB {
@@ -177,6 +128,55 @@ pub fn open(allocator: std.mem.Allocator, path: []const u8) !*DB {
     try recoverOrInitialize(db);
 
     return db;
+}
+
+pub fn materializeAllocatorStatePage(db: *DB, baseline_page_allocator: allocator_mod.PageAllocator) !MaterializedAllocatorState {
+    var baseline = baseline_page_allocator;
+    errdefer baseline.deinit(db.allocator);
+
+    var desired_order = try baseline.allocatorStateOrder(db.page_size);
+    while (true) {
+        var candidate = try baseline.clone(db.allocator);
+        errdefer candidate.deinit(db.allocator);
+
+        const page_id = try candidate.allocate(db.allocator, desired_order);
+        const required_order = try candidate.allocatorStateOrder(db.page_size);
+        if (required_order <= desired_order) {
+            const state_page = try candidate.encodeStatePageAlloc(db.allocator, db.page_size, page_id, desired_order);
+            errdefer db.allocator.free(state_page);
+
+            baseline.deinit(db.allocator);
+            baseline = movedPageAllocator(db.allocator);
+            const final_candidate = candidate;
+            candidate = movedPageAllocator(db.allocator);
+            return .{
+                .page_id = page_id,
+                .bytes = state_page,
+                .page_allocator = final_candidate,
+            };
+        }
+
+        candidate.deinit(db.allocator);
+        candidate = movedPageAllocator(db.allocator);
+        desired_order = required_order;
+    }
+}
+
+pub fn applyCommittedState(
+    db: *DB,
+    next_meta_slot: meta.MetaSlot,
+    next_meta: meta.Meta,
+    next_page_allocator: allocator_mod.PageAllocator,
+) void {
+    db.meta_slot = next_meta_slot;
+    db.flags = next_meta.flags;
+    db.root_page_id = next_meta.root_page_id;
+    db.allocator_root = next_meta.allocator_root;
+    db.high_water_mark = next_meta.high_water_mark;
+    var previous_page_allocator = db.page_allocator;
+    db.page_allocator = next_page_allocator;
+    previous_page_allocator.deinit(db.allocator);
+    db.txid = next_meta.txid;
 }
 
 fn recoverOrInitialize(db: *DB) !void {
@@ -1248,7 +1248,7 @@ test "reopen selects inactive meta after data and allocator pages are durable" {
         const baseline_page_allocator = working_page_allocator;
         working_page_allocator = movedPageAllocator(std.testing.allocator);
 
-        var allocator_state = try db.materializeAllocatorStatePage(baseline_page_allocator);
+        var allocator_state = try materializeAllocatorStatePage(db, baseline_page_allocator);
         defer std.testing.allocator.free(allocator_state.bytes);
         defer allocator_state.page_allocator.deinit(std.testing.allocator);
 
@@ -2456,4 +2456,40 @@ test "commit failure releases the writer slot and leaves the transaction failed"
     try next_write_tx.put("beta", "two");
     try next_write_tx.commit();
     try expectDbValue(db, "beta", "two");
+}
+
+test "write transaction commit without a staged write returns NoPendingWrite" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path = try tempFilePath(&path_buf, tmp.dir, "write-tx-no-pending-write.db");
+
+    const db = try open(std.testing.allocator, path);
+    defer db.close();
+
+    var write_tx = try db.beginWrite();
+    defer write_tx.rollback() catch {};
+
+    try std.testing.expectError(tx.WriteTxError.NoPendingWrite, write_tx.commit());
+    try std.testing.expect(db.write_tx_active);
+}
+
+test "rolled back write transaction rejects put commit and rollback" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path = try tempFilePath(&path_buf, tmp.dir, "write-tx-closed-after-rollback.db");
+
+    const db = try open(std.testing.allocator, path);
+    defer db.close();
+
+    var write_tx = try db.beginWrite();
+    try write_tx.rollback();
+
+    try std.testing.expect(!db.write_tx_active);
+    try std.testing.expectError(tx.WriteTxError.WriteTransactionClosed, write_tx.put("alpha", "one"));
+    try std.testing.expectError(tx.WriteTxError.WriteTransactionClosed, write_tx.commit());
+    try std.testing.expectError(tx.WriteTxError.WriteTransactionClosed, write_tx.rollback());
 }

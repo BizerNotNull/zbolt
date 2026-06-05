@@ -114,7 +114,7 @@ pub const WriteTx = struct {
         self.working_page_allocator = movedPageAllocator(self.db.allocator);
         self.owns_working_page_allocator = false;
 
-        var allocator_state = try self.db.materializeAllocatorStatePage(baseline_page_allocator);
+        var allocator_state = try db_mod.materializeAllocatorStatePage(self.db, baseline_page_allocator);
         defer self.db.allocator.free(allocator_state.bytes);
         errdefer allocator_state.page_allocator.deinit(self.db.allocator);
         std.debug.assert(self.base_txid == self.db.txid);
@@ -141,7 +141,7 @@ pub const WriteTx = struct {
         try storage.writePageObject(&self.db.file, io, self.db.page_size, metaSlotPageId(next_meta_slot), next_meta_page);
         try storage.sync(self.db.file, io);
 
-        self.db.applyCommittedState(next_meta_slot, next_meta, allocator_state.page_allocator);
+        db_mod.applyCommittedState(self.db, next_meta_slot, next_meta, allocator_state.page_allocator);
         allocator_state.page_allocator = movedPageAllocator(self.db.allocator);
 
         self.db.write_tx_active = false;
