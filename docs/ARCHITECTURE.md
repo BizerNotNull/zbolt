@@ -212,6 +212,13 @@ When a write transaction modifies a key, it does not overwrite the original leaf
 
 So a single write affects only the dirty path from the root to the target leaf, not the entire tree.
 
+The current implementation round covers only the `put` path and only the
+page-replacement side of that path:
+
+- old pages from the rewritten tree path are tracked for reclaim
+- delete, cursor, compact, and non-tree reclaim sources are still out of
+  scope for this slice
+
 ## 5. Transaction Model
 
 ### 5.1 Transaction Types
@@ -322,6 +329,23 @@ Only when the following condition holds may an old page truly re-enter the free-
 - all read transactions with `txid <= release_txid` that could still reference the page have finished
 
 This is the handoff point between MVCC and the allocator.
+
+In the current first implementation, the reclaim watermark follows the
+writer's `base_txid` direction:
+
+- a pending item records the highest snapshot `txid` that may still see
+  the old pages
+- an item becomes safe only after the oldest active reader has advanced
+  past that `base_txid`
+
+This first version keeps pending reclaim in memory only:
+
+- the committed allocator state page does not persist pending reclaim
+- if the process restarts before a pending item is reused, those pages
+  conservatively leak until a later compaction or format upgrade path
+  exists
+- committed data remains correct because restart recovery still trusts
+  only the latest valid meta page and allocator state page
 
 ### 6.3 `pending free page` and the Shrink Strategy
 
@@ -504,6 +528,9 @@ The following module responsibilities are planned to emerge incrementally:
   - `pending free page` management
   - advancing the reclaimable boundary according to the oldest active read transaction
   - returning old pages to `allocator` at a safe time
+
+At the current stage, `reclaim` is implemented only for old tree pages
+released by `put`-path page replacement.
 - `compact`
   - explicit database-file compaction
   - rewriting data based on the latest snapshot

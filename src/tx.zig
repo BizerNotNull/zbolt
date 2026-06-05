@@ -2,6 +2,7 @@ const std = @import("std");
 const allocator_mod = @import("allocator.zig");
 const db_mod = @import("db.zig");
 const meta = @import("meta.zig");
+const reclaim = @import("reclaim.zig");
 const storage = @import("storage.zig");
 const tree = @import("tree.zig");
 
@@ -14,22 +15,25 @@ pub const WriteTxError = error{
 };
 
 pub const ReadTx = struct {
-    db: *db_mod.DB,
+    db: ?*db_mod.DB,
     snapshot: tree.ReadSnapshot,
     txid: u64,
 
     /// Releases this read view.
     ///
-    /// The transaction borrows the DB handle and is valid only while that DB
-    /// remains open. The no-op lifecycle hook is where future reader tracking
-    /// can detach snapshots before reclaimed pages are reused.
+    /// The transaction borrows the DB handle, must be used through a single
+    /// mutable binding without copying, and is valid only while that DB
+    /// remains open.
     pub fn deinit(self: *ReadTx) void {
-        _ = self;
+        const db = self.db orelse return;
+        self.db = null;
+        db.reclaim.endRead(self.txid);
     }
 
     /// Returns an owned copy of the value visible to this read snapshot.
     pub fn get(self: *const ReadTx, allocator: std.mem.Allocator, key: []const u8) !?[]u8 {
-        return tree.lookupSnapshot(self.db, allocator, self.snapshot, key);
+        std.debug.assert(self.db != null);
+        return tree.lookupSnapshot(self.db.?, allocator, self.snapshot, key);
     }
 };
 
@@ -56,6 +60,7 @@ pub const WriteTx = struct {
     /// must be used through a single mutable binding without copying.
     pub fn init(db: *db_mod.DB) !WriteTx {
         if (db.write_tx_active) return WriteTxError.WriteTransactionActive;
+        try db.reclaim.releaseReusableIntoAllocator(db.allocator, &db.page_allocator);
 
         var working_page_allocator = try db.page_allocator.clone(db.allocator);
         errdefer working_page_allocator.deinit(db.allocator);
@@ -110,6 +115,16 @@ pub const WriteTx = struct {
         const write_result = self.write_result orelse return WriteTxError.NoPendingWrite;
         errdefer self.fail();
 
+        var staged_released_pages: []const reclaim.ReleasedPage = &.{};
+        if (write_result.released_pages.len > 0) {
+            try self.db.reclaim.ensurePendingCapacity(self.db.allocator, 1);
+            staged_released_pages = try self.db.allocator.dupe(
+                reclaim.ReleasedPage,
+                write_result.released_pages,
+            );
+        }
+        errdefer if (staged_released_pages.len > 0) self.db.allocator.free(staged_released_pages);
+
         const baseline_page_allocator = self.working_page_allocator;
         self.working_page_allocator = movedPageAllocator(self.db.allocator);
         self.owns_working_page_allocator = false;
@@ -143,6 +158,10 @@ pub const WriteTx = struct {
 
         db_mod.applyCommittedState(self.db, next_meta_slot, next_meta, allocator_state.page_allocator);
         allocator_state.page_allocator = movedPageAllocator(self.db.allocator);
+        if (staged_released_pages.len > 0) {
+            self.db.reclaim.appendReleasedOwned(self.base_txid, staged_released_pages);
+            staged_released_pages = &.{};
+        }
 
         self.db.write_tx_active = false;
         self.cleanupOwnedResources();

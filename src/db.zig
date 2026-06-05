@@ -3,6 +3,7 @@ const errors = @import("errors.zig");
 const allocator_mod = @import("allocator.zig");
 const meta = @import("meta.zig");
 const page = @import("page.zig");
+const reclaim = @import("reclaim.zig");
 const storage = @import("storage.zig");
 const tree = @import("tree.zig");
 const tx = @import("tx.zig");
@@ -35,13 +36,16 @@ pub const DB = struct {
     allocator_root: u64,
     high_water_mark: u64,
     page_allocator: allocator_mod.PageAllocator,
+    reclaim: reclaim.State,
     txid: u64,
     write_tx_active: bool,
 
     pub fn close(self: *DB) void {
         // Active WriteTx values borrow this DB and must be ended before close.
         std.debug.assert(!self.write_tx_active);
+        std.debug.assert(self.reclaim.activeReaderCount() == 0);
         self.file.close(self.io_threaded.io());
+        self.reclaim.deinit(self.allocator);
         self.page_allocator.deinit(self.allocator);
         self.allocator.free(self.path);
         self.io_threaded.deinit();
@@ -50,14 +54,15 @@ pub const DB = struct {
 
     /// Returns an owned copy of the value for `key`, or `null` when the key is absent.
     pub fn get(self: *DB, allocator: std.mem.Allocator, key: []const u8) !?[]u8 {
-        var read_tx = self.beginRead();
+        var read_tx = try self.beginRead();
         defer read_tx.deinit();
 
         return read_tx.get(allocator, key);
     }
 
     /// Opens a read-only view over the currently committed root.
-    pub fn beginRead(self: *DB) tx.ReadTx {
+    pub fn beginRead(self: *DB) !tx.ReadTx {
+        try self.reclaim.beginRead(self.txid);
         return .{
             .db = self,
             .snapshot = .{
@@ -94,11 +99,13 @@ pub fn open(allocator: std.mem.Allocator, path: []const u8) !*DB {
     var db = try allocator.create(DB);
     errdefer allocator.destroy(db);
 
+    const owned_path = try allocator.dupe(u8, path);
+
     db.* = .{
         .allocator = allocator,
         .io_threaded = .init(allocator, .{}),
         .file = undefined,
-        .path = try allocator.dupe(u8, path),
+        .path = owned_path,
         .meta_slot = .meta0,
         .page_size = 0,
         .flags = 0,
@@ -106,9 +113,11 @@ pub fn open(allocator: std.mem.Allocator, path: []const u8) !*DB {
         .allocator_root = 0,
         .high_water_mark = 0,
         .page_allocator = allocator_mod.PageAllocator.init(allocator, 0),
+        .reclaim = reclaim.State.init(allocator),
         .txid = 0,
         .write_tx_active = false,
     };
+    errdefer db.reclaim.deinit(allocator);
     errdefer allocator.free(db.path);
     errdefer db.io_threaded.deinit();
     errdefer db.page_allocator.deinit(allocator);
@@ -1123,7 +1132,7 @@ test "read transaction keeps old snapshot after later commits" {
         }
         try expectBranchRootMatchesChildren(db, 2);
 
-        var read_tx = db.beginRead();
+        var read_tx = try db.beginRead();
         defer read_tx.deinit();
 
         try db.put("k0000", "updated");
@@ -1161,7 +1170,7 @@ test "read transaction uses captured high water for higher-order root leaf" {
     var large_value = [_]u8{'L'} ** 7000;
     try db.put("large", large_value[0..]);
 
-    var read_tx = db.beginRead();
+    var read_tx = try db.beginRead();
     defer read_tx.deinit();
 
     try std.testing.expect(read_tx.snapshot.high_water_mark > read_tx.snapshot.root_page_id);
@@ -1304,8 +1313,8 @@ test "put inserts in sorted order and overwrites existing keys across reopen" {
         try db.put("beta", "updated");
 
         try std.testing.expectEqual(meta.MetaSlot.meta1, db.meta_slot);
-        try std.testing.expectEqual(@as(u64, 7), db.root_page_id);
-        try std.testing.expectEqual(@as(u64, 8), db.high_water_mark);
+        try std.testing.expect(db.root_page_id >= 3);
+        try std.testing.expect(db.high_water_mark >= db.root_page_id);
         try std.testing.expectEqual(@as(u64, 3), db.txid);
     }
 
@@ -1356,7 +1365,7 @@ test "put splits a full root leaf into a branch root" {
             try db.put(key, value);
         }
 
-        try std.testing.expectEqual(@as(u64, 52), db.high_water_mark);
+        try std.testing.expect(db.high_water_mark < 52);
         try std.testing.expectEqual(@as(u64, 24), db.txid);
         try expectBranchRootMatchesChildren(db, 2);
 
@@ -2171,6 +2180,10 @@ test "root leaf split uses actual non adjacent allocated page ids" {
 
     db.high_water_mark = 52;
     db.page_allocator.high_water_mark = 52;
+    for (db.reclaim.pending.items) |pending_release| {
+        db.allocator.free(pending_release.pages);
+    }
+    db.reclaim.pending.clearRetainingCapacity();
     try db.page_allocator.release(db.allocator, 50, 0);
     try db.page_allocator.release(db.allocator, 52, 0);
 
@@ -2332,6 +2345,7 @@ test "explicit write transaction rollback discards staged pages and preserves co
     try std.testing.expectEqual(initial_txid, db.txid);
     try std.testing.expectEqual(initial_high_water_mark, db.high_water_mark);
     try std.testing.expect(!db.write_tx_active);
+    try std.testing.expectEqual(@as(usize, 0), db.reclaim.pending.items.len);
 
     const value = try db.get(std.testing.allocator, "alpha");
     defer if (value) |owned| std.testing.allocator.free(owned);
@@ -2407,7 +2421,7 @@ test "read transaction keeps its snapshot after an explicit write commit" {
     defer db.close();
 
     try db.put("alpha", "one");
-    var read_tx = db.beginRead();
+    var read_tx = try db.beginRead();
     defer read_tx.deinit();
 
     var write_tx = try db.beginWrite();
@@ -2446,6 +2460,8 @@ test "commit failure releases the writer slot and leaves the transaction failed"
     try std.testing.expectEqual(initial_txid, db.txid);
     try std.testing.expectEqual(initial_high_water_mark, db.high_water_mark);
     try std.testing.expect(!db.write_tx_active);
+    try std.testing.expectEqual(@as(usize, 0), db.reclaim.pending.items.len);
+    try std.testing.expect(!db.page_allocator.containsFreeBlock(3, 0));
     try std.testing.expectError(tx.WriteTxError.WriteTransactionFailed, write_tx.put("beta", "two"));
     try std.testing.expectError(tx.WriteTxError.WriteTransactionFailed, write_tx.commit());
     try std.testing.expectError(tx.WriteTxError.WriteTransactionFailed, write_tx.rollback());
@@ -2492,4 +2508,105 @@ test "rolled back write transaction rejects put commit and rollback" {
     try std.testing.expectError(tx.WriteTxError.WriteTransactionClosed, write_tx.put("alpha", "one"));
     try std.testing.expectError(tx.WriteTxError.WriteTransactionClosed, write_tx.commit());
     try std.testing.expectError(tx.WriteTxError.WriteTransactionClosed, write_tx.rollback());
+}
+
+test "reclaim reuses released pages on the next write when no readers block reuse" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path = try tempFilePath(&path_buf, tmp.dir, "reclaim-reuses-without-readers.db");
+
+    const db = try open(std.testing.allocator, path);
+    defer db.close();
+
+    try db.put("alpha", "one");
+    try db.put("alpha", "two");
+
+    try std.testing.expectEqual(@as(usize, 1), db.reclaim.pending.items.len);
+    try std.testing.expect(!db.page_allocator.containsFreeBlock(3, 0));
+
+    try db.put("alpha", "three");
+
+    try std.testing.expectEqual(@as(u64, 3), db.root_page_id);
+    try expectDbValue(db, "alpha", "three");
+}
+
+test "reclaim keeps released pages pending while a read transaction is still active" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path = try tempFilePath(&path_buf, tmp.dir, "reclaim-blocked-by-reader.db");
+
+    const db = try open(std.testing.allocator, path);
+    defer db.close();
+
+    try db.put("alpha", "one");
+    var read_tx = try db.beginRead();
+    defer read_tx.deinit();
+
+    try db.put("alpha", "two");
+    try std.testing.expectEqual(@as(usize, 1), db.reclaim.pending.items.len);
+    try std.testing.expect(!db.page_allocator.containsFreeBlock(3, 0));
+
+    try db.put("alpha", "three");
+
+    try std.testing.expect(db.root_page_id != 3);
+    try std.testing.expectEqual(@as(usize, 2), db.reclaim.pending.items.len);
+    try expectDbValue(db, "alpha", "three");
+}
+
+test "reclaim reuses released pages after the blocking read transaction ends" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path = try tempFilePath(&path_buf, tmp.dir, "reclaim-reuses-after-reader-ends.db");
+
+    const db = try open(std.testing.allocator, path);
+    defer db.close();
+
+    try db.put("alpha", "one");
+    var read_tx = try db.beginRead();
+    defer read_tx.deinit();
+    try db.put("alpha", "two");
+
+    try std.testing.expectEqual(@as(usize, 1), db.reclaim.pending.items.len);
+    read_tx.deinit();
+
+    try db.put("alpha", "three");
+
+    try std.testing.expectEqual(@as(u64, 3), db.root_page_id);
+    try expectDbValue(db, "alpha", "three");
+}
+
+test "reopen drops in-memory pending reclaim without damaging committed data" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path = try tempFilePath(&path_buf, tmp.dir, "reclaim-pending-lost-on-reopen.db");
+
+    {
+        const db = try open(std.testing.allocator, path);
+        defer db.close();
+
+        try db.put("alpha", "one");
+        try db.put("alpha", "two");
+
+        try std.testing.expectEqual(@as(usize, 1), db.reclaim.pending.items.len);
+        try std.testing.expectEqual(@as(usize, 0), try db.page_allocator.freeBlockCount());
+    }
+
+    const reopened = try open(std.testing.allocator, path);
+    defer reopened.close();
+
+    try std.testing.expectEqual(@as(usize, 0), reopened.reclaim.pending.items.len);
+    try std.testing.expect(!reopened.page_allocator.containsFreeBlock(3, 0));
+    try expectDbValue(reopened, "alpha", "two");
+
+    try reopened.put("alpha", "three");
+    try std.testing.expect(reopened.root_page_id != 3);
+    try expectDbValue(reopened, "alpha", "three");
 }
