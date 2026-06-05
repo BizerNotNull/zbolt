@@ -5,6 +5,7 @@ const meta = @import("meta.zig");
 const page = @import("page.zig");
 const storage = @import("storage.zig");
 const tree = @import("tree.zig");
+const tx = @import("tx.zig");
 
 const default_page_size: u32 = 4096;
 const bootstrap_page_count: u64 = 3;
@@ -46,7 +47,22 @@ pub const DB = struct {
 
     /// Returns an owned copy of the value for `key`, or `null` when the key is absent.
     pub fn get(self: *DB, allocator: std.mem.Allocator, key: []const u8) !?[]u8 {
-        return tree.lookup(self, allocator, key);
+        var read_tx = self.beginRead();
+        defer read_tx.deinit();
+
+        return read_tx.get(allocator, key);
+    }
+
+    /// Opens a read-only view over the currently committed root.
+    pub fn beginRead(self: *DB) tx.ReadTx {
+        return .{
+            .db = self,
+            .snapshot = .{
+                .root_page_id = self.root_page_id,
+                .high_water_mark = self.high_water_mark,
+            },
+            .txid = self.txid,
+        };
     }
 
     /// Commits a single-key update by copy-on-writing the affected tree path.
@@ -106,6 +122,10 @@ pub const DB = struct {
 
     pub fn readPageAlloc(self: *DB, allocator: std.mem.Allocator, page_id: u64) ![]u8 {
         return readTreePageObjectAlloc(allocator, &self.file, self.io_threaded.io(), page_id, self.page_size, self.high_water_mark);
+    }
+
+    pub fn readPageAllocAtHighWater(self: *DB, allocator: std.mem.Allocator, page_id: u64, high_water_mark: u64) ![]u8 {
+        return readTreePageObjectAlloc(allocator, &self.file, self.io_threaded.io(), page_id, self.page_size, high_water_mark);
     }
 
     fn materializeAllocatorStatePage(self: *DB, baseline_page_allocator: allocator_mod.PageAllocator) !MaterializedAllocatorState {
@@ -1102,6 +1122,81 @@ test "put commits a new root leaf and updates selected meta" {
     try std.testing.expectEqual(@as(u64, 4), selected.meta.allocator_root);
     try std.testing.expectEqual(@as(u64, 4), selected.meta.high_water_mark);
     try std.testing.expectEqual(@as(u64, 1), selected.meta.txid);
+}
+
+test "read transaction keeps old snapshot after later commits" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path = try tempFilePath(&path_buf, tmp.dir, "read-tx-snapshot.db");
+    var value_buf = [_]u8{'x'} ** 160;
+
+    {
+        const db = try open(std.testing.allocator, path);
+        defer db.close();
+
+        var index: usize = 0;
+        while (index < 24) : (index += 1) {
+            var key_buf: [5]u8 = undefined;
+            const key = try generatedKey(&key_buf, index);
+            try db.put(key, value_buf[0..]);
+        }
+        try expectBranchRootMatchesChildren(db, 2);
+
+        var read_tx = db.beginRead();
+        defer read_tx.deinit();
+
+        try db.put("k0000", "updated");
+        try db.put("zzzz", "tail");
+
+        const old_value = (try read_tx.get(std.testing.allocator, "k0000")).?;
+        defer std.testing.allocator.free(old_value);
+        try std.testing.expectEqualSlices(u8, value_buf[0..], old_value);
+
+        const old_tail = try read_tx.get(std.testing.allocator, "zzzz");
+        defer if (old_tail) |owned| std.testing.allocator.free(owned);
+        try std.testing.expect(old_tail == null);
+
+        try expectDbValue(db, "k0000", "updated");
+        try expectDbValue(db, "zzzz", "tail");
+    }
+
+    const reopened = try open(std.testing.allocator, path);
+    defer reopened.close();
+
+    try expectDbValue(reopened, "k0000", "updated");
+    try expectDbValue(reopened, "zzzz", "tail");
+}
+
+test "read transaction uses captured high water for higher-order root leaf" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path = try tempFilePath(&path_buf, tmp.dir, "read-tx-high-water.db");
+
+    const db = try open(std.testing.allocator, path);
+    defer db.close();
+
+    var large_value = [_]u8{'L'} ** 7000;
+    try db.put("large", large_value[0..]);
+
+    var read_tx = db.beginRead();
+    defer read_tx.deinit();
+
+    try std.testing.expect(read_tx.snapshot.high_water_mark > read_tx.snapshot.root_page_id);
+    const current_high_water_mark = db.high_water_mark;
+    // Lower the live DB bound after opening the transaction so this test fails
+    // if ReadTx accidentally reads through the current DB high-water mark.
+    db.high_water_mark = read_tx.snapshot.root_page_id;
+    defer db.high_water_mark = current_high_water_mark;
+
+    const snapshot_value = (try read_tx.get(std.testing.allocator, "large")).?;
+    defer std.testing.allocator.free(snapshot_value);
+    try std.testing.expectEqualSlices(u8, large_value[0..], snapshot_value);
+
+    try std.testing.expectError(error.EntryOutOfBounds, db.get(std.testing.allocator, "large"));
 }
 
 test "reopen ignores dirty pages written before meta switch" {
