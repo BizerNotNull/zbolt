@@ -3,6 +3,7 @@ const page_allocator_mod = @import("allocator.zig");
 const meta = @import("meta.zig");
 const page = @import("page.zig");
 const db_mod = @import("db.zig");
+const reclaim = @import("reclaim.zig");
 const test_page_size = 4096;
 
 pub const TreeLookupError = error{
@@ -26,6 +27,7 @@ pub const WriteResult = struct {
     root_page_id: u64,
     high_water_mark: u64,
     pages: []const PendingPage,
+    released_pages: []const reclaim.ReleasedPage,
 };
 
 pub const ReadSnapshot = struct {
@@ -66,6 +68,7 @@ const WriteContext = struct {
     temp_allocator: std.mem.Allocator,
     page_allocator: *page_allocator_mod.PageAllocator,
     pages: std.ArrayList(PendingPage),
+    released_pages: std.ArrayList(reclaim.ReleasedPage),
 
     fn init(
         db: *db_mod.DB,
@@ -79,6 +82,7 @@ const WriteContext = struct {
             .temp_allocator = temp_allocator,
             .page_allocator = page_allocator,
             .pages = .empty,
+            .released_pages = .empty,
         };
     }
 
@@ -99,6 +103,14 @@ const WriteContext = struct {
             .bytes = bytes,
         });
         return page_id;
+    }
+
+    fn appendReleasedPage(self: *WriteContext, bytes: []const u8) !void {
+        const header = try page.decodeHeader(bytes);
+        try self.released_pages.append(self.allocator, .{
+            .page_id = header.page_id,
+            .order = header.order,
+        });
     }
 };
 
@@ -168,6 +180,7 @@ pub fn writePut(
         .root_page_id = root_page_id,
         .high_water_mark = ctx.page_allocator.currentHighWaterMark(),
         .pages = ctx.pages.items,
+        .released_pages = ctx.released_pages.items,
     };
 }
 
@@ -259,17 +272,21 @@ fn writeLeafPut(ctx: *WriteContext, leaf_page_bytes: []const u8, key: []const u8
                     next_entries.items,
                 );
                 const page_id = try ctx.appendAllocatedPage(grown_leaf);
+                try ctx.appendReleasedPage(leaf_page_bytes);
                 return .{ .one = .{
                     .page_id = page_id,
                     .max_key = maxKey(next_entries.items),
                 } };
             }
-            return try splitLeafPut(ctx, leaf_page.header.order, next_entries.items);
+            const split_result = try splitLeafPut(ctx, leaf_page.header.order, next_entries.items);
+            try ctx.appendReleasedPage(leaf_page_bytes);
+            return split_result;
         },
         else => return err,
     };
 
     const page_id = try ctx.appendAllocatedPage(leaf_bytes);
+    try ctx.appendReleasedPage(leaf_page_bytes);
     return .{ .one = .{
         .page_id = page_id,
         .max_key = maxKey(next_entries.items),
@@ -298,12 +315,15 @@ fn writeBranchPut(ctx: *WriteContext, branch_page_bytes: []const u8, key: []cons
     ) catch |err| switch (err) {
         error.PageFull => {
             if (next_entries.items.len == 1) return TreeWriteError.BranchEntryTooLarge;
-            return try splitBranchPut(ctx, branch_page.header.order, next_entries.items);
+            const split_result = try splitBranchPut(ctx, branch_page.header.order, next_entries.items);
+            try ctx.appendReleasedPage(branch_page_bytes);
+            return split_result;
         },
         else => return err,
     };
 
     const page_id = try ctx.appendAllocatedPage(branch_bytes);
+    try ctx.appendReleasedPage(branch_page_bytes);
     return .{ .one = .{
         .page_id = page_id,
         .max_key = branchEntriesMaxKey(next_entries.items),
@@ -766,6 +786,60 @@ fn openTestDb(tmp: std.testing.TmpDir, file_name: []const u8, page_size: u32, ro
     return db_mod.open(std.testing.allocator, path);
 }
 
+fn openEmptyDb(tmp: std.testing.TmpDir, file_name: []const u8) !*db_mod.DB {
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path = try tempFilePath(&path_buf, tmp.dir, file_name);
+    return db_mod.open(std.testing.allocator, path);
+}
+
+fn generatedKey(buf: []u8, index: usize) ![]const u8 {
+    return std.fmt.bufPrint(buf, "k{d:0>4}", .{index});
+}
+
+fn appendSnapshotPathPages(
+    out: *std.ArrayList(reclaim.ReleasedPage),
+    db: *db_mod.DB,
+    allocator: std.mem.Allocator,
+    snapshot: ReadSnapshot,
+    key: []const u8,
+) !void {
+    var page_id = snapshot.root_page_id;
+
+    while (true) {
+        const page_bytes = try readTreePageSnapshot(db, allocator, snapshot, page_id);
+        defer allocator.free(page_bytes);
+
+        const header = try page.decodeHeader(page_bytes);
+        try out.append(allocator, .{
+            .page_id = header.page_id,
+            .order = header.order,
+        });
+
+        switch (header.page_type) {
+            .branch => {
+                const branch_page = try page.BranchPage.validate(page_bytes);
+                page_id = (try selectChildForLookup(branch_page, key)) orelse return error.CorruptTreePath;
+            },
+            .leaf => return,
+            else => return error.UnexpectedPageType,
+        }
+    }
+}
+
+fn expectReleasedPagesMatchRewrittenPath(
+    released_pages: []const reclaim.ReleasedPage,
+    snapshot_path: []const reclaim.ReleasedPage,
+) !void {
+    try std.testing.expectEqual(snapshot_path.len, released_pages.len);
+
+    var index: usize = 0;
+    while (index < released_pages.len) : (index += 1) {
+        const expected = snapshot_path[snapshot_path.len - 1 - index];
+        try std.testing.expectEqual(expected.page_id, released_pages[index].page_id);
+        try std.testing.expectEqual(expected.order, released_pages[index].order);
+    }
+}
+
 test "lookup returns null from an empty root leaf" {
     const page_size = test_page_size;
     var root_page_bytes = [_]u8{0} ** page_size;
@@ -1141,4 +1215,132 @@ test "writePut records split children from non adjacent free blocks" {
     try std.testing.expect(left_entry.child_page_id != right_entry.child_page_id);
     try std.testing.expect(left_entry.child_page_id + 1 != right_entry.child_page_id);
     try std.testing.expect(right_entry.child_page_id + 1 != left_entry.child_page_id);
+}
+
+test "writePut reports released pages for a single leaf update" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const db = try openEmptyDb(tmp, "write-put-released-single-leaf.db");
+    defer db.close();
+
+    try db.put("alpha", "one");
+
+    var expected_path = std.ArrayList(reclaim.ReleasedPage).empty;
+    defer expected_path.deinit(std.testing.allocator);
+    try appendSnapshotPathPages(&expected_path, db, std.testing.allocator, .{
+        .root_page_id = db.root_page_id,
+        .high_water_mark = db.high_water_mark,
+    }, "alpha");
+
+    var working_page_allocator = try db.page_allocator.clone(db.allocator);
+    defer working_page_allocator.deinit(db.allocator);
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const write_result = try writePut(db, arena.allocator(), &working_page_allocator, "alpha", "two");
+    try std.testing.expectEqual(@as(usize, 1), expected_path.items.len);
+    try expectReleasedPagesMatchRewrittenPath(write_result.released_pages, expected_path.items);
+}
+
+test "writePut reports released pages when a root leaf split replaces the old root page" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const db = try openEmptyDb(tmp, "write-put-released-root-split.db");
+    defer db.close();
+
+    var value_buf = [_]u8{'x'} ** 160;
+    var index: usize = 0;
+    while (index < 23) : (index += 1) {
+        var key_buf: [5]u8 = undefined;
+        const key = try generatedKey(&key_buf, index);
+        try db.put(key, value_buf[0..]);
+    }
+
+    var expected_path = std.ArrayList(reclaim.ReleasedPage).empty;
+    defer expected_path.deinit(std.testing.allocator);
+    try appendSnapshotPathPages(&expected_path, db, std.testing.allocator, .{
+        .root_page_id = db.root_page_id,
+        .high_water_mark = db.high_water_mark,
+    }, "k0023");
+
+    var working_page_allocator = try db.page_allocator.clone(db.allocator);
+    defer working_page_allocator.deinit(db.allocator);
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const write_result = try writePut(db, arena.allocator(), &working_page_allocator, "k0023", value_buf[0..]);
+    try std.testing.expectEqual(@as(usize, 1), expected_path.items.len);
+    try std.testing.expect(write_result.root_page_id != expected_path.items[0].page_id);
+    try expectReleasedPagesMatchRewrittenPath(write_result.released_pages, expected_path.items);
+}
+
+test "writePut reports released pages across a multi-level rewritten path" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const db = try openEmptyDb(tmp, "write-put-released-multi-level.db");
+    defer db.close();
+
+    var value_buf = [_]u8{'x'} ** 160;
+    var index: usize = 0;
+    while (index < 261) : (index += 1) {
+        var key_buf: [5]u8 = undefined;
+        const key = try generatedKey(&key_buf, index);
+        try db.put(key, value_buf[0..]);
+    }
+
+    var expected_path = std.ArrayList(reclaim.ReleasedPage).empty;
+    defer expected_path.deinit(std.testing.allocator);
+    try appendSnapshotPathPages(&expected_path, db, std.testing.allocator, .{
+        .root_page_id = db.root_page_id,
+        .high_water_mark = db.high_water_mark,
+    }, "k0238");
+
+    var working_page_allocator = try db.page_allocator.clone(db.allocator);
+    defer working_page_allocator.deinit(db.allocator);
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const write_result = try writePut(db, arena.allocator(), &working_page_allocator, "k0238", value_buf[0..]);
+    try std.testing.expect(expected_path.items.len >= 2);
+    try expectReleasedPagesMatchRewrittenPath(write_result.released_pages, expected_path.items);
+}
+
+test "writePut records higher-order released pages for large root leaf replacements" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const db = try openEmptyDb(tmp, "write-put-released-higher-order.db");
+    defer db.close();
+
+    var initial_value = [_]u8{'L'} ** 7000;
+    try db.put("large", initial_value[0..]);
+
+    var expected_path = std.ArrayList(reclaim.ReleasedPage).empty;
+    defer expected_path.deinit(std.testing.allocator);
+    try appendSnapshotPathPages(&expected_path, db, std.testing.allocator, .{
+        .root_page_id = db.root_page_id,
+        .high_water_mark = db.high_water_mark,
+    }, "large");
+
+    const root_page = try db.readPageAlloc(std.testing.allocator, db.root_page_id);
+    defer std.testing.allocator.free(root_page);
+    const root_header = try page.decodeHeader(root_page);
+
+    var working_page_allocator = try db.page_allocator.clone(db.allocator);
+    defer working_page_allocator.deinit(db.allocator);
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var next_value = [_]u8{'M'} ** 7000;
+    const write_result = try writePut(db, arena.allocator(), &working_page_allocator, "large", next_value[0..]);
+    try std.testing.expect(root_header.order > 0);
+    try expectReleasedPagesMatchRewrittenPath(write_result.released_pages, expected_path.items);
+    try std.testing.expectEqual(root_header.order, write_result.released_pages[0].order);
 }
