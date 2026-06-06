@@ -103,6 +103,28 @@ pub const WriteTx = struct {
         self.state = .open_dirty;
     }
 
+    pub fn delete(self: *WriteTx, key: []const u8) !void {
+        try self.ensureActiveForMutation();
+        const view = &self.view.?;
+        const delete_mutation = try tree.writeDelete(
+            view.pageReader(),
+            self.arena.allocator(),
+            self.db.allocator,
+            self.db.page_size,
+            &self.working_page_allocator,
+            view.current_root_page_id,
+            key,
+        );
+        switch (delete_mutation) {
+            .unchanged => {},
+            .changed => |write_result| {
+                try view.applyWriteResult(self.db.allocator, write_result);
+                self.has_pending_write = true;
+                self.state = .open_dirty;
+            },
+        }
+    }
+
     /// Ends the transaction, rolling back an active write if the caller exits
     /// without an explicit commit or rollback.
     pub fn deinit(self: *WriteTx) void {

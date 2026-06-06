@@ -58,6 +58,11 @@ pub const WriteResult = struct {
     obsolete_pages: []const reclaim.ReleasedPage,
 };
 
+pub const DeleteMutation = union(enum) {
+    unchanged,
+    changed: WriteResult,
+};
+
 pub const ReadSnapshot = struct {
     root_page_id: u64,
     high_water_mark: u64,
@@ -120,6 +125,12 @@ const PutResult = union(enum) {
     },
 };
 
+const DeleteStep = union(enum) {
+    unchanged,
+    replaced: ChildRef,
+    removed,
+};
+
 const WriteContext = struct {
     page_reader: PageReader,
     backing_allocator: std.mem.Allocator,
@@ -175,6 +186,38 @@ const WriteContext = struct {
             .page_id = header.page_id,
             .order = header.order,
         });
+    }
+
+    fn isAllocatedPage(self: *const WriteContext, page_id: u64) bool {
+        for (self.new_pages.items) |pending_page| {
+            if (pending_page.page_id == page_id) return true;
+        }
+        return false;
+    }
+
+    fn readAvailablePage(self: *WriteContext, allocator: std.mem.Allocator, page_id: u64) !PageRef {
+        for (self.new_pages.items) |pending_page| {
+            if (pending_page.page_id == page_id) {
+                return .{ .borrowed = pending_page.bytes };
+            }
+        }
+
+        return self.page_reader.readPage(allocator, page_id);
+    }
+
+    fn discardAllocatedPage(self: *WriteContext, page_id: u64) !void {
+        var index: usize = 0;
+        while (index < self.new_pages.items.len) : (index += 1) {
+            const pending_page = self.new_pages.items[index];
+            if (pending_page.page_id != page_id) continue;
+
+            const header = try page.decodeHeader(pending_page.bytes);
+            _ = self.new_pages.swapRemove(index);
+            try self.page_allocator.release(self.backing_allocator, header.page_id, header.order);
+            return;
+        }
+
+        return error.MissingAllocatedPage;
     }
 };
 
@@ -258,6 +301,48 @@ pub fn writePut(
     };
 }
 
+pub fn writeDelete(
+    page_reader: PageReader,
+    allocator: std.mem.Allocator,
+    backing_allocator: std.mem.Allocator,
+    page_size: u32,
+    page_allocator: *page_allocator_mod.PageAllocator,
+    root_page_id: u64,
+    key: []const u8,
+) !DeleteMutation {
+    const root_page_ref = try page_reader.readPage(allocator, root_page_id);
+    defer root_page_ref.deinit(allocator);
+
+    var temp_arena = std.heap.ArenaAllocator.init(allocator);
+    defer temp_arena.deinit();
+
+    var ctx = WriteContext.init(
+        page_reader,
+        backing_allocator,
+        allocator,
+        temp_arena.allocator(),
+        page_size,
+        page_allocator,
+    );
+    const root_step = try writeNodeDelete(&ctx, root_page_ref.bytes(), key);
+
+    const next_root_page_id = switch (root_step) {
+        .unchanged => return .unchanged,
+        .removed => blk: {
+            const empty_root = try allocateEmptyLeafPageAlloc(ctx.allocator, ctx.page_size);
+            break :blk try ctx.appendAllocatedPage(empty_root);
+        },
+        .replaced => |child| try collapseSingleChildBranchRootIfNeeded(&ctx, child.page_id),
+    };
+
+    return .{ .changed = .{
+        .root_page_id = next_root_page_id,
+        .allocation_high_water_mark = ctx.page_allocator.currentHighWaterMark(),
+        .new_pages = ctx.new_pages.items,
+        .obsolete_pages = ctx.obsolete_pages.items,
+    } };
+}
+
 fn readTreePageSnapshot(db: *db_mod.DB, allocator: std.mem.Allocator, snapshot: ReadSnapshot, page_id: u64) ![]u8 {
     return db.readPageAllocAtHighWater(allocator, page_id, snapshot.high_water_mark);
 }
@@ -315,6 +400,15 @@ fn writeNodePut(ctx: *WriteContext, node_page_bytes: []const u8, key: []const u8
     return switch (header.page_type) {
         .leaf => try writeLeafPut(ctx, node_page_bytes, key, value),
         .branch => try writeBranchPut(ctx, node_page_bytes, key, value),
+        else => error.UnexpectedPageType,
+    };
+}
+
+fn writeNodeDelete(ctx: *WriteContext, node_page_bytes: []const u8, key: []const u8) anyerror!DeleteStep {
+    const header = try page.decodeHeader(node_page_bytes);
+    return switch (header.page_type) {
+        .leaf => try writeLeafDelete(ctx, node_page_bytes, key),
+        .branch => try writeBranchDelete(ctx, node_page_bytes, key),
         else => error.UnexpectedPageType,
     };
 }
@@ -400,6 +494,74 @@ fn writeBranchPut(ctx: *WriteContext, branch_page_bytes: []const u8, key: []cons
     } };
 }
 
+fn writeLeafDelete(ctx: *WriteContext, leaf_page_bytes: []const u8, key: []const u8) anyerror!DeleteStep {
+    const leaf_page = try page.LeafPage.validate(leaf_page_bytes);
+
+    var next_entries = std.ArrayList(page.LeafEntry).empty;
+    const deleted = try collectDeletedLeafEntries(&next_entries, leaf_page, ctx.temp_allocator, key);
+    if (!deleted) return .unchanged;
+
+    if (next_entries.items.len == 0) {
+        try ctx.appendObsoletePage(leaf_page_bytes);
+        return .removed;
+    }
+
+    const leaf_bytes = try encodeLeafPageAlloc(
+        ctx.allocator,
+        ctx.page_size,
+        placeholderPageId(),
+        leaf_page.header.order,
+        next_entries.items,
+    );
+    const page_id = try ctx.appendAllocatedPage(leaf_bytes);
+    try ctx.appendObsoletePage(leaf_page_bytes);
+    return .{ .replaced = .{
+        .page_id = page_id,
+        .max_key = maxKey(next_entries.items),
+    } };
+}
+
+fn writeBranchDelete(ctx: *WriteContext, branch_page_bytes: []const u8, key: []const u8) anyerror!DeleteStep {
+    const branch_page = try page.BranchPage.validate(branch_page_bytes);
+    const child_index = try selectChildIndexForPut(branch_page, key);
+    const child_entry = try branch_page.entry(child_index);
+
+    const child_page_ref = try ctx.page_reader.readPage(ctx.allocator, child_entry.child_page_id);
+    defer child_page_ref.deinit(ctx.allocator);
+
+    const child_step = try writeNodeDelete(ctx, child_page_ref.bytes(), key);
+    if (child_step == .unchanged) return .unchanged;
+
+    var next_entries = std.ArrayList(page.BranchEntry).empty;
+    try collectDeletedBranchEntries(&next_entries, branch_page, ctx.temp_allocator, child_index, child_step);
+
+    if (next_entries.items.len == 0) {
+        try ctx.appendObsoletePage(branch_page_bytes);
+        return .removed;
+    }
+
+    var affected_index = switch (child_step) {
+        .removed => @min(@as(usize, child_index), next_entries.items.len - 1),
+        .replaced => @as(usize, child_index),
+        .unchanged => unreachable,
+    };
+    try maybeMergeBranchChildren(ctx, &next_entries, &affected_index);
+
+    const branch_bytes = try encodeBranchPageAlloc(
+        ctx.allocator,
+        ctx.page_size,
+        placeholderPageId(),
+        branch_page.header.order,
+        next_entries.items,
+    );
+    const page_id = try ctx.appendAllocatedPage(branch_bytes);
+    try ctx.appendObsoletePage(branch_page_bytes);
+    return .{ .replaced = .{
+        .page_id = page_id,
+        .max_key = branchEntriesMaxKey(next_entries.items),
+    } };
+}
+
 fn collectUpdatedBranchEntries(
     entries: *std.ArrayList(page.BranchEntry),
     branch_page: page.BranchPage,
@@ -417,6 +579,28 @@ fn collectUpdatedBranchEntries(
                     try appendBranchEntry(entries, allocator, children.left.max_key, children.left.page_id);
                     try appendBranchEntry(entries, allocator, children.right.max_key, children.right.page_id);
                 },
+            }
+        } else {
+            try appendBranchEntry(entries, allocator, existing.key, existing.child_page_id);
+        }
+    }
+}
+
+fn collectDeletedBranchEntries(
+    entries: *std.ArrayList(page.BranchEntry),
+    branch_page: page.BranchPage,
+    allocator: std.mem.Allocator,
+    child_index: u16,
+    child_step: DeleteStep,
+) !void {
+    var index: u16 = 0;
+    while (index < branch_page.count()) : (index += 1) {
+        const existing = try branch_page.entry(index);
+        if (index == child_index) {
+            switch (child_step) {
+                .unchanged => unreachable,
+                .replaced => |child| try appendBranchEntry(entries, allocator, child.max_key, child.page_id),
+                .removed => {},
             }
         } else {
             try appendBranchEntry(entries, allocator, existing.key, existing.child_page_id);
@@ -678,6 +862,26 @@ fn collectUpdatedLeafEntries(
     }
 }
 
+fn collectDeletedLeafEntries(
+    entries: *std.ArrayList(page.LeafEntry),
+    leaf_page: page.LeafPage,
+    allocator: std.mem.Allocator,
+    key: []const u8,
+) !bool {
+    var deleted = false;
+    var index: u16 = 0;
+    while (index < leaf_page.count()) : (index += 1) {
+        const existing = try leaf_page.entry(index);
+        switch (std.mem.order(u8, existing.key, key)) {
+            .lt => try appendLeafEntry(entries, allocator, existing.key, existing.value, existing.flags),
+            .eq => deleted = true,
+            .gt => try appendLeafEntry(entries, allocator, existing.key, existing.value, existing.flags),
+        }
+    }
+
+    return deleted;
+}
+
 fn appendLeafEntry(
     entries: *std.ArrayList(page.LeafEntry),
     allocator: std.mem.Allocator,
@@ -775,6 +979,194 @@ fn encodeSingleLeafPageBestFitAlloc(
     }
 
     return TreeWriteError.KeyValueTooLarge;
+}
+
+fn allocateEmptyLeafPageAlloc(allocator: std.mem.Allocator, page_size: u32) ![]u8 {
+    const page_bytes = try allocator.alloc(u8, page_size);
+    errdefer allocator.free(page_bytes);
+    @memset(page_bytes, 0);
+
+    try page.LeafPage.init(page_bytes, .{
+        .page_id = placeholderPageId(),
+        .page_type = .leaf,
+        .count = 0,
+        .order = 0,
+    });
+    return page_bytes;
+}
+
+fn collapseSingleChildBranchRootIfNeeded(ctx: *WriteContext, root_page_id: u64) !u64 {
+    const root_page_ref = try ctx.readAvailablePage(ctx.allocator, root_page_id);
+    defer root_page_ref.deinit(ctx.allocator);
+
+    const root_header = try page.decodeHeader(root_page_ref.bytes());
+    if (root_header.page_type != .branch) return root_page_id;
+
+    const branch_page = try page.BranchPage.validate(root_page_ref.bytes());
+    if (branch_page.count() != 1) return root_page_id;
+
+    const only_entry = try branch_page.entry(0);
+    if (ctx.isAllocatedPage(root_page_id)) {
+        try ctx.discardAllocatedPage(root_page_id);
+    }
+    return only_entry.child_page_id;
+}
+
+fn maybeMergeBranchChildren(
+    ctx: *WriteContext,
+    entries: *std.ArrayList(page.BranchEntry),
+    affected_index: *usize,
+) !void {
+    if (entries.items.len < 2) return;
+
+    if (affected_index.* > 0) {
+        if (try tryMergeBranchChildrenAt(ctx, entries, affected_index.* - 1)) {
+            affected_index.* -= 1;
+            return;
+        }
+    }
+
+    if (affected_index.* + 1 < entries.items.len) {
+        _ = try tryMergeBranchChildrenAt(ctx, entries, affected_index.*);
+    }
+}
+
+fn tryMergeBranchChildrenAt(ctx: *WriteContext, entries: *std.ArrayList(page.BranchEntry), left_index: usize) !bool {
+    const right_index = left_index + 1;
+    if (right_index >= entries.items.len) return false;
+
+    const left_entry = entries.items[left_index];
+    const right_entry = entries.items[right_index];
+
+    const left_page_ref = try ctx.readAvailablePage(ctx.allocator, left_entry.child_page_id);
+    defer left_page_ref.deinit(ctx.allocator);
+    const right_page_ref = try ctx.readAvailablePage(ctx.allocator, right_entry.child_page_id);
+    defer right_page_ref.deinit(ctx.allocator);
+
+    const left_header = try page.decodeHeader(left_page_ref.bytes());
+    const right_header = try page.decodeHeader(right_page_ref.bytes());
+    if (left_header.page_type != right_header.page_type) return false;
+
+    const merged_child = switch (left_header.page_type) {
+        .leaf => try tryMergeLeafChildren(
+            ctx,
+            left_entry.child_page_id,
+            right_entry.child_page_id,
+            left_page_ref.bytes(),
+            right_page_ref.bytes(),
+        ),
+        .branch => try tryMergeBranchChildrenPages(
+            ctx,
+            left_entry.child_page_id,
+            right_entry.child_page_id,
+            left_page_ref.bytes(),
+            right_page_ref.bytes(),
+        ),
+        else => return false,
+    };
+
+    const merged = merged_child orelse return false;
+    entries.items[left_index] = .{
+        .key = merged.max_key,
+        .child_page_id = merged.page_id,
+    };
+    _ = entries.orderedRemove(right_index);
+    return true;
+}
+
+fn tryMergeLeafChildren(
+    ctx: *WriteContext,
+    left_page_id: u64,
+    right_page_id: u64,
+    left_page_bytes: []const u8,
+    right_page_bytes: []const u8,
+) !?ChildRef {
+    const left_leaf = try page.LeafPage.validate(left_page_bytes);
+    const right_leaf = try page.LeafPage.validate(right_page_bytes);
+
+    var merged_entries = std.ArrayList(page.LeafEntry).empty;
+    try appendLeafPageEntries(&merged_entries, left_leaf, ctx.temp_allocator);
+    try appendLeafPageEntries(&merged_entries, right_leaf, ctx.temp_allocator);
+
+    const merged_order = @max(left_leaf.header.order, right_leaf.header.order);
+    const merged_bytes = encodeLeafPageAlloc(
+        ctx.allocator,
+        ctx.page_size,
+        placeholderPageId(),
+        merged_order,
+        merged_entries.items,
+    ) catch |err| switch (err) {
+        error.PageFull => return null,
+        else => return err,
+    };
+
+    const merged_page_id = try ctx.appendAllocatedPage(merged_bytes);
+    try retireMergedChildInput(ctx, left_page_id, left_page_bytes);
+    try retireMergedChildInput(ctx, right_page_id, right_page_bytes);
+    return .{
+        .page_id = merged_page_id,
+        .max_key = maxKey(merged_entries.items),
+    };
+}
+
+fn tryMergeBranchChildrenPages(
+    ctx: *WriteContext,
+    left_page_id: u64,
+    right_page_id: u64,
+    left_page_bytes: []const u8,
+    right_page_bytes: []const u8,
+) !?ChildRef {
+    const left_branch = try page.BranchPage.validate(left_page_bytes);
+    const right_branch = try page.BranchPage.validate(right_page_bytes);
+
+    var merged_entries = std.ArrayList(page.BranchEntry).empty;
+    try appendBranchPageEntries(&merged_entries, left_branch, ctx.temp_allocator);
+    try appendBranchPageEntries(&merged_entries, right_branch, ctx.temp_allocator);
+
+    const merged_order = @max(left_branch.header.order, right_branch.header.order);
+    const merged_bytes = encodeBranchPageAlloc(
+        ctx.allocator,
+        ctx.page_size,
+        placeholderPageId(),
+        merged_order,
+        merged_entries.items,
+    ) catch |err| switch (err) {
+        error.PageFull => return null,
+        else => return err,
+    };
+
+    const merged_page_id = try ctx.appendAllocatedPage(merged_bytes);
+    try retireMergedChildInput(ctx, left_page_id, left_page_bytes);
+    try retireMergedChildInput(ctx, right_page_id, right_page_bytes);
+    return .{
+        .page_id = merged_page_id,
+        .max_key = branchEntriesMaxKey(merged_entries.items),
+    };
+}
+
+fn retireMergedChildInput(ctx: *WriteContext, page_id: u64, page_bytes: []const u8) !void {
+    if (ctx.isAllocatedPage(page_id)) {
+        try ctx.discardAllocatedPage(page_id);
+        return;
+    }
+
+    try ctx.appendObsoletePage(page_bytes);
+}
+
+fn appendLeafPageEntries(entries: *std.ArrayList(page.LeafEntry), leaf_page: page.LeafPage, allocator: std.mem.Allocator) !void {
+    var index: u16 = 0;
+    while (index < leaf_page.count()) : (index += 1) {
+        const entry = try leaf_page.entry(index);
+        try appendLeafEntry(entries, allocator, entry.key, entry.value, entry.flags);
+    }
+}
+
+fn appendBranchPageEntries(entries: *std.ArrayList(page.BranchEntry), branch_page: page.BranchPage, allocator: std.mem.Allocator) !void {
+    var index: u16 = 0;
+    while (index < branch_page.count()) : (index += 1) {
+        const entry = try branch_page.entry(index);
+        try appendBranchEntry(entries, allocator, entry.key, entry.child_page_id);
+    }
 }
 
 fn maxKey(entries: []const page.LeafEntry) []const u8 {
@@ -908,6 +1300,13 @@ fn expectReleasedPagesMatchRewrittenPath(
         try std.testing.expectEqual(expected.page_id, obsolete_pages[index].page_id);
         try std.testing.expectEqual(expected.order, obsolete_pages[index].order);
     }
+}
+
+fn expectReleasedPagesContainPage(obsolete_pages: []const reclaim.ReleasedPage, page_id: u64) !void {
+    for (obsolete_pages) |released_page| {
+        if (released_page.page_id == page_id) return;
+    }
+    return error.ExpectedReleasedPageMissing;
 }
 
 fn snapshotPageReader(db: *db_mod.DB) SnapshotPageReader {
@@ -1470,4 +1869,118 @@ test "writePut records higher-order released pages for large root leaf replaceme
     try std.testing.expect(root_header.order > 0);
     try expectReleasedPagesMatchRewrittenPath(write_result.obsolete_pages, expected_path.items);
     try std.testing.expectEqual(root_header.order, write_result.obsolete_pages[0].order);
+}
+
+test "writeDelete returns unchanged when the key is absent" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const db = try openEmptyDb(tmp, "write-delete-miss.db");
+    defer db.close();
+
+    try db.put("alpha", "one");
+
+    var working_page_allocator = try db.page_allocator.clone(db.allocator);
+    defer working_page_allocator.deinit(db.allocator);
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var page_reader = snapshotPageReader(db);
+    const delete_mutation = try writeDelete(
+        page_reader.pageReader(),
+        arena.allocator(),
+        db.allocator,
+        db.page_size,
+        &working_page_allocator,
+        db.root_page_id,
+        "missing",
+    );
+    try std.testing.expect(delete_mutation == .unchanged);
+}
+
+test "writeDelete reports released pages for a single leaf delete" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const db = try openEmptyDb(tmp, "write-delete-single-leaf.db");
+    defer db.close();
+
+    try db.put("alpha", "one");
+    try db.put("beta", "two");
+
+    var expected_path = std.ArrayList(reclaim.ReleasedPage).empty;
+    defer expected_path.deinit(std.testing.allocator);
+    try appendSnapshotPathPages(&expected_path, db, std.testing.allocator, .{
+        .root_page_id = db.root_page_id,
+        .high_water_mark = db.high_water_mark,
+    }, "alpha");
+
+    var working_page_allocator = try db.page_allocator.clone(db.allocator);
+    defer working_page_allocator.deinit(db.allocator);
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var page_reader = snapshotPageReader(db);
+    const delete_mutation = try writeDelete(
+        page_reader.pageReader(),
+        arena.allocator(),
+        db.allocator,
+        db.page_size,
+        &working_page_allocator,
+        db.root_page_id,
+        "alpha",
+    );
+    try std.testing.expect(delete_mutation == .changed);
+    try expectReleasedPagesMatchRewrittenPath(delete_mutation.changed.obsolete_pages, expected_path.items);
+}
+
+test "writeDelete records the merged sibling as an obsolete committed page" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const db = try openEmptyDb(tmp, "write-delete-merge-sibling.db");
+    defer db.close();
+
+    var value_buf = [_]u8{'x'} ** 160;
+    var index: usize = 0;
+    while (index < 24) : (index += 1) {
+        var key_buf: [5]u8 = undefined;
+        const key = try generatedKey(&key_buf, index);
+        try db.put(key, value_buf[0..]);
+    }
+
+    const root_page = try db.readPageAlloc(std.testing.allocator, db.root_page_id);
+    defer std.testing.allocator.free(root_page);
+    const root_branch = try page.BranchPage.validate(root_page);
+    try std.testing.expectEqual(@as(u16, 2), root_branch.count());
+    const right_child = try root_branch.entry(1);
+
+    var expected_path = std.ArrayList(reclaim.ReleasedPage).empty;
+    defer expected_path.deinit(std.testing.allocator);
+    try appendSnapshotPathPages(&expected_path, db, std.testing.allocator, .{
+        .root_page_id = db.root_page_id,
+        .high_water_mark = db.high_water_mark,
+    }, "k0000");
+
+    var working_page_allocator = try db.page_allocator.clone(db.allocator);
+    defer working_page_allocator.deinit(db.allocator);
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var page_reader = snapshotPageReader(db);
+    const delete_mutation = try writeDelete(
+        page_reader.pageReader(),
+        arena.allocator(),
+        db.allocator,
+        db.page_size,
+        &working_page_allocator,
+        db.root_page_id,
+        "k0000",
+    );
+    try std.testing.expect(delete_mutation == .changed);
+    try std.testing.expectEqual(expected_path.items.len + 1, delete_mutation.changed.obsolete_pages.len);
+    try expectReleasedPagesContainPage(delete_mutation.changed.obsolete_pages, right_child.child_page_id);
 }
