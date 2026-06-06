@@ -86,6 +86,16 @@ pub const DB = struct {
         try write_tx.commit();
     }
 
+    /// Deletes `key` when it exists and otherwise leaves the committed state unchanged.
+    pub fn delete(self: *DB, key: []const u8) !void {
+        var write_tx = try self.beginWrite();
+        defer write_tx.deinit();
+        try write_tx.delete(key);
+        if (write_tx.has_pending_write) {
+            try write_tx.commit();
+        }
+    }
+
     pub fn readPageAlloc(self: *DB, allocator: std.mem.Allocator, page_id: u64) ![]u8 {
         return readTreePageObjectAlloc(allocator, &self.file, self.io_threaded.io(), page_id, self.page_size, self.high_water_mark);
     }
@@ -604,6 +614,12 @@ fn expectDbValue(db: *DB, key: []const u8, expected: []const u8) !void {
     defer std.testing.allocator.free(value);
 
     try std.testing.expectEqualSlices(u8, expected, value);
+}
+
+fn expectDbMissing(db: *DB, key: []const u8) !void {
+    const value = try db.get(std.testing.allocator, key);
+    defer if (value) |owned| std.testing.allocator.free(owned);
+    try std.testing.expect(value == null);
 }
 
 fn stagedPageBytes(write_tx: *tx.WriteTx, page_id: u64) []const u8 {
@@ -2519,6 +2535,150 @@ test "write transaction keeps earlier staged pages that are still referenced by 
     defer reopened.close();
     try expectDbValue(reopened, "k0000", "left");
     try expectDbValue(reopened, "k0023", "right");
+}
+
+test "db delete removes a committed key and persists the change" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path = try tempFilePath(&path_buf, tmp.dir, "db-delete-persist.db");
+
+    const db = try open(std.testing.allocator, path);
+    defer db.close();
+
+    try db.put("alpha", "one");
+    try db.put("beta", "two");
+
+    try db.delete("alpha");
+
+    try expectDbMissing(db, "alpha");
+    try expectDbValue(db, "beta", "two");
+
+    const reopened = try open(std.testing.allocator, path);
+    defer reopened.close();
+    try expectDbMissing(reopened, "alpha");
+    try expectDbValue(reopened, "beta", "two");
+}
+
+test "db delete missing key is a no-op for txid high water mark and reclaim" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path = try tempFilePath(&path_buf, tmp.dir, "db-delete-missing.db");
+
+    const db = try open(std.testing.allocator, path);
+    defer db.close();
+
+    try db.put("alpha", "one");
+    const initial_txid = db.txid;
+    const initial_high_water_mark = db.high_water_mark;
+
+    try db.delete("missing");
+
+    try std.testing.expectEqual(initial_txid, db.txid);
+    try std.testing.expectEqual(initial_high_water_mark, db.high_water_mark);
+    try std.testing.expectEqual(@as(usize, 0), db.reclaim.pending.items.len);
+    try expectDbValue(db, "alpha", "one");
+}
+
+test "write transaction delete can be combined with staged puts" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path = try tempFilePath(&path_buf, tmp.dir, "write-tx-delete-with-put.db");
+
+    const db = try open(std.testing.allocator, path);
+    defer db.close();
+
+    try db.put("alpha", "one");
+
+    var write_tx = try db.beginWrite();
+    defer write_tx.rollback() catch {};
+
+    try write_tx.put("beta", "two");
+    try write_tx.delete("alpha");
+    try write_tx.commit();
+
+    try expectDbMissing(db, "alpha");
+    try expectDbValue(db, "beta", "two");
+}
+
+test "write transaction delete of a staged key still allows commit" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path = try tempFilePath(&path_buf, tmp.dir, "write-tx-delete-staged-key.db");
+
+    const db = try open(std.testing.allocator, path);
+    defer db.close();
+
+    var write_tx = try db.beginWrite();
+    defer write_tx.rollback() catch {};
+
+    try write_tx.put("alpha", "one");
+    try write_tx.put("beta", "two");
+    try write_tx.delete("alpha");
+    try write_tx.commit();
+
+    try expectDbMissing(db, "alpha");
+    try expectDbValue(db, "beta", "two");
+}
+
+test "db delete collapses a merged two leaf root back into one leaf" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path = try tempFilePath(&path_buf, tmp.dir, "db-delete-root-collapse.db");
+
+    const db = try open(std.testing.allocator, path);
+    defer db.close();
+
+    var value_buf = [_]u8{'x'} ** 160;
+    var index: usize = 0;
+    while (index < 24) : (index += 1) {
+        var key_buf: [5]u8 = undefined;
+        const key = try generatedKey(&key_buf, index);
+        try db.put(key, value_buf[0..]);
+    }
+
+    const root_before = try db.readPageAlloc(std.testing.allocator, db.root_page_id);
+    defer std.testing.allocator.free(root_before);
+    _ = try page.BranchPage.validate(root_before);
+
+    try db.delete("k0000");
+
+    const root_after = try db.readPageAlloc(std.testing.allocator, db.root_page_id);
+    defer std.testing.allocator.free(root_after);
+    const root_leaf = try page.LeafPage.validate(root_after);
+    try std.testing.expect(root_leaf.count() > 0);
+    try expectDbMissing(db, "k0000");
+    try expectDbValue(db, "k0023", value_buf[0..]);
+    try assertTreeInvariants(db);
+}
+
+test "db delete of the final key leaves an empty root leaf" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path = try tempFilePath(&path_buf, tmp.dir, "db-delete-final-key.db");
+
+    const db = try open(std.testing.allocator, path);
+    defer db.close();
+
+    try db.put("alpha", "one");
+    try db.delete("alpha");
+
+    const root_page = try db.readPageAlloc(std.testing.allocator, db.root_page_id);
+    defer std.testing.allocator.free(root_page);
+    const root_leaf = try page.LeafPage.validate(root_page);
+    try std.testing.expectEqual(@as(u16, 0), root_leaf.count());
+    try expectDbMissing(db, "alpha");
 }
 
 test "write transaction does not reclaim superseded staged pages as committed pages" {
