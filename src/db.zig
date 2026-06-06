@@ -606,6 +606,15 @@ fn expectDbValue(db: *DB, key: []const u8, expected: []const u8) !void {
     try std.testing.expectEqualSlices(u8, expected, value);
 }
 
+fn stagedPageBytes(write_tx: *tx.WriteTx, page_id: u64) []const u8 {
+    return write_tx.view.?.staged_pages.get(page_id).?.bytes;
+}
+
+fn stagedRootBranch(write_tx: *tx.WriteTx) !page.BranchPage {
+    const root_page = stagedPageBytes(write_tx, write_tx.view.?.current_root_page_id);
+    return page.BranchPage.validate(root_page);
+}
+
 fn expectBranchUpperBoundKeysAreReadable(db: *DB) !void {
     const root_page = try db.readPageAlloc(std.testing.allocator, db.root_page_id);
     defer std.testing.allocator.free(root_page);
@@ -1209,9 +1218,22 @@ test "reopen ignores dirty pages written before meta switch" {
         var working_page_allocator = try db.page_allocator.clone(std.testing.allocator);
         defer working_page_allocator.deinit(std.testing.allocator);
 
-        const write_result = try tree.writePut(db, arena.allocator(), &working_page_allocator, "beta", "two");
+        var page_reader = tree.SnapshotPageReader.init(db, .{
+            .root_page_id = db.root_page_id,
+            .high_water_mark = db.high_water_mark,
+        });
+        const write_result = try tree.writePut(
+            page_reader.pageReader(),
+            arena.allocator(),
+            db.allocator,
+            db.page_size,
+            &working_page_allocator,
+            db.root_page_id,
+            "beta",
+            "two",
+        );
         const io = db.io_threaded.io();
-        for (write_result.pages) |pending_page| {
+        for (write_result.new_pages) |pending_page| {
             try storage.writePageObject(&db.file, io, db.page_size, pending_page.page_id, pending_page.bytes);
         }
         try storage.sync(db.file, io);
@@ -1253,7 +1275,20 @@ test "reopen selects inactive meta after data and allocator pages are durable" {
         var working_page_allocator = try db.page_allocator.clone(std.testing.allocator);
         errdefer working_page_allocator.deinit(std.testing.allocator);
 
-        const write_result = try tree.writePut(db, arena.allocator(), &working_page_allocator, "beta", "two");
+        var page_reader = tree.SnapshotPageReader.init(db, .{
+            .root_page_id = db.root_page_id,
+            .high_water_mark = db.high_water_mark,
+        });
+        const write_result = try tree.writePut(
+            page_reader.pageReader(),
+            arena.allocator(),
+            db.allocator,
+            db.page_size,
+            &working_page_allocator,
+            db.root_page_id,
+            "beta",
+            "two",
+        );
         const baseline_page_allocator = working_page_allocator;
         working_page_allocator = movedPageAllocator(std.testing.allocator);
 
@@ -1273,7 +1308,7 @@ test "reopen selects inactive meta after data and allocator pages are durable" {
         defer std.testing.allocator.free(next_meta_page);
 
         const io = db.io_threaded.io();
-        for (write_result.pages) |pending_page| {
+        for (write_result.new_pages) |pending_page| {
             try storage.writePageObject(&db.file, io, db.page_size, pending_page.page_id, pending_page.bytes);
         }
         try storage.writePageObject(&db.file, io, db.page_size, allocator_state.page_id, allocator_state.bytes);
@@ -2393,7 +2428,7 @@ test "write transaction deinit releases the writer slot" {
     try expectDbValue(db, "beta", "two");
 }
 
-test "write transaction rejects a second put" {
+test "write transaction commits multiple staged puts" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -2407,7 +2442,110 @@ test "write transaction rejects a second put" {
     defer write_tx.rollback() catch {};
 
     try write_tx.put("alpha", "one");
-    try std.testing.expectError(tx.WriteTxError.WriteTransactionAlreadyUsed, write_tx.put("beta", "two"));
+    try write_tx.put("beta", "two");
+    try write_tx.commit();
+
+    try expectDbValue(db, "alpha", "one");
+    try expectDbValue(db, "beta", "two");
+}
+
+test "write transaction keeps the last value for repeated puts to the same key" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path = try tempFilePath(&path_buf, tmp.dir, "write-tx-repeat-key.db");
+
+    const db = try open(std.testing.allocator, path);
+    defer db.close();
+
+    var write_tx = try db.beginWrite();
+    defer write_tx.rollback() catch {};
+
+    try write_tx.put("alpha", "one");
+    try write_tx.put("alpha", "two");
+    try write_tx.commit();
+
+    try expectDbValue(db, "alpha", "two");
+}
+
+test "write transaction keeps earlier staged pages that are still referenced by the final root" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path = try tempFilePath(&path_buf, tmp.dir, "write-tx-staged-page-survives.db");
+
+    const db = try open(std.testing.allocator, path);
+    defer db.close();
+
+    var value_buf = [_]u8{'x'} ** 160;
+    var index: usize = 0;
+    while (index < 24) : (index += 1) {
+        var key_buf: [5]u8 = undefined;
+        const key = try generatedKey(&key_buf, index);
+        try db.put(key, value_buf[0..]);
+    }
+
+    var write_tx = try db.beginWrite();
+    defer write_tx.rollback() catch {};
+
+    try write_tx.put("k0000", "left");
+
+    const first_root_page_id = write_tx.view.?.current_root_page_id;
+    const first_root_page = stagedPageBytes(&write_tx, first_root_page_id);
+    const first_root_branch = try page.BranchPage.validate(first_root_page);
+    const first_left_child = try first_root_branch.entry(0);
+    const first_right_child = try first_root_branch.entry(1);
+
+    try write_tx.put("k0023", "right");
+
+    try std.testing.expect(!write_tx.view.?.staged_pages.contains(first_root_page_id));
+    try std.testing.expect(write_tx.view.?.staged_pages.contains(first_left_child.child_page_id));
+
+    const second_root_branch = try stagedRootBranch(&write_tx);
+    try std.testing.expectEqual(@as(u16, 2), second_root_branch.count());
+    const second_left_child = try second_root_branch.entry(0);
+    const second_right_child = try second_root_branch.entry(1);
+    try std.testing.expectEqual(first_left_child.child_page_id, second_left_child.child_page_id);
+    try std.testing.expect(second_right_child.child_page_id != first_right_child.child_page_id);
+
+    try write_tx.commit();
+
+    try expectDbValue(db, "k0000", "left");
+    try expectDbValue(db, "k0023", "right");
+
+    const reopened = try open(std.testing.allocator, path);
+    defer reopened.close();
+    try expectDbValue(reopened, "k0000", "left");
+    try expectDbValue(reopened, "k0023", "right");
+}
+
+test "write transaction does not reclaim superseded staged pages as committed pages" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path = try tempFilePath(&path_buf, tmp.dir, "write-tx-staged-vs-committed-reclaim.db");
+
+    const db = try open(std.testing.allocator, path);
+    defer db.close();
+
+    try db.put("alpha", "zero");
+
+    var write_tx = try db.beginWrite();
+    defer write_tx.rollback() catch {};
+
+    try write_tx.put("alpha", "one");
+    try std.testing.expectEqual(@as(usize, 1), write_tx.view.?.reclaim_committed_pages.count());
+
+    try write_tx.put("alpha", "two");
+    try std.testing.expectEqual(@as(usize, 1), write_tx.view.?.reclaim_committed_pages.count());
+
+    try write_tx.commit();
+    try std.testing.expectEqual(@as(usize, 1), db.reclaim.pending.items.len);
+    try std.testing.expectEqual(@as(usize, 1), db.reclaim.pending.items[0].pages.len);
+    try expectDbValue(db, "alpha", "two");
 }
 
 test "read transaction keeps its snapshot after an explicit write commit" {
@@ -2423,6 +2561,10 @@ test "read transaction keeps its snapshot after an explicit write commit" {
     try db.put("alpha", "one");
     var read_tx = try db.beginRead();
     defer read_tx.deinit();
+    const snapshot_root_page_id = read_tx.snapshot.root_page_id;
+    const snapshot_high_water_mark = read_tx.snapshot.high_water_mark;
+    const committed_root_page_id = db.root_page_id;
+    const committed_high_water_mark = db.high_water_mark;
 
     var write_tx = try db.beginWrite();
     try write_tx.put("beta", "two");
@@ -2431,6 +2573,10 @@ test "read transaction keeps its snapshot after an explicit write commit" {
     const snapshot_value = try read_tx.get(std.testing.allocator, "beta");
     defer if (snapshot_value) |owned| std.testing.allocator.free(owned);
     try std.testing.expect(snapshot_value == null);
+    try std.testing.expectEqual(snapshot_root_page_id, read_tx.snapshot.root_page_id);
+    try std.testing.expectEqual(snapshot_high_water_mark, read_tx.snapshot.high_water_mark);
+    try std.testing.expect(db.root_page_id != committed_root_page_id);
+    try std.testing.expect(db.high_water_mark != committed_high_water_mark);
     try expectDbValue(db, "beta", "two");
 }
 
