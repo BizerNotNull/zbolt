@@ -38,9 +38,15 @@ pub const CursorRecord = struct {
 
     /// Releases the owned key/value buffers returned by a cursor operation.
     pub fn deinit(self: *CursorRecord, allocator: std.mem.Allocator) void {
-        allocator.free(self.key);
-        allocator.free(self.value);
-        self.* = undefined;
+        const owned_key = self.key;
+        const owned_value = self.value;
+
+        self.key = &.{};
+        self.value = &.{};
+        self.flags = 0;
+
+        if (owned_key.len > 0) allocator.free(owned_key);
+        if (owned_value.len > 0) allocator.free(owned_value);
     }
 };
 
@@ -680,23 +686,41 @@ fn successorPositionFromPath(db: *db_mod.DB, snapshot: ReadSnapshot, path: PathS
 }
 
 fn selectChildIndexForLookup(branch_page: page.BranchPage, key: []const u8) !?u16 {
-    var index: u16 = 0;
-    while (index < branch_page.count()) : (index += 1) {
-        const entry = try branch_page.entry(index);
-        if (std.mem.order(u8, entry.key, key) != .lt) return index;
+    // Branch and leaf entries are already sorted, so cursor seeks can use the
+    // same lower-bound search shape that a B+Tree read path expects.
+    var low: u16 = 0;
+    var high: u16 = branch_page.count();
+
+    while (low < high) {
+        const mid = low + (high - low) / 2;
+        const entry = try branch_page.entry(mid);
+        if (std.mem.order(u8, entry.key, key) == .lt) {
+            low = mid + 1;
+        } else {
+            high = mid;
+        }
     }
 
-    return null;
+    if (low == branch_page.count()) return null;
+    return low;
 }
 
 fn findLowerBoundIndex(leaf_page: page.LeafPage, key: []const u8) !?u16 {
-    var index: u16 = 0;
-    while (index < leaf_page.count()) : (index += 1) {
-        const entry = try leaf_page.entry(index);
-        if (std.mem.order(u8, entry.key, key) != .lt) return index;
+    var low: u16 = 0;
+    var high: u16 = leaf_page.count();
+
+    while (low < high) {
+        const mid = low + (high - low) / 2;
+        const entry = try leaf_page.entry(mid);
+        if (std.mem.order(u8, entry.key, key) == .lt) {
+            low = mid + 1;
+        } else {
+            high = mid;
+        }
     }
 
-    return null;
+    if (low == leaf_page.count()) return null;
+    return low;
 }
 
 fn writeNodePut(ctx: *WriteContext, node_page_bytes: []const u8, key: []const u8, value: []const u8) anyerror!PutResult {
@@ -1624,6 +1648,59 @@ fn expectCursorRecord(record: CursorRecord, expected_key: []const u8, expected_v
     try std.testing.expectEqualSlices(u8, expected_key, record.key);
     try std.testing.expectEqualSlices(u8, expected_value, record.value);
     try std.testing.expectEqual(expected_flags, record.flags);
+}
+
+test "cursor record deinit is idempotent" {
+    var record = CursorRecord{
+        .key = try std.testing.allocator.dupe(u8, "alpha"),
+        .value = try std.testing.allocator.dupe(u8, "one"),
+        .flags = 7,
+    };
+
+    record.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 0), record.key.len);
+    try std.testing.expectEqual(@as(usize, 0), record.value.len);
+    try std.testing.expectEqual(@as(u32, 0), record.flags);
+
+    record.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 0), record.key.len);
+    try std.testing.expectEqual(@as(usize, 0), record.value.len);
+}
+
+test "branch child lookup keeps lower bound semantics" {
+    var branch_page_bytes = [_]u8{0} ** test_page_size;
+    const branch_page = try page.BranchPage.encodeInto(branch_page_bytes[0..], .{
+        .page_id = 2,
+        .page_type = .branch,
+        .count = 0,
+        .order = 0,
+    }, &.{
+        .{ .key = "beta", .child_page_id = 3 },
+        .{ .key = "gamma", .child_page_id = 4 },
+        .{ .key = "omega", .child_page_id = 5 },
+    });
+
+    try std.testing.expectEqual(@as(?u16, 1), try selectChildIndexForLookup(branch_page, "gamma"));
+    try std.testing.expectEqual(@as(?u16, 1), try selectChildIndexForLookup(branch_page, "delta"));
+    try std.testing.expectEqual(@as(?u16, null), try selectChildIndexForLookup(branch_page, "zeta"));
+}
+
+test "leaf lower bound lookup keeps lower bound semantics" {
+    var leaf_page_bytes = [_]u8{0} ** test_page_size;
+    const leaf_page = try page.LeafPage.encodeInto(leaf_page_bytes[0..], .{
+        .page_id = 2,
+        .page_type = .leaf,
+        .count = 0,
+        .order = 0,
+    }, &.{
+        .{ .key = "alpha", .value = "one", .flags = 0 },
+        .{ .key = "gamma", .value = "three", .flags = 0 },
+        .{ .key = "omega", .value = "last", .flags = 0 },
+    });
+
+    try std.testing.expectEqual(@as(?u16, 1), try findLowerBoundIndex(leaf_page, "gamma"));
+    try std.testing.expectEqual(@as(?u16, 1), try findLowerBoundIndex(leaf_page, "beta"));
+    try std.testing.expectEqual(@as(?u16, null), try findLowerBoundIndex(leaf_page, "zeta"));
 }
 
 test "cursor first returns null from an empty root leaf" {
