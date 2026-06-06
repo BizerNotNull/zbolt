@@ -10,7 +10,6 @@ pub const WriteTxError = error{
     WriteTransactionActive,
     WriteTransactionClosed,
     WriteTransactionFailed,
-    WriteTransactionAlreadyUsed,
     NoPendingWrite,
 };
 
@@ -39,18 +38,18 @@ pub const ReadTx = struct {
 
 pub const WriteTx = struct {
     db: *db_mod.DB,
-    snapshot: tree.ReadSnapshot,
     base_txid: u64,
     arena: std.heap.ArenaAllocator,
     working_page_allocator: allocator_mod.PageAllocator,
-    write_result: ?tree.WriteResult,
-    put_attempted: bool,
+    view: ?UncommittedView,
+    has_pending_write: bool,
     state: State,
     owns_working_page_allocator: bool,
     owns_arena: bool,
 
     const State = enum {
-        active,
+        open_clean,
+        open_dirty,
         committed,
         rolled_back,
         failed,
@@ -66,18 +65,21 @@ pub const WriteTx = struct {
         errdefer working_page_allocator.deinit(db.allocator);
 
         db.write_tx_active = true;
+        const base_snapshot = tree.ReadSnapshot{
+            .root_page_id = db.root_page_id,
+            .high_water_mark = db.high_water_mark,
+        };
+        var view = UncommittedView.init(db.allocator, db, base_snapshot);
+        errdefer view.deinit();
+
         return .{
             .db = db,
-            .snapshot = .{
-                .root_page_id = db.root_page_id,
-                .high_water_mark = db.high_water_mark,
-            },
             .base_txid = db.txid,
             .arena = std.heap.ArenaAllocator.init(db.allocator),
             .working_page_allocator = working_page_allocator,
-            .write_result = null,
-            .put_attempted = false,
-            .state = .active,
+            .view = view,
+            .has_pending_write = false,
+            .state = .open_clean,
             .owns_working_page_allocator = true,
             .owns_arena = true,
         };
@@ -85,23 +87,27 @@ pub const WriteTx = struct {
 
     pub fn put(self: *WriteTx, key: []const u8, value: []const u8) !void {
         try self.ensureActiveForMutation();
-        if (self.put_attempted) return WriteTxError.WriteTransactionAlreadyUsed;
-        self.put_attempted = true;
-
-        self.write_result = try tree.writePut(
-            self.db,
+        const view = &self.view.?;
+        const write_result = try tree.writePut(
+            view.pageReader(),
             self.arena.allocator(),
+            self.db.allocator,
+            self.db.page_size,
             &self.working_page_allocator,
+            view.current_root_page_id,
             key,
             value,
         );
+        try view.applyWriteResult(self.db.allocator, write_result);
+        self.has_pending_write = true;
+        self.state = .open_dirty;
     }
 
     /// Ends the transaction, rolling back an active write if the caller exits
     /// without an explicit commit or rollback.
     pub fn deinit(self: *WriteTx) void {
         switch (self.state) {
-            .active => {
+            .open_clean, .open_dirty => {
                 self.cleanupOwnedResources();
                 self.db.write_tx_active = false;
                 self.state = .rolled_back;
@@ -112,18 +118,18 @@ pub const WriteTx = struct {
 
     pub fn commit(self: *WriteTx) !void {
         try self.ensureActiveForMutation();
-        const write_result = self.write_result orelse return WriteTxError.NoPendingWrite;
+        if (!self.has_pending_write) return WriteTxError.NoPendingWrite;
         errdefer self.fail();
 
-        var staged_released_pages: []const reclaim.ReleasedPage = &.{};
-        if (write_result.released_pages.len > 0) {
+        var staged_reclaim_pages: []const reclaim.ReleasedPage = &.{};
+        if (self.view.?.reclaim_committed_pages.count() > 0) {
             try self.db.reclaim.ensurePendingCapacity(self.db.allocator, 1);
-            staged_released_pages = try self.db.allocator.dupe(
-                reclaim.ReleasedPage,
-                write_result.released_pages,
-            );
+            staged_reclaim_pages = try self.view.?.ownedReclaimPagesAlloc(self.db.allocator);
         }
-        errdefer if (staged_released_pages.len > 0) self.db.allocator.free(staged_released_pages);
+        errdefer if (staged_reclaim_pages.len > 0) self.db.allocator.free(staged_reclaim_pages);
+
+        const staged_pages = try self.view.?.sortedStagedPagesAlloc(self.db.allocator);
+        defer self.db.allocator.free(staged_pages);
 
         const baseline_page_allocator = self.working_page_allocator;
         self.working_page_allocator = movedPageAllocator(self.db.allocator);
@@ -137,7 +143,7 @@ pub const WriteTx = struct {
         const next_meta = meta.Meta{
             .page_size = self.db.page_size,
             .flags = self.db.flags,
-            .root_page_id = write_result.root_page_id,
+            .root_page_id = self.view.?.current_root_page_id,
             .allocator_root = allocator_state.page_id,
             .high_water_mark = allocator_state.page_allocator.currentHighWaterMark(),
             .txid = self.db.txid + 1,
@@ -146,7 +152,7 @@ pub const WriteTx = struct {
         defer self.db.allocator.free(next_meta_page);
 
         const io = self.db.io_threaded.io();
-        for (write_result.pages) |pending_page| {
+        for (staged_pages) |pending_page| {
             try storage.writePageObject(&self.db.file, io, self.db.page_size, pending_page.page_id, pending_page.bytes);
         }
         try storage.writePageObject(&self.db.file, io, self.db.page_size, allocator_state.page_id, allocator_state.bytes);
@@ -158,9 +164,9 @@ pub const WriteTx = struct {
 
         db_mod.applyCommittedState(self.db, next_meta_slot, next_meta, allocator_state.page_allocator);
         allocator_state.page_allocator = movedPageAllocator(self.db.allocator);
-        if (staged_released_pages.len > 0) {
-            self.db.reclaim.appendReleasedOwned(self.base_txid, staged_released_pages);
-            staged_released_pages = &.{};
+        if (staged_reclaim_pages.len > 0) {
+            self.db.reclaim.appendReleasedOwned(self.base_txid, staged_reclaim_pages);
+            staged_reclaim_pages = &.{};
         }
 
         self.db.write_tx_active = false;
@@ -170,7 +176,7 @@ pub const WriteTx = struct {
 
     pub fn rollback(self: *WriteTx) !void {
         switch (self.state) {
-            .active => {
+            .open_clean, .open_dirty => {
                 self.cleanupOwnedResources();
                 self.db.write_tx_active = false;
                 self.state = .rolled_back;
@@ -182,22 +188,26 @@ pub const WriteTx = struct {
 
     fn ensureActiveForMutation(self: *WriteTx) WriteTxError!void {
         return switch (self.state) {
-            .active => {},
+            .open_clean, .open_dirty => {},
             .failed => WriteTxError.WriteTransactionFailed,
             .committed, .rolled_back => WriteTxError.WriteTransactionClosed,
         };
     }
 
     fn fail(self: *WriteTx) void {
-        if (self.state != .active) return;
+        if (self.state != .open_clean and self.state != .open_dirty) return;
         self.cleanupOwnedResources();
         self.db.write_tx_active = false;
         self.state = .failed;
     }
 
     fn cleanupOwnedResources(self: *WriteTx) void {
-        self.write_result = null;
-        self.put_attempted = false;
+        self.has_pending_write = false;
+
+        if (self.view) |*view| {
+            view.deinit();
+            self.view = null;
+        }
 
         if (self.owns_working_page_allocator) {
             self.working_page_allocator.deinit(self.db.allocator);
@@ -211,6 +221,116 @@ pub const WriteTx = struct {
         }
     }
 };
+
+const ReclaimPageKey = struct {
+    page_id: u64,
+    order: u8,
+};
+
+const UncommittedView = struct {
+    db: *db_mod.DB,
+    base_snapshot: tree.ReadSnapshot,
+    current_root_page_id: u64,
+    allocation_high_water_mark: u64,
+    staged_pages: std.AutoHashMap(u64, tree.PendingPage),
+    reclaim_committed_pages: std.AutoHashMap(ReclaimPageKey, void),
+
+    fn init(allocator: std.mem.Allocator, db: *db_mod.DB, base_snapshot: tree.ReadSnapshot) UncommittedView {
+        return .{
+            .db = db,
+            .base_snapshot = base_snapshot,
+            .current_root_page_id = base_snapshot.root_page_id,
+            .allocation_high_water_mark = base_snapshot.high_water_mark,
+            .staged_pages = std.AutoHashMap(u64, tree.PendingPage).init(allocator),
+            .reclaim_committed_pages = std.AutoHashMap(ReclaimPageKey, void).init(allocator),
+        };
+    }
+
+    fn deinit(self: *UncommittedView) void {
+        self.staged_pages.deinit();
+        self.reclaim_committed_pages.deinit();
+    }
+
+    fn pageReader(self: *const UncommittedView) tree.PageReader {
+        return .{
+            .context = self,
+            .read_page_fn = readPage,
+        };
+    }
+
+    fn applyWriteResult(self: *UncommittedView, allocator: std.mem.Allocator, write_result: tree.WriteResult) !void {
+        for (write_result.new_pages) |pending_page| {
+            try self.staged_pages.put(pending_page.page_id, pending_page);
+        }
+
+        for (write_result.obsolete_pages) |obsolete_page| {
+            if (self.staged_pages.remove(obsolete_page.page_id)) continue;
+            try self.reclaim_committed_pages.put(.{
+                .page_id = obsolete_page.page_id,
+                .order = obsolete_page.order,
+            }, {});
+        }
+
+        self.current_root_page_id = write_result.root_page_id;
+        self.allocation_high_water_mark = write_result.allocation_high_water_mark;
+        _ = allocator;
+    }
+
+    fn sortedStagedPagesAlloc(self: *const UncommittedView, allocator: std.mem.Allocator) ![]tree.PendingPage {
+        var staged_pages = try allocator.alloc(tree.PendingPage, self.staged_pages.count());
+        errdefer allocator.free(staged_pages);
+
+        var iterator = self.staged_pages.valueIterator();
+        var index: usize = 0;
+        while (iterator.next()) |pending_page| : (index += 1) {
+            staged_pages[index] = pending_page.*;
+        }
+
+        std.sort.pdq(tree.PendingPage, staged_pages, {}, pendingPageLessThan);
+        return staged_pages;
+    }
+
+    fn ownedReclaimPagesAlloc(self: *const UncommittedView, allocator: std.mem.Allocator) ![]reclaim.ReleasedPage {
+        var reclaim_pages = try allocator.alloc(reclaim.ReleasedPage, self.reclaim_committed_pages.count());
+        errdefer allocator.free(reclaim_pages);
+
+        var iterator = self.reclaim_committed_pages.keyIterator();
+        var index: usize = 0;
+        while (iterator.next()) |reclaim_key| : (index += 1) {
+            reclaim_pages[index] = .{
+                .page_id = reclaim_key.page_id,
+                .order = reclaim_key.order,
+            };
+        }
+
+        std.sort.pdq(reclaim.ReleasedPage, reclaim_pages, {}, reclaimPageLessThan);
+        return reclaim_pages;
+    }
+
+    fn readPage(context: *const anyopaque, allocator: std.mem.Allocator, page_id: u64) !tree.PageRef {
+        const self: *const UncommittedView = @ptrCast(@alignCast(context));
+        if (self.staged_pages.get(page_id)) |pending_page| {
+            return .{ .borrowed = pending_page.bytes };
+        }
+
+        return .{
+            .owned = try self.db.readPageAllocAtHighWater(
+                allocator,
+                page_id,
+                self.base_snapshot.high_water_mark,
+            ),
+        };
+    }
+};
+
+fn pendingPageLessThan(_: void, lhs: tree.PendingPage, rhs: tree.PendingPage) bool {
+    return lhs.page_id < rhs.page_id;
+}
+
+fn reclaimPageLessThan(_: void, lhs: reclaim.ReleasedPage, rhs: reclaim.ReleasedPage) bool {
+    if (lhs.page_id != rhs.page_id) return lhs.page_id < rhs.page_id;
+    return lhs.order < rhs.order;
+}
 
 fn movedPageAllocator(allocator: std.mem.Allocator) allocator_mod.PageAllocator {
     return allocator_mod.PageAllocator.init(allocator, 0);
