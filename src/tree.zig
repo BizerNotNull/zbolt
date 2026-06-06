@@ -18,9 +18,36 @@ pub const TreeWriteError = error{
     PageOverflowNoValidSplit,
 };
 
+const CursorTraversalError = error{
+    CursorUnpositioned,
+};
+
+const ReadTreePageError = @typeInfo(@typeInfo(@TypeOf(readTreePageSnapshot)).@"fn".return_type.?).error_union.error_set;
+
+pub const CursorError = ReadTreePageError || page.Error || page.LayoutError || TreeLookupError || CursorTraversalError || error{OutOfMemory};
+
 pub const PendingPage = struct {
     page_id: u64,
     bytes: []const u8,
+};
+
+pub const CursorRecord = struct {
+    key: []u8,
+    value: []u8,
+    flags: u32,
+
+    /// Releases the owned key/value buffers returned by a cursor operation.
+    pub fn deinit(self: *CursorRecord, allocator: std.mem.Allocator) void {
+        const owned_key = self.key;
+        const owned_value = self.value;
+
+        self.key = &.{};
+        self.value = &.{};
+        self.flags = 0;
+
+        if (owned_key.len > 0) allocator.free(owned_key);
+        if (owned_value.len > 0) allocator.free(owned_value);
+    }
 };
 
 pub const PageRef = union(enum) {
@@ -66,6 +93,108 @@ pub const DeleteMutation = union(enum) {
 pub const ReadSnapshot = struct {
     root_page_id: u64,
     high_water_mark: u64,
+};
+
+const max_cursor_depth: usize = @bitSizeOf(u64);
+
+const PathFrame = struct {
+    branch_page_id: u64,
+    child_index: u16,
+};
+
+const PathStack = struct {
+    len: usize,
+    frames: [max_cursor_depth]PathFrame,
+
+    fn init() PathStack {
+        return .{
+            .len = 0,
+            .frames = undefined,
+        };
+    }
+
+    fn truncate(self: *PathStack, len: usize) void {
+        std.debug.assert(len <= self.len);
+        self.len = len;
+    }
+
+    fn append(self: *PathStack, frame: PathFrame) TreeLookupError!void {
+        if (self.len >= self.frames.len) return error.CorruptTreePath;
+        self.frames[self.len] = frame;
+        self.len += 1;
+    }
+
+    fn get(self: PathStack, index: usize) *const PathFrame {
+        std.debug.assert(index < self.len);
+        return &self.frames[index];
+    }
+
+    fn getPtr(self: *PathStack, index: usize) *PathFrame {
+        std.debug.assert(index < self.len);
+        return &self.frames[index];
+    }
+};
+
+const CursorPosition = struct {
+    leaf_page_id: u64,
+    entry_index: u16,
+    path: PathStack,
+};
+
+const CursorState = union(enum) {
+    unpositioned,
+    positioned: CursorPosition,
+    eof,
+};
+
+pub const Cursor = struct {
+    db: ?*db_mod.DB,
+    snapshot: ReadSnapshot,
+    state: CursorState,
+
+    /// Repositions the cursor to the first record visible in this snapshot.
+    pub fn first(self: *Cursor, allocator: std.mem.Allocator) CursorError!?CursorRecord {
+        const db = self.db orelse return error.CursorUnpositioned;
+        const position = try locateFirstPosition(db, self.snapshot);
+        return try self.setPositionAndMaterialize(allocator, position);
+    }
+
+    /// Repositions the cursor to the first record whose key is not less than `key`.
+    pub fn seek(self: *Cursor, allocator: std.mem.Allocator, key: []const u8) CursorError!?CursorRecord {
+        const db = self.db orelse return error.CursorUnpositioned;
+        const position = try locateSeekPosition(db, self.snapshot, key);
+        return try self.setPositionAndMaterialize(allocator, position);
+    }
+
+    /// Returns the next record after the current cursor position.
+    pub fn next(self: *Cursor, allocator: std.mem.Allocator) CursorError!?CursorRecord {
+        const db = self.db orelse return error.CursorUnpositioned;
+
+        const position = switch (self.state) {
+            .unpositioned => return error.CursorUnpositioned,
+            .eof => return null,
+            .positioned => |current| try advancePosition(db, self.snapshot, current),
+        };
+
+        return try self.setPositionAndMaterialize(allocator, position);
+    }
+
+    /// Releases the cursor handle. Returned records remain owned by the caller.
+    pub fn deinit(self: *Cursor) void {
+        self.db = null;
+        self.state = .eof;
+    }
+
+    fn setPositionAndMaterialize(self: *Cursor, allocator: std.mem.Allocator, position: ?CursorPosition) CursorError!?CursorRecord {
+        const db = self.db orelse return error.CursorUnpositioned;
+        const resolved_position = position orelse {
+            self.state = .eof;
+            return null;
+        };
+
+        self.state = .{ .positioned = resolved_position };
+        return try materializeRecord(db, self.snapshot, allocator, resolved_position);
+    }
 };
 
 pub const SnapshotPageReader = struct {
@@ -393,6 +522,205 @@ fn findInLeaf(leaf_page: page.LeafPage, allocator: std.mem.Allocator, key: []con
     }
 
     return null;
+}
+
+fn locateFirstPosition(db: *db_mod.DB, snapshot: ReadSnapshot) CursorError!?CursorPosition {
+    const path = PathStack.init();
+    return try descendToLeftmostPosition(db, snapshot, snapshot.root_page_id, path, true);
+}
+
+fn locateSeekPosition(db: *db_mod.DB, snapshot: ReadSnapshot, key: []const u8) CursorError!?CursorPosition {
+    var page_id = snapshot.root_page_id;
+    var path = PathStack.init();
+
+    while (true) {
+        const page_bytes = try readTreePageSnapshot(db, db.allocator, snapshot, page_id);
+        defer db.allocator.free(page_bytes);
+
+        const header = try page.decodeHeader(page_bytes);
+        switch (header.page_type) {
+            .branch => {
+                const branch_page = try page.BranchPage.validate(page_bytes);
+                const child_index = (try selectChildIndexForLookup(branch_page, key)) orelse return null;
+                const child_entry = try branch_page.entry(child_index);
+                try path.append(.{
+                    .branch_page_id = header.page_id,
+                    .child_index = child_index,
+                });
+                page_id = child_entry.child_page_id;
+            },
+            .leaf => {
+                const leaf_page = try page.LeafPage.validate(page_bytes);
+                if (leaf_page.count() == 0) return null;
+
+                if (try findLowerBoundIndex(leaf_page, key)) |entry_index| {
+                    return .{
+                        .leaf_page_id = header.page_id,
+                        .entry_index = entry_index,
+                        .path = path,
+                    };
+                }
+
+                return try successorPositionFromPath(db, snapshot, path);
+            },
+            else => return error.UnexpectedPageType,
+        }
+    }
+}
+
+fn advancePosition(db: *db_mod.DB, snapshot: ReadSnapshot, current: CursorPosition) CursorError!?CursorPosition {
+    const page_bytes = try readTreePageSnapshot(db, db.allocator, snapshot, current.leaf_page_id);
+    defer db.allocator.free(page_bytes);
+
+    const leaf_page = try page.LeafPage.validate(page_bytes);
+    if (current.entry_index >= leaf_page.count()) return error.CorruptTreePath;
+
+    const next_entry_index = std.math.add(u16, current.entry_index, 1) catch return error.CorruptTreePath;
+    if (next_entry_index < leaf_page.count()) {
+        return .{
+            .leaf_page_id = current.leaf_page_id,
+            .entry_index = next_entry_index,
+            .path = current.path,
+        };
+    }
+
+    return try successorPositionFromPath(db, snapshot, current.path);
+}
+
+fn materializeRecord(
+    db: *db_mod.DB,
+    snapshot: ReadSnapshot,
+    allocator: std.mem.Allocator,
+    position: CursorPosition,
+) CursorError!CursorRecord {
+    const page_bytes = try readTreePageSnapshot(db, db.allocator, snapshot, position.leaf_page_id);
+    defer db.allocator.free(page_bytes);
+
+    const leaf_page = try page.LeafPage.validate(page_bytes);
+    const entry = try leaf_page.entry(position.entry_index);
+
+    const owned_key = try allocator.dupe(u8, entry.key);
+    errdefer allocator.free(owned_key);
+
+    const owned_value = try allocator.dupe(u8, entry.value);
+    return .{
+        .key = owned_key,
+        .value = owned_value,
+        .flags = entry.flags,
+    };
+}
+
+fn descendToLeftmostPosition(
+    db: *db_mod.DB,
+    snapshot: ReadSnapshot,
+    start_page_id: u64,
+    initial_path: PathStack,
+    allow_empty_leaf: bool,
+) CursorError!?CursorPosition {
+    var page_id = start_page_id;
+    var path = initial_path;
+
+    while (true) {
+        const page_bytes = try readTreePageSnapshot(db, db.allocator, snapshot, page_id);
+        defer db.allocator.free(page_bytes);
+
+        const header = try page.decodeHeader(page_bytes);
+        switch (header.page_type) {
+            .branch => {
+                const branch_page = try page.BranchPage.validate(page_bytes);
+                if (branch_page.count() == 0) return error.CorruptTreePath;
+
+                const child_index: u16 = 0;
+                const child_entry = try branch_page.entry(child_index);
+                try path.append(.{
+                    .branch_page_id = header.page_id,
+                    .child_index = child_index,
+                });
+                page_id = child_entry.child_page_id;
+            },
+            .leaf => {
+                const leaf_page = try page.LeafPage.validate(page_bytes);
+                if (leaf_page.count() == 0) {
+                    if (allow_empty_leaf) return null;
+                    return error.CorruptTreePath;
+                }
+
+                return .{
+                    .leaf_page_id = header.page_id,
+                    .entry_index = 0,
+                    .path = path,
+                };
+            },
+            else => return error.UnexpectedPageType,
+        }
+    }
+}
+
+fn successorPositionFromPath(db: *db_mod.DB, snapshot: ReadSnapshot, path: PathStack) CursorError!?CursorPosition {
+    var branch_level = path.len;
+    while (branch_level > 0) {
+        branch_level -= 1;
+
+        const frame = path.get(branch_level).*;
+        const page_bytes = try readTreePageSnapshot(db, db.allocator, snapshot, frame.branch_page_id);
+        defer db.allocator.free(page_bytes);
+
+        const branch_page = try page.BranchPage.validate(page_bytes);
+        if (frame.child_index >= branch_page.count()) return error.CorruptTreePath;
+
+        const next_child_index = std.math.add(u16, frame.child_index, 1) catch continue;
+        if (next_child_index >= branch_page.count()) continue;
+
+        const next_child = try branch_page.entry(next_child_index);
+        var next_path = path;
+        next_path.truncate(branch_level);
+        try next_path.append(.{
+            .branch_page_id = frame.branch_page_id,
+            .child_index = next_child_index,
+        });
+
+        return try descendToLeftmostPosition(db, snapshot, next_child.child_page_id, next_path, false);
+    }
+
+    return null;
+}
+
+fn selectChildIndexForLookup(branch_page: page.BranchPage, key: []const u8) !?u16 {
+    // Branch and leaf entries are already sorted, so cursor seeks can use the
+    // same lower-bound search shape that a B+Tree read path expects.
+    var low: u16 = 0;
+    var high: u16 = branch_page.count();
+
+    while (low < high) {
+        const mid = low + (high - low) / 2;
+        const entry = try branch_page.entry(mid);
+        if (std.mem.order(u8, entry.key, key) == .lt) {
+            low = mid + 1;
+        } else {
+            high = mid;
+        }
+    }
+
+    if (low == branch_page.count()) return null;
+    return low;
+}
+
+fn findLowerBoundIndex(leaf_page: page.LeafPage, key: []const u8) !?u16 {
+    var low: u16 = 0;
+    var high: u16 = leaf_page.count();
+
+    while (low < high) {
+        const mid = low + (high - low) / 2;
+        const entry = try leaf_page.entry(mid);
+        if (std.mem.order(u8, entry.key, key) == .lt) {
+            low = mid + 1;
+        } else {
+            high = mid;
+        }
+    }
+
+    if (low == leaf_page.count()) return null;
+    return low;
 }
 
 fn writeNodePut(ctx: *WriteContext, node_page_bytes: []const u8, key: []const u8, value: []const u8) anyerror!PutResult {
@@ -1314,6 +1642,419 @@ fn snapshotPageReader(db: *db_mod.DB) SnapshotPageReader {
         .root_page_id = db.root_page_id,
         .high_water_mark = db.high_water_mark,
     });
+}
+
+fn expectCursorRecord(record: CursorRecord, expected_key: []const u8, expected_value: []const u8, expected_flags: u32) !void {
+    try std.testing.expectEqualSlices(u8, expected_key, record.key);
+    try std.testing.expectEqualSlices(u8, expected_value, record.value);
+    try std.testing.expectEqual(expected_flags, record.flags);
+}
+
+test "cursor record deinit is idempotent" {
+    var record = CursorRecord{
+        .key = try std.testing.allocator.dupe(u8, "alpha"),
+        .value = try std.testing.allocator.dupe(u8, "one"),
+        .flags = 7,
+    };
+
+    record.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 0), record.key.len);
+    try std.testing.expectEqual(@as(usize, 0), record.value.len);
+    try std.testing.expectEqual(@as(u32, 0), record.flags);
+
+    record.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 0), record.key.len);
+    try std.testing.expectEqual(@as(usize, 0), record.value.len);
+}
+
+test "branch child lookup keeps lower bound semantics" {
+    var branch_page_bytes = [_]u8{0} ** test_page_size;
+    const branch_page = try page.BranchPage.encodeInto(branch_page_bytes[0..], .{
+        .page_id = 2,
+        .page_type = .branch,
+        .count = 0,
+        .order = 0,
+    }, &.{
+        .{ .key = "beta", .child_page_id = 3 },
+        .{ .key = "gamma", .child_page_id = 4 },
+        .{ .key = "omega", .child_page_id = 5 },
+    });
+
+    try std.testing.expectEqual(@as(?u16, 1), try selectChildIndexForLookup(branch_page, "gamma"));
+    try std.testing.expectEqual(@as(?u16, 1), try selectChildIndexForLookup(branch_page, "delta"));
+    try std.testing.expectEqual(@as(?u16, null), try selectChildIndexForLookup(branch_page, "zeta"));
+}
+
+test "leaf lower bound lookup keeps lower bound semantics" {
+    var leaf_page_bytes = [_]u8{0} ** test_page_size;
+    const leaf_page = try page.LeafPage.encodeInto(leaf_page_bytes[0..], .{
+        .page_id = 2,
+        .page_type = .leaf,
+        .count = 0,
+        .order = 0,
+    }, &.{
+        .{ .key = "alpha", .value = "one", .flags = 0 },
+        .{ .key = "gamma", .value = "three", .flags = 0 },
+        .{ .key = "omega", .value = "last", .flags = 0 },
+    });
+
+    try std.testing.expectEqual(@as(?u16, 1), try findLowerBoundIndex(leaf_page, "gamma"));
+    try std.testing.expectEqual(@as(?u16, 1), try findLowerBoundIndex(leaf_page, "beta"));
+    try std.testing.expectEqual(@as(?u16, null), try findLowerBoundIndex(leaf_page, "zeta"));
+}
+
+test "cursor first returns null from an empty root leaf" {
+    const page_size = test_page_size;
+    var root_page_bytes = [_]u8{0} ** page_size;
+    try page.LeafPage.init(root_page_bytes[0..], .{
+        .page_id = 2,
+        .page_type = .leaf,
+        .count = 0,
+        .order = 0,
+    });
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const db = try openTestDb(tmp, "cursor-empty-root.db", page_size, 2, &.{root_page_bytes[0..]});
+    defer db.close();
+
+    var read_tx = try db.beginRead();
+    defer read_tx.deinit();
+    var cursor = read_tx.cursor();
+    defer cursor.deinit();
+
+    const first = try cursor.first(std.testing.allocator);
+    try std.testing.expect(first == null);
+    const next = try cursor.next(std.testing.allocator);
+    try std.testing.expect(next == null);
+}
+
+test "cursor first returns the smallest record with flags" {
+    const page_size = test_page_size;
+    var root_page_bytes = [_]u8{0} ** page_size;
+    _ = try page.LeafPage.encodeInto(root_page_bytes[0..], .{
+        .page_id = 2,
+        .page_type = .leaf,
+        .count = 0,
+        .order = 0,
+    }, &.{
+        .{ .key = "alpha", .value = "one", .flags = 3 },
+        .{ .key = "beta", .value = "two", .flags = 4 },
+    });
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const db = try openTestDb(tmp, "cursor-first-leaf.db", page_size, 2, &.{root_page_bytes[0..]});
+    defer db.close();
+
+    var read_tx = try db.beginRead();
+    defer read_tx.deinit();
+    var cursor = read_tx.cursor();
+    defer cursor.deinit();
+
+    var first = (try cursor.first(std.testing.allocator)).?;
+    defer first.deinit(std.testing.allocator);
+    try expectCursorRecord(first, "alpha", "one", 3);
+}
+
+test "cursor next rejects unpositioned cursors" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const db = try openEmptyDb(tmp, "cursor-unpositioned.db");
+    defer db.close();
+
+    var read_tx = try db.beginRead();
+    defer read_tx.deinit();
+    var cursor = read_tx.cursor();
+    defer cursor.deinit();
+
+    try std.testing.expectError(error.CursorUnpositioned, cursor.next(std.testing.allocator));
+}
+
+test "cursor seek supports exact gap and reset semantics" {
+    const page_size = test_page_size;
+    var root_page_bytes = [_]u8{0} ** page_size;
+    _ = try page.LeafPage.encodeInto(root_page_bytes[0..], .{
+        .page_id = 2,
+        .page_type = .leaf,
+        .count = 0,
+        .order = 0,
+    }, &.{
+        .{ .key = "alpha", .value = "one", .flags = 0 },
+        .{ .key = "gamma", .value = "three", .flags = 1 },
+        .{ .key = "omega", .value = "last", .flags = 2 },
+    });
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const db = try openTestDb(tmp, "cursor-seek-reset.db", page_size, 2, &.{root_page_bytes[0..]});
+    defer db.close();
+
+    var read_tx = try db.beginRead();
+    defer read_tx.deinit();
+    var cursor = read_tx.cursor();
+    defer cursor.deinit();
+
+    var exact = (try cursor.seek(std.testing.allocator, "gamma")).?;
+    defer exact.deinit(std.testing.allocator);
+    try expectCursorRecord(exact, "gamma", "three", 1);
+
+    var gap = (try cursor.seek(std.testing.allocator, "beta")).?;
+    defer gap.deinit(std.testing.allocator);
+    try expectCursorRecord(gap, "gamma", "three", 1);
+
+    var tail = (try cursor.next(std.testing.allocator)).?;
+    defer tail.deinit(std.testing.allocator);
+    try expectCursorRecord(tail, "omega", "last", 2);
+
+    var reset = (try cursor.first(std.testing.allocator)).?;
+    defer reset.deinit(std.testing.allocator);
+    try expectCursorRecord(reset, "alpha", "one", 0);
+}
+
+test "cursor seek past the largest key enters eof" {
+    const page_size = test_page_size;
+    var root_page_bytes = [_]u8{0} ** page_size;
+    _ = try page.LeafPage.encodeInto(root_page_bytes[0..], .{
+        .page_id = 2,
+        .page_type = .leaf,
+        .count = 0,
+        .order = 0,
+    }, &.{
+        .{ .key = "alpha", .value = "one", .flags = 0 },
+        .{ .key = "beta", .value = "two", .flags = 0 },
+    });
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const db = try openTestDb(tmp, "cursor-seek-eof.db", page_size, 2, &.{root_page_bytes[0..]});
+    defer db.close();
+
+    var read_tx = try db.beginRead();
+    defer read_tx.deinit();
+    var cursor = read_tx.cursor();
+    defer cursor.deinit();
+
+    const miss = try cursor.seek(std.testing.allocator, "omega");
+    try std.testing.expect(miss == null);
+    const next = try cursor.next(std.testing.allocator);
+    try std.testing.expect(next == null);
+}
+
+test "cursor next traverses split leaves in key order" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const db = try openEmptyDb(tmp, "cursor-split-leaves.db");
+    defer db.close();
+
+    var value_buf = [_]u8{'x'} ** 160;
+    var index: usize = 0;
+    while (index < 24) : (index += 1) {
+        var key_buf: [5]u8 = undefined;
+        const key = try generatedKey(&key_buf, index);
+        try db.put(key, value_buf[0..]);
+    }
+
+    var read_tx = try db.beginRead();
+    defer read_tx.deinit();
+    var cursor = read_tx.cursor();
+    defer cursor.deinit();
+
+    var first = (try cursor.first(std.testing.allocator)).?;
+    defer first.deinit(std.testing.allocator);
+    try expectCursorRecord(first, "k0000", value_buf[0..], 0);
+
+    var seen: usize = 1;
+    while (try cursor.next(std.testing.allocator)) |record| {
+        defer {
+            var owned = record;
+            owned.deinit(std.testing.allocator);
+        }
+
+        var expected_key_buf: [5]u8 = undefined;
+        const expected_key = try generatedKey(&expected_key_buf, seen);
+        try expectCursorRecord(record, expected_key, value_buf[0..], 0);
+        seen += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 24), seen);
+}
+
+test "cursor next traverses a multi-level tree" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const db = try openEmptyDb(tmp, "cursor-multi-level.db");
+    defer db.close();
+
+    var value_buf = [_]u8{'x'} ** 160;
+    var index: usize = 0;
+    while (index < 261) : (index += 1) {
+        var key_buf: [5]u8 = undefined;
+        const key = try generatedKey(&key_buf, index);
+        try db.put(key, value_buf[0..]);
+    }
+
+    var read_tx = try db.beginRead();
+    defer read_tx.deinit();
+    var cursor = read_tx.cursor();
+    defer cursor.deinit();
+
+    var count: usize = 0;
+    while (try (if (count == 0) cursor.first(std.testing.allocator) else cursor.next(std.testing.allocator))) |record| {
+        defer {
+            var owned = record;
+            owned.deinit(std.testing.allocator);
+        }
+
+        var expected_key_buf: [5]u8 = undefined;
+        const expected_key = try generatedKey(&expected_key_buf, count);
+        try expectCursorRecord(record, expected_key, value_buf[0..], 0);
+        count += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 261), count);
+}
+
+test "cursor snapshot remains stable after a later write commit" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const db = try openEmptyDb(tmp, "cursor-snapshot.db");
+    defer db.close();
+
+    try db.put("alpha", "one");
+
+    var read_tx = try db.beginRead();
+    defer read_tx.deinit();
+    var cursor = read_tx.cursor();
+    defer cursor.deinit();
+
+    var first = (try cursor.first(std.testing.allocator)).?;
+    defer first.deinit(std.testing.allocator);
+    try expectCursorRecord(first, "alpha", "one", 0);
+
+    try db.put("beta", "two");
+
+    const next = try cursor.next(std.testing.allocator);
+    try std.testing.expect(next == null);
+    const missed_seek = try cursor.seek(std.testing.allocator, "beta");
+    try std.testing.expect(missed_seek == null);
+}
+
+test "cursor traverses higher-order leaf pages" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const db = try openEmptyDb(tmp, "cursor-higher-order-leaf.db");
+    defer db.close();
+
+    var large_value = [_]u8{'L'} ** 7000;
+    try db.put("large", large_value[0..]);
+
+    var read_tx = try db.beginRead();
+    defer read_tx.deinit();
+    var cursor = read_tx.cursor();
+    defer cursor.deinit();
+
+    var first = (try cursor.first(std.testing.allocator)).?;
+    defer first.deinit(std.testing.allocator);
+    try expectCursorRecord(first, "large", large_value[0..], 0);
+}
+
+test "cursor traverses the latest snapshot after root collapse" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const db = try openEmptyDb(tmp, "cursor-root-collapse.db");
+    defer db.close();
+
+    var value_buf = [_]u8{'x'} ** 160;
+    var index: usize = 0;
+    while (index < 24) : (index += 1) {
+        var key_buf: [5]u8 = undefined;
+        const key = try generatedKey(&key_buf, index);
+        try db.put(key, value_buf[0..]);
+    }
+    try db.delete("k0000");
+
+    var read_tx = try db.beginRead();
+    defer read_tx.deinit();
+    var cursor = read_tx.cursor();
+    defer cursor.deinit();
+
+    var first = (try cursor.first(std.testing.allocator)).?;
+    defer first.deinit(std.testing.allocator);
+    try expectCursorRecord(first, "k0001", value_buf[0..], 0);
+
+    var seen: usize = 1;
+    while (try cursor.next(std.testing.allocator)) |record| {
+        defer {
+            var owned = record;
+            owned.deinit(std.testing.allocator);
+        }
+        seen += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 23), seen);
+}
+
+test "cursor first propagates non tree root type errors" {
+    const page_size = test_page_size;
+    var root_page_bytes = [_]u8{0} ** page_size;
+    try page.encodeHeader(root_page_bytes[0..], .{
+        .page_id = 2,
+        .page_type = .allocator,
+        .count = 0,
+        .order = 0,
+    });
+    try page.encodeDataHeader(root_page_bytes[0..], .{
+        .lower = page.data_header_size,
+        .upper = page_size,
+        .flags = 0,
+    });
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const db = try openTestDb(tmp, "cursor-bad-root-type.db", page_size, 2, &.{root_page_bytes[0..]});
+    defer db.close();
+
+    var read_tx = try db.beginRead();
+    defer read_tx.deinit();
+    var cursor = read_tx.cursor();
+    defer cursor.deinit();
+
+    try std.testing.expectError(error.UnexpectedPageType, cursor.first(std.testing.allocator));
+}
+
+test "cursor first propagates malformed leaf layouts" {
+    const page_size = test_page_size;
+    var root_page_bytes = [_]u8{0} ** page_size;
+    try page.LeafPage.init(root_page_bytes[0..], .{
+        .page_id = 2,
+        .page_type = .leaf,
+        .count = 0,
+        .order = 0,
+    });
+    page.writeInt(u16, root_page_bytes[0..], page.header_size, 40);
+    page.writeInt(u16, root_page_bytes[0..], page.header_size + 2, 32);
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const db = try openTestDb(tmp, "cursor-bad-leaf-layout.db", page_size, 2, &.{root_page_bytes[0..]});
+    defer db.close();
+
+    var read_tx = try db.beginRead();
+    defer read_tx.deinit();
+    var cursor = read_tx.cursor();
+    defer cursor.deinit();
+
+    try std.testing.expectError(error.InvalidPageLayout, cursor.first(std.testing.allocator));
 }
 
 test "lookup returns null from an empty root leaf" {

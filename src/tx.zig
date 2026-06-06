@@ -34,6 +34,16 @@ pub const ReadTx = struct {
         std.debug.assert(self.db != null);
         return tree.lookupSnapshot(self.db.?, allocator, self.snapshot, key);
     }
+
+    /// Opens a read-only cursor pinned to this transaction's snapshot.
+    pub fn cursor(self: *const ReadTx) tree.Cursor {
+        std.debug.assert(self.db != null);
+        return .{
+            .db = self.db.?,
+            .snapshot = self.snapshot,
+            .state = .unpositioned,
+        };
+    }
 };
 
 pub const WriteTx = struct {
