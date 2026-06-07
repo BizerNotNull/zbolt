@@ -38,7 +38,8 @@ pub const CompactError = error{
     ActiveReadersPresent,
     CorruptTreeShape,
     TempFileValidationFailed,
-    FileReplaceFailed,
+    FileReplaceRolledBack,
+    FileReplaceRollbackFailed,
 };
 
 pub const StorageError = error{

@@ -171,9 +171,9 @@ pub const FileReplacement = struct {
             std.Io.Dir.renameAbsolute(backup_path, original_path, io) catch {};
         }
 
-        std.Io.Dir.renameAbsolute(temp_path, original_path, io) catch |err| {
-            std.Io.Dir.renameAbsolute(backup_path, original_path, io) catch return error.FileReplaceFailed;
-            return err;
+        std.Io.Dir.renameAbsolute(temp_path, original_path, io) catch {
+            std.Io.Dir.renameAbsolute(backup_path, original_path, io) catch return error.FileReplaceRollbackFailed;
+            return error.FileReplaceRolledBack;
         };
 
         deleteFileIfExists(backup_path, io) catch {};

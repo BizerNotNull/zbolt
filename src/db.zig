@@ -29,6 +29,7 @@ pub const DB = struct {
     allocator: std.mem.Allocator,
     io_threaded: std.Io.Threaded,
     file: std.Io.File,
+    file_open: bool,
     path: []u8,
     meta_slot: meta.MetaSlot,
     page_size: u32,
@@ -45,7 +46,10 @@ pub const DB = struct {
         // Active WriteTx values borrow this DB and must be ended before close.
         std.debug.assert(!self.write_tx_active);
         std.debug.assert(self.reclaim.activeReaderCount() == 0);
-        self.file.close(self.io_threaded.io());
+        if (self.file_open) {
+            self.file.close(self.io_threaded.io());
+            self.file_open = false;
+        }
         self.reclaim.deinit(self.allocator);
         self.page_allocator.deinit(self.allocator);
         self.allocator.free(self.path);
@@ -149,12 +153,20 @@ pub const DB = struct {
         try validateCompactedFile(allocator, temp_path, compact_meta);
 
         self.file.close(io);
+        self.file_open = false;
         compact_mod.FileReplacement.replaceFileWithRollback(self.path, temp_path, backup_path, io) catch |err| {
-            self.file = try std.Io.Dir.openFileAbsolute(io, self.path, .{ .mode = .read_write });
-            return err;
+            switch (err) {
+                error.FileReplaceRollbackFailed => return err,
+                else => {
+                    self.file = try std.Io.Dir.openFileAbsolute(io, self.path, .{ .mode = .read_write });
+                    self.file_open = true;
+                    return err;
+                },
+            }
         };
 
         self.file = try std.Io.Dir.openFileAbsolute(io, self.path, .{ .mode = .read_write });
+        self.file_open = true;
         try reloadCommittedStateFromOpenFile(self);
         self.reclaim.deinit(self.allocator);
         self.reclaim = reclaim.State.init(self.allocator);
@@ -171,6 +183,7 @@ pub fn open(allocator: std.mem.Allocator, path: []const u8) !*DB {
         .allocator = allocator,
         .io_threaded = .init(allocator, .{}),
         .file = undefined,
+        .file_open = false,
         .path = owned_path,
         .meta_slot = .meta0,
         .page_size = 0,
@@ -197,8 +210,9 @@ pub fn open(allocator: std.mem.Allocator, path: []const u8) !*DB {
         }),
         else => return err,
     };
+    db.file_open = true;
 
-    errdefer db.file.close(io);
+    errdefer if (db.file_open) db.file.close(io);
 
     try recoverOrInitialize(db);
 
@@ -2836,6 +2850,7 @@ test "commit failure releases the writer slot and leaves the transaction failed"
     const initial_high_water_mark = db.high_water_mark;
     const io = db.io_threaded.io();
     db.file.close(io);
+    db.file_open = false;
 
     var commit_failed = false;
     write_tx.commit() catch {
@@ -2852,6 +2867,7 @@ test "commit failure releases the writer slot and leaves the transaction failed"
     try std.testing.expectError(tx.WriteTxError.WriteTransactionFailed, write_tx.rollback());
 
     db.file = try std.Io.Dir.openFileAbsolute(io, db.path, .{ .mode = .read_write });
+    db.file_open = true;
 
     var next_write_tx = try db.beginWrite();
     try next_write_tx.put("beta", "two");
