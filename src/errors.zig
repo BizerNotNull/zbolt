@@ -33,6 +33,15 @@ pub const DbOpenError = error{
     DatabaseFileTooSmall,
 };
 
+pub const CompactError = error{
+    WriteTransactionActive,
+    ActiveReadersPresent,
+    CorruptTreeShape,
+    TempFileValidationFailed,
+    FileReplaceRolledBack,
+    FileReplaceRollbackFailed,
+};
+
 pub const StorageError = error{
     PageLengthMismatch,
     PageOffsetOverflow,

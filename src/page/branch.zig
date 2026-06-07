@@ -122,6 +122,18 @@ pub const BranchPage = struct {
     pub fn count(self: BranchPage) u16 {
         return self.header.count;
     }
+
+    pub fn rewriteChildPageId(bytes: []u8, index: u16, child_page_id: u64) Error!void {
+        const branch_page = try validate(bytes);
+        try page.validateEntryIndex(branch_page.header.count, index);
+
+        const slot_start = try page.checkedAdd(page.data_header_size, @as(usize, index) * slot_size);
+        writeSlot(bytes[slot_start .. slot_start + slot_size], .{
+            .child_page_id = child_page_id,
+            .key_len = page.readInt(u16, bytes, slot_start + key_len_offset),
+            .payload_offset = page.readInt(u16, bytes, slot_start + payload_offset_offset),
+        });
+    }
 };
 
 const Slot = struct {
@@ -221,4 +233,26 @@ test "validate rejects malformed bounds" {
     page.writeInt(u16, bytes[0..], page.header_size + 2, 32);
 
     try std.testing.expectError(error.InvalidPageLayout, BranchPage.validate(bytes[0..]));
+}
+
+test "rewriteChildPageId updates only the selected child pointer" {
+    var bytes = [_]u8{0} ** 128;
+    _ = try BranchPage.encodeInto(bytes[0..], .{
+        .page_id = 5,
+        .page_type = .branch,
+        .count = 0,
+        .order = 0,
+    }, &.{
+        .{ .key = "alpha", .child_page_id = 11 },
+        .{ .key = "gamma", .child_page_id = 15 },
+    });
+
+    try BranchPage.rewriteChildPageId(bytes[0..], 1, 42);
+
+    const branch_page = try BranchPage.validate(bytes[0..]);
+    const first = try branch_page.entry(0);
+    const second = try branch_page.entry(1);
+    try std.testing.expectEqual(@as(u64, 11), first.child_page_id);
+    try std.testing.expectEqual(@as(u64, 42), second.child_page_id);
+    try std.testing.expectEqualSlices(u8, "gamma", second.key);
 }
