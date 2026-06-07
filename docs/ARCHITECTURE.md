@@ -212,12 +212,12 @@ When a write transaction modifies a key, it does not overwrite the original leaf
 
 So a single write affects only the dirty path from the root to the target leaf, not the entire tree.
 
-The current implementation round covers only the `put` path and only the
-page-replacement side of that path:
+The current implementation round covers the `put`, `delete`, read-cursor,
+and explicit `compact` paths, while still limiting reclaim sources to tree
+page replacement:
 
 - old pages from the rewritten tree path are tracked for reclaim
-- delete, cursor, compact, and non-tree reclaim sources are still out of
-  scope for this slice
+- non-tree reclaim sources are still out of scope for this slice
 
 ## 5. Transaction Model
 
@@ -342,8 +342,8 @@ This first version keeps pending reclaim in memory only:
 
 - the committed allocator state page does not persist pending reclaim
 - if the process restarts before a pending item is reused, those pages
-  conservatively leak until a later compaction or format upgrade path
-  exists
+  conservatively leak until an explicit `compact` run or a later format
+  upgrade path exists
 - committed data remains correct because restart recovery still trusts
   only the latest valid meta page and allocator state page
 
@@ -369,6 +369,13 @@ The expected responsibilities of `compact` are:
 - rewrite a new, more compact database file
 - skip all unreachable pages and old-version pages that no longer need to be preserved
 - switch to the new file through atomic replacement or an equivalent method after validation completes
+
+The current first implementation narrows that path deliberately:
+
+- `compact` requires no active read or write transactions
+- it rewrites only tree pages referenced by the latest committed snapshot
+- it emits identical `meta0/meta1` pages with the same logical `txid`
+- it clears in-memory pending reclaim by replacing the file with the compacted layout
 
 Therefore:
 

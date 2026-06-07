@@ -1,6 +1,7 @@
 const std = @import("std");
 const errors = @import("errors.zig");
 const allocator_mod = @import("allocator.zig");
+const compact_mod = @import("compact.zig");
 const meta = @import("meta.zig");
 const page = @import("page.zig");
 const reclaim = @import("reclaim.zig");
@@ -102,6 +103,61 @@ pub const DB = struct {
 
     pub fn readPageAllocAtHighWater(self: *DB, allocator: std.mem.Allocator, page_id: u64, high_water_mark: u64) ![]u8 {
         return readTreePageObjectAlloc(allocator, &self.file, self.io_threaded.io(), page_id, self.page_size, high_water_mark);
+    }
+
+    /// Rewrites the latest committed snapshot into a compact replacement file.
+    pub fn compact(self: *DB, allocator: std.mem.Allocator) !void {
+        if (self.write_tx_active) return error.WriteTransactionActive;
+        if (self.reclaim.activeReaderCount() > 0) return error.ActiveReadersPresent;
+
+        const snapshot = tree.ReadSnapshot{
+            .root_page_id = self.root_page_id,
+            .high_water_mark = self.high_water_mark,
+        };
+        var snapshot_page_reader = tree.SnapshotPageReader.init(self, snapshot);
+        var walker = compact_mod.SnapshotTreeWalker.init(allocator, snapshot_page_reader.pageReader(), snapshot);
+        defer walker.deinit();
+
+        try walker.walk();
+        try walker.rewritePages();
+
+        const compact_meta = meta.Meta{
+            .page_size = self.page_size,
+            .flags = self.flags,
+            .root_page_id = try walker.rootPageId(),
+            .allocator_root = 0,
+            .high_water_mark = try walker.highWaterMark(),
+            .txid = self.txid,
+        };
+
+        const temp_path = try std.fmt.allocPrint(allocator, "{s}.compact.tmp", .{self.path});
+        defer allocator.free(temp_path);
+        const backup_path = try std.fmt.allocPrint(allocator, "{s}.compact.bak", .{self.path});
+        defer allocator.free(backup_path);
+
+        const io = self.io_threaded.io();
+        errdefer compact_mod.deleteFileIfExists(temp_path, io) catch {};
+
+        try compact_mod.FileReplacement.writeCompactedFile(
+            allocator,
+            temp_path,
+            io,
+            self.page_size,
+            walker.descriptors.items,
+            compact_meta,
+        );
+        try validateCompactedFile(allocator, temp_path, compact_meta);
+
+        self.file.close(io);
+        compact_mod.FileReplacement.replaceFileWithRollback(self.path, temp_path, backup_path, io) catch |err| {
+            self.file = try std.Io.Dir.openFileAbsolute(io, self.path, .{ .mode = .read_write });
+            return err;
+        };
+
+        self.file = try std.Io.Dir.openFileAbsolute(io, self.path, .{ .mode = .read_write });
+        try reloadCommittedStateFromOpenFile(self);
+        self.reclaim.deinit(self.allocator);
+        self.reclaim = reclaim.State.init(self.allocator);
     }
 };
 
@@ -208,6 +264,11 @@ fn recoverOrInitialize(db: *DB) !void {
         return errors.DbOpenError.DatabaseFileTooSmall;
     }
 
+    try reloadCommittedStateFromOpenFile(db);
+}
+
+pub fn reloadCommittedStateFromOpenFile(db: *DB) !void {
+    const io = db.io_threaded.io();
     var selected = loadNewestRecoverableSnapshot(db.allocator, &db.file, io, default_page_size) catch |err| switch (err) {
         error.NoValidMetaPage => return errors.DbOpenError.InvalidDatabaseFile,
         else => return err,
@@ -449,6 +510,24 @@ fn metaSlotPageId(slot: meta.MetaSlot) u64 {
         .meta0 => 0,
         .meta1 => 1,
     };
+}
+
+fn validateCompactedFile(allocator: std.mem.Allocator, path: []const u8, expected_meta: meta.Meta) !void {
+    const compacted = try open(allocator, path);
+    defer compacted.close();
+
+    if (compacted.root_page_id != expected_meta.root_page_id) return error.TempFileValidationFailed;
+    if (compacted.high_water_mark != expected_meta.high_water_mark) return error.TempFileValidationFailed;
+    if (compacted.txid != expected_meta.txid) return error.TempFileValidationFailed;
+    if (compacted.allocator_root != expected_meta.allocator_root) return error.TempFileValidationFailed;
+
+    const root_page = try compacted.readPageAlloc(allocator, compacted.root_page_id);
+    defer allocator.free(root_page);
+    const header = try page.decodeHeader(root_page);
+    switch (header.page_type) {
+        .leaf, .branch => {},
+        else => return error.TempFileValidationFailed,
+    }
 }
 
 fn tempFilePath(buf: []u8, tmp_dir: std.Io.Dir, file_name: []const u8) ![]const u8 {
@@ -2915,4 +2994,141 @@ test "reopen drops in-memory pending reclaim without damaging committed data" {
     try reopened.put("alpha", "three");
     try std.testing.expect(reopened.root_page_id != 3);
     try expectDbValue(reopened, "alpha", "three");
+}
+
+test "compact rewrites an empty database into a reopenable file" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path = try tempFilePath(&path_buf, tmp.dir, "compact-empty.db");
+
+    const db = try open(std.testing.allocator, path);
+    defer db.close();
+
+    try db.compact(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(u64, 2), db.root_page_id);
+    try std.testing.expectEqual(@as(u64, 2), db.high_water_mark);
+    try std.testing.expectEqual(@as(u64, 0), db.allocator_root);
+
+    const reopened = try open(std.testing.allocator, path);
+    defer reopened.close();
+    try std.testing.expectEqual(@as(u64, 2), reopened.root_page_id);
+    try std.testing.expectEqual(@as(u64, 2), reopened.high_water_mark);
+}
+
+test "compact preserves data clears pending reclaim and shrinks the high water mark" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path = try tempFilePath(&path_buf, tmp.dir, "compact-shrinks.db");
+
+    const db = try open(std.testing.allocator, path);
+    defer db.close();
+
+    try db.put("alpha", "one");
+    var read_tx = try db.beginRead();
+    try db.put("alpha", "two");
+    try db.put("alpha", "three");
+
+    try std.testing.expect(db.high_water_mark > 2);
+    try std.testing.expect(db.reclaim.pending.items.len > 0);
+    read_tx.deinit();
+
+    const high_water_mark_before = db.high_water_mark;
+    try db.compact(std.testing.allocator);
+
+    try std.testing.expect(db.high_water_mark < high_water_mark_before);
+    try std.testing.expectEqual(@as(usize, 0), db.reclaim.pending.items.len);
+    try std.testing.expectEqual(@as(u64, 0), db.allocator_root);
+    try expectDbValue(db, "alpha", "three");
+
+    const reopened = try open(std.testing.allocator, path);
+    defer reopened.close();
+    try expectDbValue(reopened, "alpha", "three");
+    try std.testing.expectEqual(db.high_water_mark, reopened.high_water_mark);
+}
+
+test "compact preserves cursor order across a multi-level tree" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path = try tempFilePath(&path_buf, tmp.dir, "compact-cursor.db");
+
+    const db = try open(std.testing.allocator, path);
+    defer db.close();
+
+    var value_buf = [_]u8{'x'} ** 160;
+    var index: usize = 0;
+    while (index < 261) : (index += 1) {
+        var key_buf: [5]u8 = undefined;
+        const key = try generatedKey(&key_buf, index);
+        try db.put(key, value_buf[0..]);
+    }
+
+    try db.compact(std.testing.allocator);
+
+    var read_tx = try db.beginRead();
+    defer read_tx.deinit();
+    var cursor = read_tx.cursor();
+    defer cursor.deinit();
+
+    var count: usize = 0;
+    while (try (if (count == 0) cursor.first(std.testing.allocator) else cursor.next(std.testing.allocator))) |record| {
+        var owned = record;
+        defer owned.deinit(std.testing.allocator);
+        var key_buf: [5]u8 = undefined;
+        const expected = try generatedKey(&key_buf, count);
+        try std.testing.expectEqualSlices(u8, expected, owned.key);
+        count += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 261), count);
+}
+
+test "compact preserves higher-order leaf pages" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path = try tempFilePath(&path_buf, tmp.dir, "compact-large-value.db");
+
+    const db = try open(std.testing.allocator, path);
+    defer db.close();
+
+    var large_value = [_]u8{'L'} ** 7000;
+    try db.put("large", large_value[0..]);
+
+    const before = try db.readPageAlloc(std.testing.allocator, db.root_page_id);
+    defer std.testing.allocator.free(before);
+    const before_header = try page.decodeHeader(before);
+
+    try db.compact(std.testing.allocator);
+    try expectDbValue(db, "large", large_value[0..]);
+
+    const after = try db.readPageAlloc(std.testing.allocator, db.root_page_id);
+    defer std.testing.allocator.free(after);
+    const after_header = try page.decodeHeader(after);
+    try std.testing.expectEqual(before_header.order, after_header.order);
+}
+
+test "compact rejects active read and write transactions" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path = try tempFilePath(&path_buf, tmp.dir, "compact-active-tx.db");
+
+    const db = try open(std.testing.allocator, path);
+    defer db.close();
+
+    var read_tx = try db.beginRead();
+    try std.testing.expectError(error.ActiveReadersPresent, db.compact(std.testing.allocator));
+    read_tx.deinit();
+
+    var write_tx = try db.beginWrite();
+    defer write_tx.rollback() catch {};
+    try std.testing.expectError(error.WriteTransactionActive, db.compact(std.testing.allocator));
 }
