@@ -484,15 +484,14 @@ fn loadRecoverableSnapshotForMeta(
             decoded_meta.high_water_mark,
             decoded_meta.allocator_root,
         );
-        defer allocator.free(restored_state.pending_records);
+        defer restored_state.deinit(allocator);
 
         for (restored_state.pending_records) |pending_record| {
             if (pending_record.visible_through_txid > decoded_meta.txid) return error.InvalidAllocatorState;
         }
 
         page_allocator.deinit(allocator);
-        page_allocator = restored_state.page_allocator;
-        restored_state.page_allocator = movedPageAllocator(allocator);
+        page_allocator = restored_state.takePageAllocator(allocator);
 
         reclaim_state.deinit(allocator);
         reclaim_state = try reclaim.State.initFromStateRecords(allocator, restored_state.pending_records);

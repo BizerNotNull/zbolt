@@ -36,6 +36,12 @@ pub const RestoredState = struct {
             .pending_records = &.{},
         };
     }
+
+    pub fn takePageAllocator(self: *RestoredState, backing_allocator: std.mem.Allocator) PageAllocator {
+        const page_allocator = self.page_allocator;
+        self.page_allocator = PageAllocator.init(backing_allocator, 0);
+        return page_allocator;
+    }
 };
 
 pub const PageAllocator = struct {
@@ -191,9 +197,9 @@ pub const PageAllocator = struct {
         high_water_mark: u64,
         allocator_root: u64,
     ) (Error || page.Error || page.LayoutError)!PageAllocator {
-        const restored_state = try restoreStateFromPage(backing_allocator, state_page_bytes, high_water_mark, allocator_root);
-        defer backing_allocator.free(restored_state.pending_records);
-        return restored_state.page_allocator;
+        var restored_state = try restoreStateFromPage(backing_allocator, state_page_bytes, high_water_mark, allocator_root);
+        defer restored_state.deinit(backing_allocator);
+        return restored_state.takePageAllocator(backing_allocator);
     }
 
     pub fn restoreStateFromPage(
