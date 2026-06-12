@@ -3896,6 +3896,28 @@ test "managed cursor traverses the latest root snapshot and releases its reader"
     try std.testing.expectEqual(@as(usize, 0), db.reclaim.activeReaderCount());
 }
 
+test "managed cursor deinit is idempotent" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path = try tempFilePath(&path_buf, tmp.dir, "managed-cursor-deinit.db");
+
+    const db = try open(std.testing.allocator, std.testing.io, path);
+    defer db.close();
+
+    try db.put("alpha", "one");
+
+    var cursor = try db.cursor();
+    try std.testing.expectEqual(@as(usize, 1), db.reclaim.activeReaderCount());
+
+    cursor.deinit();
+    try std.testing.expectEqual(@as(usize, 0), db.reclaim.activeReaderCount());
+
+    cursor.deinit();
+    try std.testing.expectEqual(@as(usize, 0), db.reclaim.activeReaderCount());
+}
+
 test "managed bucket cursor keeps its snapshot stable after later writes" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();

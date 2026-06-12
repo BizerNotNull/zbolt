@@ -148,10 +148,8 @@ pub const ManagedCursor = struct {
     /// The cursor and its snapshot remain valid until `deinit`, so callers can
     /// traverse the latest committed state without manually managing `ReadTx`.
     pub fn init(db: *db_mod.DB) !ManagedCursor {
-        const owned_read_tx = try db.allocator.create(ReadTx);
-        errdefer db.allocator.destroy(owned_read_tx);
-        owned_read_tx.* = try db.beginRead();
-        errdefer owned_read_tx.deinit();
+        const owned_read_tx = try initOwnedReadTx(db);
+        errdefer destroyOwnedReadTx(db.allocator, owned_read_tx);
 
         var managed = ManagedCursor{
             .allocator = db.allocator,
@@ -167,10 +165,8 @@ pub const ManagedCursor = struct {
 
     /// Opens a bucket-scoped cursor that owns the underlying read transaction.
     pub fn initInBucket(db: *db_mod.DB, bucket: []const u8) !ManagedCursor {
-        const owned_read_tx = try db.allocator.create(ReadTx);
-        errdefer db.allocator.destroy(owned_read_tx);
-        owned_read_tx.* = try db.beginRead();
-        errdefer owned_read_tx.deinit();
+        const owned_read_tx = try initOwnedReadTx(db);
+        errdefer destroyOwnedReadTx(db.allocator, owned_read_tx);
 
         var managed = ManagedCursor{
             .allocator = db.allocator,
@@ -203,11 +199,23 @@ pub const ManagedCursor = struct {
 
     /// Releases both the cursor handle and the owned read transaction snapshot.
     pub fn deinit(self: *ManagedCursor) void {
-        self.cursor.deinit();
         const owned_read_tx = self.read_tx orelse return;
         self.read_tx = null;
+        self.cursor.deinit();
         owned_read_tx.deinit();
         self.allocator.destroy(owned_read_tx);
+    }
+
+    fn initOwnedReadTx(db: *db_mod.DB) !*ReadTx {
+        const owned_read_tx = try db.allocator.create(ReadTx);
+        errdefer db.allocator.destroy(owned_read_tx);
+        owned_read_tx.* = try db.beginRead();
+        return owned_read_tx;
+    }
+
+    fn destroyOwnedReadTx(allocator: std.mem.Allocator, owned_read_tx: *ReadTx) void {
+        owned_read_tx.deinit();
+        allocator.destroy(owned_read_tx);
     }
 };
 
