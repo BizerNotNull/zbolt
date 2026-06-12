@@ -207,6 +207,16 @@ const CursorState = union(enum) {
     eof,
 };
 
+const CursorEdge = enum {
+    first,
+    last,
+};
+
+const CursorStep = enum {
+    next,
+    prev,
+};
+
 pub const Cursor = struct {
     snapshot_source: ?*const SnapshotSource,
     owner_db: ?*const ?*db_mod.DB,
@@ -236,7 +246,15 @@ pub const Cursor = struct {
     pub fn first(self: *Cursor, allocator: std.mem.Allocator) CursorError!?CursorRecord {
         const snapshot_source = self.snapshot_source orelse return error.CursorUnpositioned;
         if (!self.ownerIsActive()) return error.CursorUnpositioned;
-        const position = try locateFirstPosition(snapshot_source, self.temp_allocator, self.root_page_id);
+        const position = try locateEdgePosition(snapshot_source, self.temp_allocator, self.root_page_id, .first);
+        return try self.setPositionAndMaterialize(allocator, position);
+    }
+
+    /// Repositions the cursor to the last record visible in this snapshot.
+    pub fn last(self: *Cursor, allocator: std.mem.Allocator) CursorError!?CursorRecord {
+        const snapshot_source = self.snapshot_source orelse return error.CursorUnpositioned;
+        if (!self.ownerIsActive()) return error.CursorUnpositioned;
+        const position = try locateEdgePosition(snapshot_source, self.temp_allocator, self.root_page_id, .last);
         return try self.setPositionAndMaterialize(allocator, position);
     }
 
@@ -256,7 +274,21 @@ pub const Cursor = struct {
         const position = switch (self.state) {
             .unpositioned => return error.CursorUnpositioned,
             .eof => return null,
-            .positioned => |current| try advancePosition(snapshot_source, self.temp_allocator, current),
+            .positioned => |current| try stepPosition(snapshot_source, self.temp_allocator, current, .next),
+        };
+
+        return try self.setPositionAndMaterialize(allocator, position);
+    }
+
+    /// Returns the previous record before the current cursor position.
+    pub fn prev(self: *Cursor, allocator: std.mem.Allocator) CursorError!?CursorRecord {
+        const snapshot_source = self.snapshot_source orelse return error.CursorUnpositioned;
+        if (!self.ownerIsActive()) return error.CursorUnpositioned;
+
+        const position = switch (self.state) {
+            .unpositioned => return error.CursorUnpositioned,
+            .eof => return null,
+            .positioned => |current| try stepPosition(snapshot_source, self.temp_allocator, current, .prev),
         };
 
         return try self.setPositionAndMaterialize(allocator, position);
@@ -678,13 +710,14 @@ fn findEntryInLeaf(leaf_page: page.LeafPage, allocator: std.mem.Allocator, key: 
     return null;
 }
 
-fn locateFirstPosition(
+fn locateEdgePosition(
     snapshot_source: *const SnapshotSource,
     allocator: std.mem.Allocator,
     root_page_id: u64,
+    edge: CursorEdge,
 ) CursorError!?CursorPosition {
     const path = PathStack.init();
-    return try descendToLeftmostPosition(snapshot_source, allocator, root_page_id, path, true);
+    return try descendToEdgePosition(snapshot_source, allocator, root_page_id, path, true, edge);
 }
 
 fn locateSeekPosition(
@@ -724,30 +757,48 @@ fn locateSeekPosition(
                     };
                 }
 
-                return try successorPositionFromPath(snapshot_source, allocator, path);
+                return try adjacentPositionFromPath(snapshot_source, allocator, path, .next);
             },
             else => return error.UnexpectedPageType,
         }
     }
 }
 
-fn advancePosition(snapshot_source: *const SnapshotSource, allocator: std.mem.Allocator, current: CursorPosition) CursorError!?CursorPosition {
+fn stepPosition(
+    snapshot_source: *const SnapshotSource,
+    allocator: std.mem.Allocator,
+    current: CursorPosition,
+    step: CursorStep,
+) CursorError!?CursorPosition {
     const page_bytes = try readTreePageSnapshot(snapshot_source, allocator, current.leaf_page_id);
     defer allocator.free(page_bytes);
 
     const leaf_page = try page.LeafPage.validate(page_bytes);
     if (current.entry_index >= leaf_page.count()) return error.CorruptTreePath;
 
-    const next_entry_index = std.math.add(u16, current.entry_index, 1) catch return error.CorruptTreePath;
-    if (next_entry_index < leaf_page.count()) {
-        return .{
-            .leaf_page_id = current.leaf_page_id,
-            .entry_index = next_entry_index,
-            .path = current.path,
-        };
+    switch (step) {
+        .next => {
+            const next_entry_index = std.math.add(u16, current.entry_index, 1) catch return error.CorruptTreePath;
+            if (next_entry_index < leaf_page.count()) {
+                return .{
+                    .leaf_page_id = current.leaf_page_id,
+                    .entry_index = next_entry_index,
+                    .path = current.path,
+                };
+            }
+        },
+        .prev => {
+            if (current.entry_index > 0) {
+                return .{
+                    .leaf_page_id = current.leaf_page_id,
+                    .entry_index = current.entry_index - 1,
+                    .path = current.path,
+                };
+            }
+        },
     }
 
-    return try successorPositionFromPath(snapshot_source, allocator, current.path);
+    return try adjacentPositionFromPath(snapshot_source, allocator, current.path, step);
 }
 
 fn materializeRecord(
@@ -773,12 +824,13 @@ fn materializeRecord(
     };
 }
 
-fn descendToLeftmostPosition(
+fn descendToEdgePosition(
     snapshot_source: *const SnapshotSource,
     allocator: std.mem.Allocator,
     start_page_id: u64,
     initial_path: PathStack,
     allow_empty_leaf: bool,
+    edge: CursorEdge,
 ) CursorError!?CursorPosition {
     var page_id = start_page_id;
     var path = initial_path;
@@ -793,7 +845,10 @@ fn descendToLeftmostPosition(
                 const branch_page = try page.BranchPage.validate(page_bytes);
                 if (branch_page.count() == 0) return error.CorruptTreePath;
 
-                const child_index: u16 = 0;
+                const child_index: u16 = switch (edge) {
+                    .first => 0,
+                    .last => branch_page.count() - 1,
+                };
                 const child_entry = try branch_page.entry(child_index);
                 try path.append(.{
                     .branch_page_id = header.page_id,
@@ -810,7 +865,10 @@ fn descendToLeftmostPosition(
 
                 return .{
                     .leaf_page_id = header.page_id,
-                    .entry_index = 0,
+                    .entry_index = switch (edge) {
+                        .first => 0,
+                        .last => leaf_page.count() - 1,
+                    },
                     .path = path,
                 };
             },
@@ -819,7 +877,12 @@ fn descendToLeftmostPosition(
     }
 }
 
-fn successorPositionFromPath(snapshot_source: *const SnapshotSource, allocator: std.mem.Allocator, path: PathStack) CursorError!?CursorPosition {
+fn adjacentPositionFromPath(
+    snapshot_source: *const SnapshotSource,
+    allocator: std.mem.Allocator,
+    path: PathStack,
+    step: CursorStep,
+) CursorError!?CursorPosition {
     var branch_level = path.len;
     while (branch_level > 0) {
         branch_level -= 1;
@@ -831,18 +894,37 @@ fn successorPositionFromPath(snapshot_source: *const SnapshotSource, allocator: 
         const branch_page = try page.BranchPage.validate(page_bytes);
         if (frame.child_index >= branch_page.count()) return error.CorruptTreePath;
 
-        const next_child_index = std.math.add(u16, frame.child_index, 1) catch continue;
-        if (next_child_index >= branch_page.count()) continue;
+        const adjacent_child_index = switch (step) {
+            .next => blk: {
+                const next_child_index = std.math.add(u16, frame.child_index, 1) catch continue;
+                if (next_child_index >= branch_page.count()) continue;
+                break :blk next_child_index;
+            },
+            .prev => blk: {
+                if (frame.child_index == 0) continue;
+                break :blk frame.child_index - 1;
+            },
+        };
 
-        const next_child = try branch_page.entry(next_child_index);
+        const adjacent_child = try branch_page.entry(adjacent_child_index);
         var next_path = path;
         next_path.truncate(branch_level);
         try next_path.append(.{
             .branch_page_id = frame.branch_page_id,
-            .child_index = next_child_index,
+            .child_index = adjacent_child_index,
         });
 
-        return try descendToLeftmostPosition(snapshot_source, allocator, next_child.child_page_id, next_path, false);
+        return try descendToEdgePosition(
+            snapshot_source,
+            allocator,
+            adjacent_child.child_page_id,
+            next_path,
+            false,
+            switch (step) {
+                .next => .first,
+                .prev => .last,
+            },
+        );
     }
 
     return null;
@@ -1898,8 +1980,12 @@ test "cursor first returns null from an empty root leaf" {
 
     const first = try cursor.first(std.testing.allocator);
     try std.testing.expect(first == null);
+    const last = try cursor.last(std.testing.allocator);
+    try std.testing.expect(last == null);
     const next = try cursor.next(std.testing.allocator);
     try std.testing.expect(next == null);
+    const prev = try cursor.prev(std.testing.allocator);
+    try std.testing.expect(prev == null);
 }
 
 test "cursor first returns the smallest record with flags" {
@@ -1944,6 +2030,7 @@ test "cursor next rejects unpositioned cursors" {
     defer cursor.deinit();
 
     try std.testing.expectError(error.CursorUnpositioned, cursor.next(std.testing.allocator));
+    try std.testing.expectError(error.CursorUnpositioned, cursor.prev(std.testing.allocator));
 }
 
 test "cursor rejects use after the owning read transaction closes" {
@@ -1960,8 +2047,54 @@ test "cursor rejects use after the owning read transaction closes" {
     read_tx.deinit();
 
     try std.testing.expectError(error.CursorUnpositioned, cursor.first(std.testing.allocator));
+    try std.testing.expectError(error.CursorUnpositioned, cursor.last(std.testing.allocator));
     try std.testing.expectError(error.CursorUnpositioned, cursor.seek(std.testing.allocator, "alpha"));
     try std.testing.expectError(error.CursorUnpositioned, cursor.next(std.testing.allocator));
+    try std.testing.expectError(error.CursorUnpositioned, cursor.prev(std.testing.allocator));
+}
+
+test "cursor last and prev support reverse traversal and reset semantics" {
+    const page_size = test_page_size;
+    var root_page_bytes = [_]u8{0} ** page_size;
+    _ = try page.LeafPage.encodeInto(root_page_bytes[0..], .{
+        .page_id = 2,
+        .page_type = .leaf,
+        .count = 0,
+        .order = 0,
+    }, &.{
+        .{ .key = "alpha", .value = "one", .flags = 0 },
+        .{ .key = "gamma", .value = "three", .flags = 1 },
+        .{ .key = "omega", .value = "last", .flags = 2 },
+    });
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const db = try openTestDb(tmp, "cursor-last-prev.db", page_size, 2, &.{root_page_bytes[0..]});
+    defer db.close();
+
+    var read_tx = try db.beginRead();
+    defer read_tx.deinit();
+    var cursor = read_tx.cursor();
+    defer cursor.deinit();
+
+    var last = (try cursor.last(std.testing.allocator)).?;
+    defer last.deinit(std.testing.allocator);
+    try expectCursorRecord(last, "omega", "last", 2);
+
+    var middle = (try cursor.prev(std.testing.allocator)).?;
+    defer middle.deinit(std.testing.allocator);
+    try expectCursorRecord(middle, "gamma", "three", 1);
+
+    var first = (try cursor.prev(std.testing.allocator)).?;
+    defer first.deinit(std.testing.allocator);
+    try expectCursorRecord(first, "alpha", "one", 0);
+
+    try std.testing.expect((try cursor.prev(std.testing.allocator)) == null);
+
+    var reset = (try cursor.last(std.testing.allocator)).?;
+    defer reset.deinit(std.testing.allocator);
+    try expectCursorRecord(reset, "omega", "last", 2);
 }
 
 test "cursor seek supports exact gap and reset semantics" {
@@ -2108,6 +2241,41 @@ test "cursor next traverses a multi-level tree" {
         count += 1;
     }
     try std.testing.expectEqual(@as(usize, 261), count);
+}
+
+test "cursor prev traverses a multi-level tree in reverse order" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const db = try openEmptyDb(tmp, "cursor-prev-multi-level.db");
+    defer db.close();
+
+    var value_buf = [_]u8{'x'} ** 160;
+    var index: usize = 0;
+    while (index < 261) : (index += 1) {
+        var key_buf: [5]u8 = undefined;
+        const key = try generatedKey(&key_buf, index);
+        try db.put(key, value_buf[0..]);
+    }
+
+    var read_tx = try db.beginRead();
+    defer read_tx.deinit();
+    var cursor = read_tx.cursor();
+    defer cursor.deinit();
+
+    var seen: usize = 261;
+    while (try (if (seen == 261) cursor.last(std.testing.allocator) else cursor.prev(std.testing.allocator))) |record| {
+        defer {
+            var owned = record;
+            owned.deinit(std.testing.allocator);
+        }
+
+        seen -= 1;
+        var expected_key_buf: [5]u8 = undefined;
+        const expected_key = try generatedKey(&expected_key_buf, seen);
+        try expectCursorRecord(record, expected_key, value_buf[0..], 0);
+    }
+    try std.testing.expectEqual(@as(usize, 0), seen);
 }
 
 test "cursor snapshot remains stable after a later write commit" {
