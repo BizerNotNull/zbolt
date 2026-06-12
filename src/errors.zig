@@ -31,6 +31,7 @@ pub const PageLayoutError = error{
 pub const DbOpenError = error{
     InvalidDatabaseFile,
     DatabaseFileTooSmall,
+    DatabaseLocked,
 };
 
 pub const CompactError = error{
