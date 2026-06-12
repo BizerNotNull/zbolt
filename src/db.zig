@@ -90,6 +90,22 @@ pub const DB = struct {
         return read_tx.bucketNamesAlloc(allocator);
     }
 
+    /// Returns owned records whose keys fall within `[start_inclusive, end_exclusive)`.
+    pub fn scanAlloc(self: *DB, allocator: std.mem.Allocator, bounds: tx.ScanBounds) !tx.ScanRecords {
+        var read_tx = try self.beginRead();
+        defer read_tx.deinit();
+
+        return read_tx.scanAlloc(allocator, bounds);
+    }
+
+    /// Returns owned records from `bucket` whose keys fall within `[start_inclusive, end_exclusive)`.
+    pub fn scanInBucketAlloc(self: *DB, allocator: std.mem.Allocator, bucket: []const u8, bounds: tx.ScanBounds) !tx.ScanRecords {
+        var read_tx = try self.beginRead();
+        defer read_tx.deinit();
+
+        return read_tx.scanInBucketAlloc(allocator, bucket, bounds);
+    }
+
     /// Opens a read-only view over the currently committed root.
     pub fn beginRead(self: *DB) !tx.ReadTx {
         const snapshot = tree.ReadSnapshot{
@@ -873,6 +889,17 @@ fn expectBucketNames(names: namespace.BucketNames, expected: []const []const u8)
 fn expectCursorRecord(record: tree.CursorRecord, expected_key: []const u8, expected_value: []const u8) !void {
     try std.testing.expectEqualSlices(u8, expected_key, record.key);
     try std.testing.expectEqualSlices(u8, expected_value, record.value);
+}
+
+fn expectScanRecords(records: tx.ScanRecords, expected: []const struct { key: []const u8, value: []const u8 }) !void {
+    var owned_records = records;
+    defer owned_records.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(expected.len, owned_records.items.len);
+    for (expected, owned_records.items) |expected_record, actual_record| {
+        try std.testing.expectEqualSlices(u8, expected_record.key, actual_record.key);
+        try std.testing.expectEqualSlices(u8, expected_record.value, actual_record.value);
+    }
 }
 
 fn expectReadTxValue(read_tx: tx.ReadTx, key: []const u8, expected: []const u8) !void {
@@ -3817,4 +3844,140 @@ test "bucket cursor keeps the removed bucket visible to older snapshots" {
 
     try std.testing.expect((try cursor.next(std.testing.allocator)) == null);
     try std.testing.expectError(error.BucketNotFound, db.getInBucket(std.testing.allocator, "users", "alice"));
+}
+
+test "scanAlloc returns root records within inclusive start and exclusive end bounds" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path = try tempFilePath(&path_buf, tmp.dir, "scan-root-range.db");
+
+    const db = try open(std.testing.allocator, std.testing.io, path);
+    defer db.close();
+
+    try db.put("alpha", "one");
+    try db.put("beta", "two");
+    try db.put("delta", "four");
+    try db.put("gamma", "three");
+
+    try expectScanRecords(
+        try db.scanAlloc(std.testing.allocator, .{
+            .start_inclusive = "beta",
+            .end_exclusive = "gamma",
+        }),
+        &.{
+            .{ .key = "beta", .value = "two" },
+            .{ .key = "delta", .value = "four" },
+        },
+    );
+
+    try expectScanRecords(
+        try db.scanAlloc(std.testing.allocator, .{
+            .start_inclusive = "carrot",
+            .end_exclusive = "delta",
+        }),
+        &.{},
+    );
+}
+
+test "scanAlloc treats equal or reversed bounds as an empty range" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path = try tempFilePath(&path_buf, tmp.dir, "scan-root-empty-range.db");
+
+    const db = try open(std.testing.allocator, std.testing.io, path);
+    defer db.close();
+
+    try db.put("alpha", "one");
+    try db.put("beta", "two");
+
+    try expectScanRecords(
+        try db.scanAlloc(std.testing.allocator, .{
+            .start_inclusive = "beta",
+            .end_exclusive = "beta",
+        }),
+        &.{},
+    );
+
+    try expectScanRecords(
+        try db.scanAlloc(std.testing.allocator, .{
+            .start_inclusive = "gamma",
+            .end_exclusive = "beta",
+        }),
+        &.{},
+    );
+}
+
+test "scanInBucketAlloc reuses the same bounds semantics inside bucket roots" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path = try tempFilePath(&path_buf, tmp.dir, "scan-bucket-range.db");
+
+    const db = try open(std.testing.allocator, std.testing.io, path);
+    defer db.close();
+
+    try db.createBucket("users");
+    try db.putInBucket("users", "alpha", "one");
+    try db.putInBucket("users", "beta", "two");
+    try db.putInBucket("users", "gamma", "three");
+
+    try expectScanRecords(
+        try db.scanInBucketAlloc(std.testing.allocator, "users", .{
+            .start_inclusive = "beta",
+            .end_exclusive = "omega",
+        }),
+        &.{
+            .{ .key = "beta", .value = "two" },
+            .{ .key = "gamma", .value = "three" },
+        },
+    );
+}
+
+test "scanInBucketAlloc keeps read snapshots stable after later bucket writes" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path = try tempFilePath(&path_buf, tmp.dir, "scan-bucket-snapshot.db");
+
+    const db = try open(std.testing.allocator, std.testing.io, path);
+    defer db.close();
+
+    try db.createBucket("users");
+    try db.putInBucket("users", "alice", "one");
+    try db.putInBucket("users", "carol", "three");
+
+    var read_tx = try db.beginRead();
+    defer read_tx.deinit();
+
+    try db.putInBucket("users", "bob", "two");
+    try db.putInBucket("users", "carol", "updated");
+
+    try expectScanRecords(
+        try read_tx.scanInBucketAlloc(std.testing.allocator, "users", .{
+            .start_inclusive = "alice",
+            .end_exclusive = "d",
+        }),
+        &.{
+            .{ .key = "alice", .value = "one" },
+            .{ .key = "carol", .value = "three" },
+        },
+    );
+
+    try expectScanRecords(
+        try db.scanInBucketAlloc(std.testing.allocator, "users", .{
+            .start_inclusive = "alice",
+            .end_exclusive = "d",
+        }),
+        &.{
+            .{ .key = "alice", .value = "one" },
+            .{ .key = "bob", .value = "two" },
+            .{ .key = "carol", .value = "updated" },
+        },
+    );
 }

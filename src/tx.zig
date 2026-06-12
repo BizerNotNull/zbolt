@@ -15,6 +15,23 @@ pub const WriteTxError = error{
     NoPendingWrite,
 };
 
+pub const ScanBounds = struct {
+    start_inclusive: ?[]const u8 = null,
+    end_exclusive: ?[]const u8 = null,
+};
+
+pub const ScanRecords = struct {
+    items: []tree.CursorRecord,
+
+    pub fn deinit(self: *ScanRecords, allocator: std.mem.Allocator) void {
+        const owned_items = self.items;
+        self.items = &.{};
+
+        for (owned_items) |*record| record.deinit(allocator);
+        if (owned_items.len > 0) allocator.free(owned_items);
+    }
+};
+
 pub const ReadTx = struct {
     db: ?*db_mod.DB,
     snapshot: tree.ReadSnapshot,
@@ -63,6 +80,12 @@ pub const ReadTx = struct {
         return collectBucketNamesAlloc(&bucket_cursor, allocator);
     }
 
+    /// Returns owned records whose keys fall within `[start_inclusive, end_exclusive)`.
+    pub fn scanAlloc(self: *const ReadTx, allocator: std.mem.Allocator, bounds: ScanBounds) !ScanRecords {
+        std.debug.assert(self.db != null);
+        return self.scanRangeAtRootAlloc(allocator, self.snapshot.root_page_id, bounds);
+    }
+
     fn bucketRootPageId(self: *const ReadTx, allocator: std.mem.Allocator, bucket: []const u8) !u64 {
         const entry = try tree.lookupEntrySnapshotSource(&self.snapshot_source, allocator, bucket);
         return try bucketRootPageIdFromLookup(allocator, entry);
@@ -89,6 +112,29 @@ pub const ReadTx = struct {
             self.db.?.allocator,
             bucket_root_page_id,
         );
+    }
+
+    /// Returns owned records from `bucket` whose keys fall within `[start_inclusive, end_exclusive)`.
+    pub fn scanInBucketAlloc(self: *const ReadTx, allocator: std.mem.Allocator, bucket: []const u8, bounds: ScanBounds) !ScanRecords {
+        std.debug.assert(self.db != null);
+        const bucket_root_page_id = try self.bucketRootPageId(self.db.?.allocator, bucket);
+        return self.scanRangeAtRootAlloc(allocator, bucket_root_page_id, bounds);
+    }
+
+    fn scanRangeAtRootAlloc(self: *const ReadTx, allocator: std.mem.Allocator, root_page_id: u64, bounds: ScanBounds) !ScanRecords {
+        if (rangeIsKnownEmpty(bounds)) {
+            return .{ .items = &.{} };
+        }
+
+        var range_cursor = tree.Cursor.init(
+            &self.snapshot_source,
+            &self.db,
+            self.db.?.allocator,
+            root_page_id,
+        );
+        defer range_cursor.deinit();
+
+        return collectScanRangeAlloc(&range_cursor, allocator, bounds);
     }
 };
 
@@ -539,6 +585,45 @@ fn collectBucketNamesAlloc(cursor: *tree.Cursor, allocator: std.mem.Allocator) !
     return .{
         .items = try names.toOwnedSlice(allocator),
     };
+}
+
+fn collectScanRangeAlloc(cursor: *tree.Cursor, allocator: std.mem.Allocator, bounds: ScanBounds) !ScanRecords {
+    var records = std.ArrayList(tree.CursorRecord).empty;
+    errdefer {
+        for (records.items) |*record| record.deinit(allocator);
+        records.deinit(allocator);
+    }
+
+    var next_record = if (bounds.start_inclusive) |start|
+        try cursor.seek(allocator, start)
+    else
+        try cursor.first(allocator);
+
+    while (next_record) |record| {
+        var owned_record = record;
+        if (!recordFallsWithinBounds(owned_record, bounds)) {
+            owned_record.deinit(allocator);
+            break;
+        }
+
+        try records.append(allocator, owned_record);
+        next_record = try cursor.next(allocator);
+    }
+
+    return .{
+        .items = try records.toOwnedSlice(allocator),
+    };
+}
+
+fn rangeIsKnownEmpty(bounds: ScanBounds) bool {
+    const start = bounds.start_inclusive orelse return false;
+    const end = bounds.end_exclusive orelse return false;
+    return std.mem.order(u8, start, end) != .lt;
+}
+
+fn recordFallsWithinBounds(record: tree.CursorRecord, bounds: ScanBounds) bool {
+    const end = bounds.end_exclusive orelse return true;
+    return std.mem.order(u8, record.key, end) == .lt;
 }
 
 fn collectCommittedTreePagesAlloc(page_reader: tree.PageReader, allocator: std.mem.Allocator, root_page_id: u64) ![]reclaim.ReleasedPage {
