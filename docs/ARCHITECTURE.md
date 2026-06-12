@@ -213,11 +213,12 @@ When a write transaction modifies a key, it does not overwrite the original leaf
 So a single write affects only the dirty path from the root to the target leaf, not the entire tree.
 
 The current implementation round covers the `put`, `delete`, read-cursor,
-and explicit `compact` paths, while still limiting reclaim sources to tree
-page replacement:
+and explicit `compact` paths. Reclaim currently covers the page objects
+that are replaced by normal commits:
 
 - old pages from the rewritten tree path are tracked for reclaim
-- non-tree reclaim sources are still out of scope for this slice
+- the previous allocator state page is tracked for reclaim after the new
+  allocator state page and meta page commit successfully
 
 ## 5. Transaction Model
 
@@ -338,14 +339,19 @@ writer's `base_txid` direction:
 - an item becomes safe only after the oldest active reader has advanced
   past that `base_txid`
 
-This first version keeps pending reclaim in memory only:
+The current allocator state format persists pending reclaim:
 
-- the committed allocator state page does not persist pending reclaim
-- if the process restarts before a pending item is reused, those pages
-  conservatively leak until an explicit `compact` run or a later format
-  upgrade path exists
-- committed data remains correct because restart recovery still trusts
-  only the latest valid meta page and allocator state page
+- v1 allocator state pages are still readable as legacy free-list-only state
+- new commits write v2 allocator state pages with both free blocks and
+  pending-reclaim records
+- each pending record stores the page ID, `order`, and highest snapshot
+  `txid` that may still see the old page object
+- when a database is reopened, there are no active read transactions from
+  the previous process, so restored pending records are released into the
+  in-memory buddy allocator before the next write transaction
+- the release result is written back on the next successful commit; if the
+  process exits before then, the pending records can be restored and safely
+  released again on the next open
 
 ### 6.3 `pending free page` and the Shrink Strategy
 
@@ -375,7 +381,7 @@ The current first implementation narrows that path deliberately:
 - `compact` requires no active read or write transactions
 - it rewrites only tree pages referenced by the latest committed snapshot
 - it emits identical `meta0/meta1` pages with the same logical `txid`
-- it clears in-memory pending reclaim by replacing the file with the compacted layout
+- it clears persisted pending reclaim by replacing the file with the compacted layout
 
 Therefore:
 
@@ -536,8 +542,9 @@ The following module responsibilities are planned to emerge incrementally:
   - advancing the reclaimable boundary according to the oldest active read transaction
   - returning old pages to `allocator` at a safe time
 
-At the current stage, `reclaim` is implemented only for old tree pages
-released by `put`-path page replacement.
+At the current stage, `reclaim` is implemented for old tree pages released
+by write-path replacement and for allocator state pages replaced by a
+successful commit.
 - `compact`
   - explicit database-file compaction
   - rewriting data based on the latest snapshot

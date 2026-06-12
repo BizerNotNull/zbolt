@@ -23,6 +23,7 @@ const RecoverableSnapshot = struct {
     slot: meta.MetaSlot,
     meta: meta.Meta,
     page_allocator: allocator_mod.PageAllocator,
+    reclaim_state: reclaim.State,
 };
 
 pub const DB = struct {
@@ -219,19 +220,23 @@ pub fn open(allocator: std.mem.Allocator, path: []const u8) !*DB {
     return db;
 }
 
-pub fn materializeAllocatorStatePage(db: *DB, baseline_page_allocator: allocator_mod.PageAllocator) !MaterializedAllocatorState {
+pub fn materializeAllocatorStatePage(
+    db: *DB,
+    baseline_page_allocator: allocator_mod.PageAllocator,
+    pending_records: []const page.AllocatorStateRecord,
+) !MaterializedAllocatorState {
     var baseline = baseline_page_allocator;
     errdefer baseline.deinit(db.allocator);
 
-    var desired_order = try baseline.allocatorStateOrder(db.page_size);
+    var desired_order = try baseline.allocatorStateOrder(db.page_size, pending_records.len);
     while (true) {
         var candidate = try baseline.clone(db.allocator);
         errdefer candidate.deinit(db.allocator);
 
         const page_id = try candidate.allocate(db.allocator, desired_order);
-        const required_order = try candidate.allocatorStateOrder(db.page_size);
+        const required_order = try candidate.allocatorStateOrder(db.page_size, pending_records.len);
         if (required_order <= desired_order) {
-            const state_page = try candidate.encodeStatePageAlloc(db.allocator, db.page_size, page_id, desired_order);
+            const state_page = try candidate.encodeStatePageAlloc(db.allocator, db.page_size, page_id, desired_order, pending_records);
             errdefer db.allocator.free(state_page);
 
             baseline.deinit(db.allocator);
@@ -249,6 +254,29 @@ pub fn materializeAllocatorStatePage(db: *DB, baseline_page_allocator: allocator
         candidate = movedPageAllocator(db.allocator);
         desired_order = required_order;
     }
+}
+
+pub fn currentAllocatorRootRelease(db: *DB) !?reclaim.ReleasedPage {
+    if (db.allocator_root == 0) return null;
+
+    const allocator_page = try readAllocatorStatePageObjectAlloc(
+        db.allocator,
+        &db.file,
+        db.io_threaded.io(),
+        db.allocator_root,
+        db.page_size,
+        db.high_water_mark,
+    );
+    defer db.allocator.free(allocator_page);
+
+    const header = try page.decodeHeader(allocator_page);
+    if (header.page_id != db.allocator_root) return error.InvalidAllocatorState;
+    if (header.page_type != .allocator) return error.InvalidAllocatorState;
+
+    return .{
+        .page_id = db.allocator_root,
+        .order = header.order,
+    };
 }
 
 pub fn applyCommittedState(
@@ -288,6 +316,7 @@ pub fn reloadCommittedStateFromOpenFile(db: *DB) !void {
         else => return err,
     };
     errdefer selected.page_allocator.deinit(db.allocator);
+    errdefer selected.reclaim_state.deinit(db.allocator);
 
     db.meta_slot = selected.slot;
     db.page_size = selected.meta.page_size;
@@ -299,7 +328,12 @@ pub fn reloadCommittedStateFromOpenFile(db: *DB) !void {
     db.page_allocator = selected.page_allocator;
     previous_page_allocator.deinit(db.allocator);
     selected.page_allocator = movedPageAllocator(db.allocator);
+    var previous_reclaim = db.reclaim;
+    db.reclaim = selected.reclaim_state;
+    previous_reclaim.deinit(db.allocator);
+    selected.reclaim_state = reclaim.State.init(db.allocator);
     db.txid = selected.meta.txid;
+    try db.reclaim.releaseReusableIntoAllocator(db.allocator, &db.page_allocator);
 }
 
 fn initializeEmptyDatabase(db: *DB) !void {
@@ -409,11 +443,13 @@ fn loadNewestRecoverableSnapshot(allocator: std.mem.Allocator, file: *std.Io.Fil
     if (snapshot0.?.meta.txid >= snapshot1.?.meta.txid) {
         var older = snapshot1.?;
         older.page_allocator.deinit(allocator);
+        older.reclaim_state.deinit(allocator);
         return snapshot0.?;
     }
 
     var older = snapshot0.?;
     older.page_allocator.deinit(allocator);
+    older.reclaim_state.deinit(allocator);
     return snapshot1.?;
 }
 
@@ -426,9 +462,12 @@ fn loadRecoverableSnapshotForMeta(
 ) !RecoverableSnapshot {
     const decoded_meta = try meta.decode(meta_page);
 
-    const page_allocator = if (decoded_meta.allocator_root == 0)
-        allocator_mod.PageAllocator.init(allocator, decoded_meta.high_water_mark)
-    else blk: {
+    var page_allocator = allocator_mod.PageAllocator.init(allocator, decoded_meta.high_water_mark);
+    errdefer page_allocator.deinit(allocator);
+    var reclaim_state = reclaim.State.init(allocator);
+    errdefer reclaim_state.deinit(allocator);
+
+    if (decoded_meta.allocator_root != 0) {
         const state_page = try readAllocatorStatePageObjectAlloc(
             allocator,
             file,
@@ -438,18 +477,31 @@ fn loadRecoverableSnapshotForMeta(
             decoded_meta.high_water_mark,
         );
         defer allocator.free(state_page);
-        break :blk try allocator_mod.PageAllocator.restoreFromStatePage(
+
+        var restored_state = try allocator_mod.PageAllocator.restoreStateFromPage(
             allocator,
             state_page,
             decoded_meta.high_water_mark,
             decoded_meta.allocator_root,
         );
-    };
+        defer restored_state.deinit(allocator);
+
+        for (restored_state.pending_records) |pending_record| {
+            if (pending_record.visible_through_txid > decoded_meta.txid) return error.InvalidAllocatorState;
+        }
+
+        page_allocator.deinit(allocator);
+        page_allocator = restored_state.takePageAllocator(allocator);
+
+        reclaim_state.deinit(allocator);
+        reclaim_state = try reclaim.State.initFromStateRecords(allocator, restored_state.pending_records);
+    }
 
     return .{
         .slot = slot,
         .meta = decoded_meta,
         .page_allocator = page_allocator,
+        .reclaim_state = reclaim_state,
     };
 }
 
@@ -1401,7 +1453,7 @@ test "reopen selects inactive meta after data and allocator pages are durable" {
         const baseline_page_allocator = working_page_allocator;
         working_page_allocator = movedPageAllocator(std.testing.allocator);
 
-        var allocator_state = try materializeAllocatorStatePage(db, baseline_page_allocator);
+        var allocator_state = try materializeAllocatorStatePage(db, baseline_page_allocator, &.{});
         defer std.testing.allocator.free(allocator_state.bytes);
         defer allocator_state.page_allocator.deinit(std.testing.allocator);
 
@@ -2201,6 +2253,58 @@ test "open restores older snapshot when newer allocator state is corrupt" {
     try std.testing.expect(value == null);
 }
 
+test "open restores older snapshot when newer allocator pending txid is impossible" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path = try tempFilePath(&path_buf, tmp.dir, "allocator-state-pending-txid-fallback.db");
+
+    {
+        const db = try open(std.testing.allocator, path);
+        defer db.close();
+        try db.put("old", "one");
+        try db.put("new", "two");
+
+        const newest_allocator_root = db.allocator_root;
+        const io = db.io_threaded.io();
+        const allocator_state = try readAllocatorStatePageObjectAlloc(
+            std.testing.allocator,
+            &db.file,
+            io,
+            newest_allocator_root,
+            db.page_size,
+            db.high_water_mark,
+        );
+        defer std.testing.allocator.free(allocator_state);
+        const header = try page.decodeHeader(allocator_state);
+
+        const invalid_state = try std.testing.allocator.alloc(u8, allocator_state.len);
+        defer std.testing.allocator.free(invalid_state);
+        _ = try page.AllocatorStatePage.encodeInto(invalid_state, .{
+            .page_id = newest_allocator_root,
+            .page_type = .allocator,
+            .count = 0,
+            .order = header.order,
+        }, &.{.{
+            .kind = .pending,
+            .page_id = 3,
+            .order = 0,
+            .visible_through_txid = db.txid + 1,
+        }});
+        try storage.writePageObject(&db.file, io, db.page_size, newest_allocator_root, invalid_state);
+    }
+
+    const reopened = try open(std.testing.allocator, path);
+    defer reopened.close();
+
+    try std.testing.expectEqual(@as(u64, 1), reopened.txid);
+    try expectDbValue(reopened, "old", "one");
+    const value = try reopened.get(std.testing.allocator, "new");
+    defer if (value) |owned| std.testing.allocator.free(owned);
+    try std.testing.expect(value == null);
+}
+
 test "open ignores allocator state page that is not referenced by meta" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -2216,7 +2320,7 @@ test "open ignores allocator state page that is not referenced by meta" {
         var candidate = try db.page_allocator.clone(db.allocator);
         defer candidate.deinit(db.allocator);
         const unreferenced_root = try candidate.allocate(db.allocator, 0);
-        const state_page = try candidate.encodeStatePageAlloc(std.testing.allocator, db.page_size, unreferenced_root, 0);
+        const state_page = try candidate.encodeStatePageAlloc(std.testing.allocator, db.page_size, unreferenced_root, 0, &.{});
         defer std.testing.allocator.free(state_page);
         try storage.writePageObject(&db.file, db.io_threaded.io(), db.page_size, unreferenced_root, state_page);
     }
@@ -2797,7 +2901,7 @@ test "write transaction does not reclaim superseded staged pages as committed pa
 
     try write_tx.commit();
     try std.testing.expectEqual(@as(usize, 1), db.reclaim.pending.items.len);
-    try std.testing.expectEqual(@as(usize, 1), db.reclaim.pending.items[0].pages.len);
+    try std.testing.expectEqual(@as(usize, 2), db.reclaim.pending.items[0].pages.len);
     try expectDbValue(db, "alpha", "two");
 }
 
@@ -2926,10 +3030,11 @@ test "reclaim reuses released pages on the next write when no readers block reus
 
     try std.testing.expectEqual(@as(usize, 1), db.reclaim.pending.items.len);
     try std.testing.expect(!db.page_allocator.containsFreeBlock(3, 0));
+    const high_water_mark_before_reuse = db.high_water_mark;
 
     try db.put("alpha", "three");
 
-    try std.testing.expectEqual(@as(u64, 3), db.root_page_id);
+    try std.testing.expectEqual(high_water_mark_before_reuse, db.high_water_mark);
     try expectDbValue(db, "alpha", "three");
 }
 
@@ -2975,25 +3080,28 @@ test "reclaim reuses released pages after the blocking read transaction ends" {
 
     try std.testing.expectEqual(@as(usize, 1), db.reclaim.pending.items.len);
     read_tx.deinit();
+    const high_water_mark_before_reuse = db.high_water_mark;
 
     try db.put("alpha", "three");
 
-    try std.testing.expectEqual(@as(u64, 3), db.root_page_id);
+    try std.testing.expectEqual(high_water_mark_before_reuse, db.high_water_mark);
     try expectDbValue(db, "alpha", "three");
 }
 
-test "reopen drops in-memory pending reclaim without damaging committed data" {
+test "reopen restores and safely releases persisted pending reclaim" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
-    const path = try tempFilePath(&path_buf, tmp.dir, "reclaim-pending-lost-on-reopen.db");
+    const path = try tempFilePath(&path_buf, tmp.dir, "reclaim-pending-restored-on-reopen.db");
+    var released_allocator_root: reclaim.ReleasedPage = undefined;
 
     {
         const db = try open(std.testing.allocator, path);
         defer db.close();
 
         try db.put("alpha", "one");
+        released_allocator_root = (try currentAllocatorRootRelease(db)).?;
         try db.put("alpha", "two");
 
         try std.testing.expectEqual(@as(usize, 1), db.reclaim.pending.items.len);
@@ -3004,11 +3112,13 @@ test "reopen drops in-memory pending reclaim without damaging committed data" {
     defer reopened.close();
 
     try std.testing.expectEqual(@as(usize, 0), reopened.reclaim.pending.items.len);
-    try std.testing.expect(!reopened.page_allocator.containsFreeBlock(3, 0));
+    try std.testing.expect(reopened.page_allocator.containsFreeBlock(3, 0));
+    try std.testing.expect(reopened.page_allocator.containsFreeBlock(released_allocator_root.page_id, released_allocator_root.order));
     try expectDbValue(reopened, "alpha", "two");
+    const high_water_mark_before_reuse = reopened.high_water_mark;
 
     try reopened.put("alpha", "three");
-    try std.testing.expect(reopened.root_page_id != 3);
+    try std.testing.expectEqual(high_water_mark_before_reuse, reopened.high_water_mark);
     try expectDbValue(reopened, "alpha", "three");
 }
 

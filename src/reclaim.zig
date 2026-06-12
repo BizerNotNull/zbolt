@@ -1,5 +1,6 @@
 const std = @import("std");
 const allocator_mod = @import("allocator.zig");
+const page = @import("page.zig");
 
 pub const ReleasedPage = struct {
     page_id: u64,
@@ -90,6 +91,67 @@ pub const State = struct {
         });
     }
 
+    pub fn initFromStateRecords(allocator: std.mem.Allocator, records: []const page.AllocatorStateRecord) !State {
+        var state = State.init(allocator);
+        errdefer state.deinit(allocator);
+
+        var sorted_records = try allocator.dupe(page.AllocatorStateRecord, records);
+        defer allocator.free(sorted_records);
+        std.sort.pdq(page.AllocatorStateRecord, sorted_records, {}, stateRecordLessThan);
+
+        try state.pending.ensureTotalCapacity(allocator, sorted_records.len);
+        var start: usize = 0;
+        while (start < sorted_records.len) {
+            const visible_through_txid = sorted_records[start].visible_through_txid;
+            var end = start + 1;
+            while (end < sorted_records.len and sorted_records[end].visible_through_txid == visible_through_txid) : (end += 1) {}
+
+            const pages = try allocator.alloc(ReleasedPage, end - start);
+            for (sorted_records[start..end], 0..) |record, index| {
+                std.debug.assert(record.kind == .pending);
+                pages[index] = .{
+                    .page_id = record.page_id,
+                    .order = record.order,
+                };
+            }
+            state.pending.appendAssumeCapacity(.{
+                .visible_through_txid = visible_through_txid,
+                .pages = pages,
+            });
+
+            start = end;
+        }
+
+        return state;
+    }
+
+    fn stateRecordLessThan(_: void, lhs: page.AllocatorStateRecord, rhs: page.AllocatorStateRecord) bool {
+        if (lhs.visible_through_txid != rhs.visible_through_txid) {
+            return lhs.visible_through_txid < rhs.visible_through_txid;
+        }
+        if (lhs.page_id != rhs.page_id) {
+            return lhs.page_id < rhs.page_id;
+        }
+        return lhs.order < rhs.order;
+    }
+
+    pub fn appendStateRecords(
+        self: *const State,
+        allocator: std.mem.Allocator,
+        records: *std.ArrayList(page.AllocatorStateRecord),
+    ) !void {
+        for (self.pending.items) |pending_release| {
+            for (pending_release.pages) |released_page| {
+                try records.append(allocator, .{
+                    .kind = .pending,
+                    .page_id = released_page.page_id,
+                    .order = released_page.order,
+                    .visible_through_txid = pending_release.visible_through_txid,
+                });
+            }
+        }
+    }
+
     pub fn releaseReusableIntoAllocator(
         self: *State,
         backing_allocator: std.mem.Allocator,
@@ -116,3 +178,20 @@ pub const State = struct {
         }
     }
 };
+
+// ======tests======
+
+test "reclaim state groups restored records by visible txid" {
+    var state = try State.initFromStateRecords(std.testing.allocator, &.{
+        .{ .kind = .pending, .page_id = 8, .order = 0, .visible_through_txid = 2 },
+        .{ .kind = .pending, .page_id = 4, .order = 0, .visible_through_txid = 1 },
+        .{ .kind = .pending, .page_id = 5, .order = 0, .visible_through_txid = 1 },
+    });
+    defer state.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 2), state.pending.items.len);
+    try std.testing.expectEqual(@as(u64, 1), state.pending.items[0].visible_through_txid);
+    try std.testing.expectEqual(@as(usize, 2), state.pending.items[0].pages.len);
+    try std.testing.expectEqual(@as(u64, 2), state.pending.items[1].visible_through_txid);
+    try std.testing.expectEqual(@as(usize, 1), state.pending.items[1].pages.len);
+}

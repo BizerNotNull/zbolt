@@ -50,6 +50,9 @@ pub const BranchEntryView = branch.EntryView;
 pub const BranchPage = branch.BranchPage;
 pub const AllocatorEntry = allocator.Entry;
 pub const AllocatorPage = allocator.AllocatorPage;
+pub const AllocatorStateRecordKind = allocator.StateRecordKind;
+pub const AllocatorStateRecord = allocator.StateRecord;
+pub const AllocatorStatePage = allocator.AllocatorStatePage;
 
 pub fn encodeHeader(page_bytes: []u8, header: Header) Error!void {
     if (page_bytes.len < header_size) return error.PageTooSmall;
