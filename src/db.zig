@@ -68,26 +68,61 @@ pub const DB = struct {
 
     /// Returns an owned copy of the value stored in `bucket` for `key`.
     pub fn getInBucket(self: *DB, allocator: std.mem.Allocator, bucket: []const u8, key: []const u8) !?[]u8 {
+        const bucket_path = [_][]const u8{bucket};
+        return self.getInBucketPath(allocator, bucket_path[0..], key);
+    }
+
+    /// Returns an owned copy of the value stored in the bucket at
+    /// `bucket_path` for `key`.
+    pub fn getInBucketPath(
+        self: *DB,
+        allocator: std.mem.Allocator,
+        bucket_path: []const []const u8,
+        key: []const u8,
+    ) !?[]u8 {
         var read_tx = try self.beginRead();
         defer read_tx.deinit();
 
-        return read_tx.getInBucket(allocator, bucket, key);
+        return read_tx.getInBucketPath(allocator, bucket_path, key);
     }
 
     /// Returns whether `bucket` exists in the latest committed snapshot.
     pub fn bucketExists(self: *DB, allocator: std.mem.Allocator, bucket: []const u8) !bool {
+        const parent_bucket_path: [0][]const u8 = .{};
+        return self.bucketExistsInBucketPath(allocator, parent_bucket_path[0..], bucket);
+    }
+
+    /// Returns whether `bucket` exists inside the bucket at
+    /// `parent_bucket_path` in the latest committed snapshot.
+    pub fn bucketExistsInBucketPath(
+        self: *DB,
+        allocator: std.mem.Allocator,
+        parent_bucket_path: []const []const u8,
+        bucket: []const u8,
+    ) !bool {
         var read_tx = try self.beginRead();
         defer read_tx.deinit();
 
-        return read_tx.bucketExists(allocator, bucket);
+        return read_tx.bucketExistsInBucketPath(allocator, parent_bucket_path, bucket);
     }
 
     /// Returns the top-level bucket names in key order.
     pub fn bucketNamesAlloc(self: *DB, allocator: std.mem.Allocator) !namespace.BucketNames {
+        const parent_bucket_path: [0][]const u8 = .{};
+        return self.bucketNamesInBucketPathAlloc(allocator, parent_bucket_path[0..]);
+    }
+
+    /// Returns the direct child bucket names inside the bucket at
+    /// `parent_bucket_path` in key order.
+    pub fn bucketNamesInBucketPathAlloc(
+        self: *DB,
+        allocator: std.mem.Allocator,
+        parent_bucket_path: []const []const u8,
+    ) !namespace.BucketNames {
         var read_tx = try self.beginRead();
         defer read_tx.deinit();
 
-        return read_tx.bucketNamesAlloc(allocator);
+        return read_tx.bucketNamesInBucketPathAlloc(allocator, parent_bucket_path);
     }
 
     /// Returns owned records whose keys fall within `[start_inclusive, end_exclusive)`.
@@ -100,10 +135,22 @@ pub const DB = struct {
 
     /// Returns owned records from `bucket` whose keys fall within `[start_inclusive, end_exclusive)`.
     pub fn scanInBucketAlloc(self: *DB, allocator: std.mem.Allocator, bucket: []const u8, bounds: tx.ScanBounds) !tx.ScanRecords {
+        const bucket_path = [_][]const u8{bucket};
+        return self.scanInBucketPathAlloc(allocator, bucket_path[0..], bounds);
+    }
+
+    /// Returns owned records from the bucket at `bucket_path` whose keys fall
+    /// within `[start_inclusive, end_exclusive)`.
+    pub fn scanInBucketPathAlloc(
+        self: *DB,
+        allocator: std.mem.Allocator,
+        bucket_path: []const []const u8,
+        bounds: tx.ScanBounds,
+    ) !tx.ScanRecords {
         var read_tx = try self.beginRead();
         defer read_tx.deinit();
 
-        return read_tx.scanInBucketAlloc(allocator, bucket, bounds);
+        return read_tx.scanInBucketPathAlloc(allocator, bucket_path, bounds);
     }
 
     /// Opens a cursor over the latest committed root snapshot and owns its read transaction.
@@ -113,7 +160,14 @@ pub const DB = struct {
 
     /// Opens a cursor over the latest committed snapshot root of `bucket`.
     pub fn cursorInBucket(self: *DB, bucket: []const u8) !tx.ManagedCursor {
-        return try tx.ManagedCursor.initInBucket(self, bucket);
+        const bucket_path = [_][]const u8{bucket};
+        return self.cursorInBucketPath(bucket_path[0..]);
+    }
+
+    /// Opens a cursor over the latest committed snapshot root of the bucket at
+    /// `bucket_path`.
+    pub fn cursorInBucketPath(self: *DB, bucket_path: []const []const u8) !tx.ManagedCursor {
+        return try tx.ManagedCursor.initInBucketPath(self, bucket_path);
     }
 
     /// Opens a read-only view over the currently committed root.
@@ -149,16 +203,26 @@ pub const DB = struct {
     }
 
     pub fn createBucket(self: *DB, bucket: []const u8) !void {
+        const parent_bucket_path: [0][]const u8 = .{};
+        return self.createBucketInBucketPath(parent_bucket_path[0..], bucket);
+    }
+
+    pub fn createBucketInBucketPath(self: *DB, parent_bucket_path: []const []const u8, bucket: []const u8) !void {
         var write_tx = try self.beginWrite();
         defer write_tx.deinit();
-        try write_tx.createBucket(bucket);
+        try write_tx.createBucketInBucketPath(parent_bucket_path, bucket);
         try write_tx.commit();
     }
 
     pub fn putInBucket(self: *DB, bucket: []const u8, key: []const u8, value: []const u8) !void {
+        const bucket_path = [_][]const u8{bucket};
+        return self.putInBucketPath(bucket_path[0..], key, value);
+    }
+
+    pub fn putInBucketPath(self: *DB, bucket_path: []const []const u8, key: []const u8, value: []const u8) !void {
         var write_tx = try self.beginWrite();
         defer write_tx.deinit();
-        try write_tx.putInBucket(bucket, key, value);
+        try write_tx.putInBucketPath(bucket_path, key, value);
         try write_tx.commit();
     }
 
@@ -173,18 +237,28 @@ pub const DB = struct {
     }
 
     pub fn deleteInBucket(self: *DB, bucket: []const u8, key: []const u8) !void {
+        const bucket_path = [_][]const u8{bucket};
+        return self.deleteInBucketPath(bucket_path[0..], key);
+    }
+
+    pub fn deleteInBucketPath(self: *DB, bucket_path: []const []const u8, key: []const u8) !void {
         var write_tx = try self.beginWrite();
         defer write_tx.deinit();
-        try write_tx.deleteInBucket(bucket, key);
+        try write_tx.deleteInBucketPath(bucket_path, key);
         if (write_tx.has_pending_write) {
             try write_tx.commit();
         }
     }
 
     pub fn deleteBucket(self: *DB, bucket: []const u8) !void {
+        const parent_bucket_path: [0][]const u8 = .{};
+        return self.deleteBucketInBucketPath(parent_bucket_path[0..], bucket);
+    }
+
+    pub fn deleteBucketInBucketPath(self: *DB, parent_bucket_path: []const []const u8, bucket: []const u8) !void {
         var write_tx = try self.beginWrite();
         defer write_tx.deinit();
-        try write_tx.deleteBucket(bucket);
+        try write_tx.deleteBucketInBucketPath(parent_bucket_path, bucket);
         try write_tx.commit();
     }
 
@@ -882,6 +956,19 @@ fn expectBucketValue(db: *DB, bucket: []const u8, key: []const u8, expected: []c
 
 fn expectBucketMissing(db: *DB, bucket: []const u8, key: []const u8) !void {
     const value = try db.getInBucket(std.testing.allocator, bucket, key);
+    defer if (value) |owned| std.testing.allocator.free(owned);
+    try std.testing.expect(value == null);
+}
+
+fn expectBucketPathValue(db: *DB, bucket_path: []const []const u8, key: []const u8, expected: []const u8) !void {
+    const value = (try db.getInBucketPath(std.testing.allocator, bucket_path, key)).?;
+    defer std.testing.allocator.free(value);
+
+    try std.testing.expectEqualSlices(u8, expected, value);
+}
+
+fn expectBucketPathMissing(db: *DB, bucket_path: []const []const u8, key: []const u8) !void {
+    const value = try db.getInBucketPath(std.testing.allocator, bucket_path, key);
     defer if (value) |owned| std.testing.allocator.free(owned);
     try std.testing.expect(value == null);
 }
@@ -3854,6 +3941,179 @@ test "bucket cursor keeps the removed bucket visible to older snapshots" {
 
     try std.testing.expect((try cursor.next(std.testing.allocator)) == null);
     try std.testing.expectError(error.BucketNotFound, db.getInBucket(std.testing.allocator, "users", "alice"));
+}
+
+test "nested bucket create put delete round trips across reopen" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path = try tempFilePath(&path_buf, tmp.dir, "nested-bucket-round-trip.db");
+
+    const orgs_path = [_][]const u8{"orgs"};
+    const engineering_path = [_][]const u8{ "orgs", "engineering" };
+
+    {
+        const db = try open(std.testing.allocator, std.testing.io, path);
+        defer db.close();
+
+        try db.createBucket("orgs");
+        try db.createBucketInBucketPath(orgs_path[0..], "engineering");
+        try db.putInBucketPath(engineering_path[0..], "alice", "admin");
+        try db.putInBucketPath(engineering_path[0..], "bob", "reader");
+        try expectBucketPathValue(db, engineering_path[0..], "alice", "admin");
+        try expectBucketPathValue(db, engineering_path[0..], "bob", "reader");
+    }
+
+    const reopened = try open(std.testing.allocator, std.testing.io, path);
+    defer reopened.close();
+    try expectBucketPathValue(reopened, engineering_path[0..], "alice", "admin");
+    try expectBucketPathValue(reopened, engineering_path[0..], "bob", "reader");
+
+    try reopened.deleteInBucketPath(engineering_path[0..], "alice");
+    try expectBucketPathMissing(reopened, engineering_path[0..], "alice");
+    try reopened.deleteBucketInBucketPath(orgs_path[0..], "engineering");
+    try std.testing.expectError(error.BucketNotFound, reopened.getInBucketPath(std.testing.allocator, engineering_path[0..], "bob"));
+}
+
+test "nested bucket names and existence stay scoped to the parent bucket" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path = try tempFilePath(&path_buf, tmp.dir, "nested-bucket-names.db");
+
+    const db = try open(std.testing.allocator, std.testing.io, path);
+    defer db.close();
+
+    const orgs_path = [_][]const u8{"orgs"};
+    const plain_path = [_][]const u8{ "orgs", "plain" };
+
+    try db.createBucket("orgs");
+    try db.createBucketInBucketPath(orgs_path[0..], "engineering");
+    try db.createBucketInBucketPath(orgs_path[0..], "finance");
+    try db.putInBucketPath(orgs_path[0..], "plain", "value");
+
+    try std.testing.expect(try db.bucketExistsInBucketPath(std.testing.allocator, orgs_path[0..], "engineering"));
+    try std.testing.expect(try db.bucketExistsInBucketPath(std.testing.allocator, orgs_path[0..], "finance"));
+    try std.testing.expect(!(try db.bucketExistsInBucketPath(std.testing.allocator, orgs_path[0..], "plain")));
+    try expectBucketNames(
+        try db.bucketNamesInBucketPathAlloc(std.testing.allocator, orgs_path[0..]),
+        &.{ "engineering", "finance" },
+    );
+
+    try std.testing.expectError(error.BucketNameConflict, db.createBucketInBucketPath(orgs_path[0..], "plain"));
+    try std.testing.expectError(error.KeyNotBucket, db.putInBucketPath(plain_path[0..], "alice", "admin"));
+}
+
+test "nested bucket cursors and scans keep earlier snapshots stable" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path = try tempFilePath(&path_buf, tmp.dir, "nested-bucket-snapshot.db");
+
+    const db = try open(std.testing.allocator, std.testing.io, path);
+    defer db.close();
+
+    const orgs_path = [_][]const u8{"orgs"};
+    const engineering_path = [_][]const u8{ "orgs", "engineering" };
+
+    try db.createBucket("orgs");
+    try db.createBucketInBucketPath(orgs_path[0..], "engineering");
+    try db.putInBucketPath(engineering_path[0..], "alice", "one");
+    try db.putInBucketPath(engineering_path[0..], "carol", "three");
+
+    var read_tx = try db.beginRead();
+    defer read_tx.deinit();
+    var cursor = try read_tx.cursorInBucketPath(engineering_path[0..]);
+    defer cursor.deinit();
+
+    var managed_cursor = try db.cursorInBucketPath(engineering_path[0..]);
+    defer managed_cursor.deinit();
+
+    try db.putInBucketPath(engineering_path[0..], "bob", "two");
+    try db.putInBucketPath(engineering_path[0..], "carol", "updated");
+
+    var first = (try cursor.first(std.testing.allocator)).?;
+    defer first.deinit(std.testing.allocator);
+    try expectCursorRecord(first, "alice", "one");
+
+    var second = (try cursor.next(std.testing.allocator)).?;
+    defer second.deinit(std.testing.allocator);
+    try expectCursorRecord(second, "carol", "three");
+    try std.testing.expect((try cursor.next(std.testing.allocator)) == null);
+
+    try expectScanRecords(
+        try read_tx.scanInBucketPathAlloc(std.testing.allocator, engineering_path[0..], .{
+            .start_inclusive = "alice",
+            .end_exclusive = "d",
+        }),
+        &.{
+            .{ .key = "alice", .value = "one" },
+            .{ .key = "carol", .value = "three" },
+        },
+    );
+
+    var managed_first = (try managed_cursor.first(std.testing.allocator)).?;
+    defer managed_first.deinit(std.testing.allocator);
+    try expectCursorRecord(managed_first, "alice", "one");
+    var managed_seek = (try managed_cursor.seek(std.testing.allocator, "bob")).?;
+    defer managed_seek.deinit(std.testing.allocator);
+    try expectCursorRecord(managed_seek, "carol", "three");
+
+    try expectScanRecords(
+        try db.scanInBucketPathAlloc(std.testing.allocator, engineering_path[0..], .{
+            .start_inclusive = "alice",
+            .end_exclusive = "d",
+        }),
+        &.{
+            .{ .key = "alice", .value = "one" },
+            .{ .key = "bob", .value = "two" },
+            .{ .key = "carol", .value = "updated" },
+        },
+    );
+}
+
+test "deleteBucketInBucketPath keeps removed nested bucket visible to older snapshots" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path = try tempFilePath(&path_buf, tmp.dir, "nested-bucket-delete-snapshot.db");
+
+    const db = try open(std.testing.allocator, std.testing.io, path);
+    defer db.close();
+
+    const orgs_path = [_][]const u8{"orgs"};
+    const engineering_path = [_][]const u8{ "orgs", "engineering" };
+
+    try db.createBucket("orgs");
+    try db.createBucketInBucketPath(orgs_path[0..], "engineering");
+    try db.putInBucketPath(engineering_path[0..], "alice", "one");
+    try db.putInBucketPath(engineering_path[0..], "bob", "two");
+
+    var read_tx = try db.beginRead();
+    defer read_tx.deinit();
+    try db.deleteBucketInBucketPath(orgs_path[0..], "engineering");
+
+    const alice_before = (try read_tx.getInBucketPath(std.testing.allocator, engineering_path[0..], "alice")).?;
+    defer std.testing.allocator.free(alice_before);
+    try std.testing.expectEqualSlices(u8, "one", alice_before);
+
+    var cursor = try read_tx.cursorInBucketPath(engineering_path[0..]);
+    defer cursor.deinit();
+
+    var first = (try cursor.first(std.testing.allocator)).?;
+    defer first.deinit(std.testing.allocator);
+    try expectCursorRecord(first, "alice", "one");
+
+    var second = (try cursor.next(std.testing.allocator)).?;
+    defer second.deinit(std.testing.allocator);
+    try expectCursorRecord(second, "bob", "two");
+
+    try std.testing.expect((try cursor.next(std.testing.allocator)) == null);
+    try std.testing.expectError(error.BucketNotFound, db.getInBucketPath(std.testing.allocator, engineering_path[0..], "alice"));
 }
 
 test "managed cursor traverses the latest root snapshot and releases its reader" {
