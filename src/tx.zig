@@ -17,6 +17,7 @@ pub const WriteTxError = error{
 pub const ReadTx = struct {
     db: ?*db_mod.DB,
     snapshot: tree.ReadSnapshot,
+    snapshot_source: tree.SnapshotSource,
     txid: u64,
 
     /// Releases this read view.
@@ -27,21 +28,23 @@ pub const ReadTx = struct {
     pub fn deinit(self: *ReadTx) void {
         const db = self.db orelse return;
         self.db = null;
+        self.snapshot_source.file.close(self.snapshot_source.io);
         db.reclaim.endRead(self.txid);
     }
 
     /// Returns an owned copy of the value visible to this read snapshot.
     pub fn get(self: *const ReadTx, allocator: std.mem.Allocator, key: []const u8) !?[]u8 {
         std.debug.assert(self.db != null);
-        return tree.lookupSnapshot(self.db.?, allocator, self.snapshot, key);
+        return tree.lookupSnapshotSource(&self.snapshot_source, allocator, key);
     }
 
     /// Opens a read-only cursor pinned to this transaction's snapshot.
     pub fn cursor(self: *const ReadTx) tree.Cursor {
         std.debug.assert(self.db != null);
         return .{
-            .db = self.db.?,
-            .snapshot = self.snapshot,
+            .snapshot_source = &self.snapshot_source,
+            .owner_db = &self.db,
+            .temp_allocator = self.db.?.allocator,
             .state = .unpositioned,
         };
     }

@@ -68,13 +68,20 @@ pub const DB = struct {
 
     /// Opens a read-only view over the currently committed root.
     pub fn beginRead(self: *DB) !tx.ReadTx {
+        const snapshot = tree.ReadSnapshot{
+            .root_page_id = self.root_page_id,
+            .high_water_mark = self.high_water_mark,
+        };
+        const io = self.io_threaded.io();
+        const snapshot_file = try std.Io.Dir.openFileAbsolute(io, self.path, .{
+            .mode = .read_only,
+        });
+        errdefer snapshot_file.close(io);
         try self.reclaim.beginRead(self.txid);
         return .{
             .db = self,
-            .snapshot = .{
-                .root_page_id = self.root_page_id,
-                .high_water_mark = self.high_water_mark,
-            },
+            .snapshot = snapshot,
+            .snapshot_source = tree.SnapshotSource.init(self, snapshot, snapshot_file),
             .txid = self.txid,
         };
     }
@@ -113,7 +120,6 @@ pub const DB = struct {
     /// Rewrites the latest committed snapshot into a compact replacement file.
     pub fn compact(self: *DB, allocator: std.mem.Allocator) !void {
         if (self.write_tx_active) return error.WriteTransactionActive;
-        if (self.reclaim.activeReaderCount() > 0) return error.ActiveReadersPresent;
 
         const snapshot = tree.ReadSnapshot{
             .root_page_id = self.root_page_id,
@@ -168,9 +174,7 @@ pub const DB = struct {
 
         self.file = try std.Io.Dir.openFileAbsolute(io, self.path, .{ .mode = .read_write });
         self.file_open = true;
-        try reloadCommittedStateFromOpenFile(self);
-        self.reclaim.deinit(self.allocator);
-        self.reclaim = reclaim.State.init(self.allocator);
+        try reloadCompactedStateFromOpenFile(self);
     }
 };
 
@@ -331,6 +335,34 @@ pub fn reloadCommittedStateFromOpenFile(db: *DB) !void {
     selected.reclaim_state = reclaim.State.init(db.allocator);
     db.txid = selected.meta.txid;
     try db.reclaim.releaseReusableIntoAllocator(db.allocator, &db.page_allocator);
+}
+
+fn reloadCompactedStateFromOpenFile(db: *DB) !void {
+    const io = db.io_threaded.io();
+    var selected = loadNewestRecoverableSnapshot(db.allocator, &db.file, io, default_page_size) catch |err| switch (err) {
+        error.NoValidMetaPage => return errors.DbOpenError.InvalidDatabaseFile,
+        else => return err,
+    };
+    defer selected.page_allocator.deinit(db.allocator);
+    defer selected.reclaim_state.deinit(db.allocator);
+
+    db.meta_slot = selected.slot;
+    db.page_size = selected.meta.page_size;
+    db.flags = selected.meta.flags;
+    db.root_page_id = selected.meta.root_page_id;
+    db.allocator_root = selected.meta.allocator_root;
+    db.high_water_mark = selected.meta.high_water_mark;
+
+    var previous_page_allocator = db.page_allocator;
+    db.page_allocator = selected.page_allocator;
+    previous_page_allocator.deinit(db.allocator);
+    selected.page_allocator = movedPageAllocator(db.allocator);
+
+    // Active readers still own handles to the pre-compact file, so only the
+    // pending reclaim list is replaced here; their reader bookkeeping must
+    // survive until each snapshot closes.
+    db.reclaim.clearPending(db.allocator);
+    db.txid = selected.meta.txid;
 }
 
 fn initializeEmptyDatabase(db: *DB) !void {
@@ -760,6 +792,19 @@ fn expectDbValue(db: *DB, key: []const u8, expected: []const u8) !void {
 
 fn expectDbMissing(db: *DB, key: []const u8) !void {
     const value = try db.get(std.testing.allocator, key);
+    defer if (value) |owned| std.testing.allocator.free(owned);
+    try std.testing.expect(value == null);
+}
+
+fn expectReadTxValue(read_tx: tx.ReadTx, key: []const u8, expected: []const u8) !void {
+    const value = (try read_tx.get(std.testing.allocator, key)).?;
+    defer std.testing.allocator.free(value);
+
+    try std.testing.expectEqualSlices(u8, expected, value);
+}
+
+fn expectReadTxMissing(read_tx: tx.ReadTx, key: []const u8) !void {
+    const value = try read_tx.get(std.testing.allocator, key);
     defer if (value) |owned| std.testing.allocator.free(owned);
     try std.testing.expect(value == null);
 }
@@ -3272,19 +3317,69 @@ test "compact preserves higher-order leaf pages" {
     try std.testing.expectEqual(before_header.order, after_header.order);
 }
 
-test "compact rejects active read and write transactions" {
+test "compact keeps active read transactions on their original snapshot" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
-    const path = try tempFilePath(&path_buf, tmp.dir, "compact-active-tx.db");
+    const path = try tempFilePath(&path_buf, tmp.dir, "compact-active-reader.db");
 
     const db = try open(std.testing.allocator, path);
     defer db.close();
 
+    try db.put("alpha", "one");
+    try db.put("beta", "two");
+
     var read_tx = try db.beginRead();
-    try std.testing.expectError(error.ActiveReadersPresent, db.compact(std.testing.allocator));
-    read_tx.deinit();
+    defer read_tx.deinit();
+
+    try db.put("alpha", "three");
+    try db.put("gamma", "four");
+
+    try expectReadTxValue(read_tx, "alpha", "one");
+    try expectReadTxMissing(read_tx, "gamma");
+
+    try db.compact(std.testing.allocator);
+
+    try expectReadTxValue(read_tx, "alpha", "one");
+    try expectReadTxMissing(read_tx, "gamma");
+
+    var cursor = read_tx.cursor();
+    defer cursor.deinit();
+
+    var count: usize = 0;
+    while (try (if (count == 0) cursor.first(std.testing.allocator) else cursor.next(std.testing.allocator))) |record| {
+        var owned = record;
+        defer owned.deinit(std.testing.allocator);
+
+        switch (count) {
+            0 => {
+                try std.testing.expectEqualSlices(u8, "alpha", owned.key);
+                try std.testing.expectEqualSlices(u8, "one", owned.value);
+            },
+            1 => {
+                try std.testing.expectEqualSlices(u8, "beta", owned.key);
+                try std.testing.expectEqualSlices(u8, "two", owned.value);
+            },
+            else => return error.UnexpectedRecordCount,
+        }
+        count += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 2), count);
+
+    try expectDbValue(db, "alpha", "three");
+    try expectDbValue(db, "gamma", "four");
+}
+
+test "compact rejects an active write transaction" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path = try tempFilePath(&path_buf, tmp.dir, "compact-active-write.db");
+
+    const db = try open(std.testing.allocator, path);
+    defer db.close();
 
     var write_tx = try db.beginWrite();
     defer write_tx.rollback() catch {};

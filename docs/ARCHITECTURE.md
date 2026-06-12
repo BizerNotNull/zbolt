@@ -378,7 +378,7 @@ The expected responsibilities of `compact` are:
 
 The current first implementation narrows that path deliberately:
 
-- `compact` requires no active read or write transactions
+- `compact` still rejects concurrent write transactions
 - it rewrites only tree pages referenced by the latest committed snapshot
 - it emits identical `meta0/meta1` pages with the same logical `txid`
 - it clears persisted pending reclaim by replacing the file with the compacted layout

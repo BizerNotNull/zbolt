@@ -34,6 +34,13 @@ pub const State = struct {
         self.* = State.init(allocator);
     }
 
+    pub fn clearPending(self: *State, allocator: std.mem.Allocator) void {
+        for (self.pending.items) |pending_release| {
+            allocator.free(pending_release.pages);
+        }
+        self.pending.clearRetainingCapacity();
+    }
+
     pub fn beginRead(self: *State, reader_txid: u64) !void {
         const gop = try self.active_readers.getOrPut(reader_txid);
         if (gop.found_existing) {
