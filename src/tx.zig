@@ -2,6 +2,7 @@ const std = @import("std");
 const allocator_mod = @import("allocator.zig");
 const db_mod = @import("db.zig");
 const meta = @import("meta.zig");
+const namespace = @import("namespace.zig");
 const page = @import("page.zig");
 const reclaim = @import("reclaim.zig");
 const storage = @import("storage.zig");
@@ -35,7 +36,21 @@ pub const ReadTx = struct {
     /// Returns an owned copy of the value visible to this read snapshot.
     pub fn get(self: *const ReadTx, allocator: std.mem.Allocator, key: []const u8) !?[]u8 {
         std.debug.assert(self.db != null);
-        return tree.lookupSnapshotSource(&self.snapshot_source, allocator, key);
+        const entry = try tree.lookupEntrySnapshotSource(&self.snapshot_source, allocator, key);
+        return rootEntryValueOrError(allocator, entry);
+    }
+
+    /// Returns an owned copy of the value stored inside `bucket` for `key`.
+    pub fn getInBucket(self: *const ReadTx, allocator: std.mem.Allocator, bucket: []const u8, key: []const u8) !?[]u8 {
+        std.debug.assert(self.db != null);
+        const bucket_root_page_id = try self.bucketRootPageId(allocator, bucket);
+        const entry = try tree.lookupEntrySnapshotSourceAtRoot(&self.snapshot_source, allocator, bucket_root_page_id, key);
+        return rootEntryValueOrError(allocator, entry);
+    }
+
+    fn bucketRootPageId(self: *const ReadTx, allocator: std.mem.Allocator, bucket: []const u8) !u64 {
+        const entry = try tree.lookupEntrySnapshotSource(&self.snapshot_source, allocator, bucket);
+        return try bucketRootPageIdFromLookup(allocator, entry);
     }
 
     /// Opens a read-only cursor pinned to this transaction's snapshot.
@@ -102,6 +117,7 @@ pub const WriteTx = struct {
     pub fn put(self: *WriteTx, key: []const u8, value: []const u8) !void {
         try self.ensureActiveForMutation();
         const view = &self.view.?;
+        try ensureRootKeyMutable(view.pageReader(), self.arena.allocator(), view.current_root_page_id, key);
         const write_result = try tree.writePut(
             view.pageReader(),
             self.arena.allocator(),
@@ -112,7 +128,7 @@ pub const WriteTx = struct {
             key,
             value,
         );
-        try view.applyWriteResult(self.db.allocator, write_result);
+        try view.applyRootWriteResult(self.db.allocator, write_result);
         self.has_pending_write = true;
         self.state = .open_dirty;
     }
@@ -120,6 +136,7 @@ pub const WriteTx = struct {
     pub fn delete(self: *WriteTx, key: []const u8) !void {
         try self.ensureActiveForMutation();
         const view = &self.view.?;
+        try ensureRootKeyMutable(view.pageReader(), self.arena.allocator(), view.current_root_page_id, key);
         const delete_mutation = try tree.writeDelete(
             view.pageReader(),
             self.arena.allocator(),
@@ -132,7 +149,137 @@ pub const WriteTx = struct {
         switch (delete_mutation) {
             .unchanged => {},
             .changed => |write_result| {
-                try view.applyWriteResult(self.db.allocator, write_result);
+                try view.applyRootWriteResult(self.db.allocator, write_result);
+                self.has_pending_write = true;
+                self.state = .open_dirty;
+            },
+        }
+    }
+
+    pub fn createBucket(self: *WriteTx, bucket: []const u8) !void {
+        try self.ensureActiveForMutation();
+        const view = &self.view.?;
+        const existing = try tree.lookupEntryPageReader(view.pageReader(), self.arena.allocator(), view.current_root_page_id, bucket);
+        if (existing) |owned_entry| {
+            var owned = owned_entry;
+            defer owned.deinit(self.arena.allocator());
+            if (namespace.isBucketFlags(owned.flags)) return error.BucketAlreadyExists;
+            return error.BucketNameConflict;
+        }
+
+        // Buckets are indexed in the root tree, but each bucket still owns an
+        // independent subtree rooted at its own empty leaf page.
+        const empty_root_page = try tree.allocateEmptyLeafPageAlloc(self.arena.allocator(), self.db.page_size);
+        const bucket_root_page_id = try view.stageAllocatedPage(self.db.allocator, &self.working_page_allocator, self.db.page_size, empty_root_page);
+        const bucket_record = try namespace.encodeBucketRecord(bucket_root_page_id);
+        const write_result = try tree.writePutWithFlags(
+            view.pageReader(),
+            self.arena.allocator(),
+            self.db.allocator,
+            self.db.page_size,
+            &self.working_page_allocator,
+            view.current_root_page_id,
+            bucket,
+            bucket_record[0..],
+            namespace.bucket_entry_flag,
+        );
+        try view.applyRootWriteResult(self.db.allocator, write_result);
+        self.has_pending_write = true;
+        self.state = .open_dirty;
+    }
+
+    pub fn deleteBucket(self: *WriteTx, bucket: []const u8) !void {
+        try self.ensureActiveForMutation();
+        const view = &self.view.?;
+        const bucket_root_page_id = try currentBucketRootPageId(view, self.arena.allocator(), bucket);
+
+        const delete_bucket_result = try tree.writeDelete(
+            view.pageReader(),
+            self.arena.allocator(),
+            self.db.allocator,
+            self.db.page_size,
+            &self.working_page_allocator,
+            view.current_root_page_id,
+            bucket,
+        );
+        switch (delete_bucket_result) {
+            .unchanged => return error.BucketNotFound,
+            .changed => |write_result| try view.applyRootWriteResult(self.db.allocator, write_result),
+        }
+
+        // Removing the bucket name only detaches the namespace entry. The
+        // previous bucket subtree remains visible to older snapshots, so its
+        // committed pages must enter reclaim as a whole.
+        const released_pages = try collectCommittedTreePagesAlloc(view.pageReader(), self.arena.allocator(), bucket_root_page_id);
+        defer self.arena.allocator().free(released_pages);
+        try view.appendReleasedPages(self.db.allocator, released_pages);
+        self.has_pending_write = true;
+        self.state = .open_dirty;
+    }
+
+    pub fn putInBucket(self: *WriteTx, bucket: []const u8, key: []const u8, value: []const u8) !void {
+        try self.ensureActiveForMutation();
+        const view = &self.view.?;
+        const bucket_root_page_id = try currentBucketRootPageId(view, self.arena.allocator(), bucket);
+        const bucket_write = try tree.writePut(
+            view.pageReader(),
+            self.arena.allocator(),
+            self.db.allocator,
+            self.db.page_size,
+            &self.working_page_allocator,
+            bucket_root_page_id,
+            key,
+            value,
+        );
+        try view.applyDetachedWriteResult(self.db.allocator, bucket_write);
+
+        const bucket_record = try namespace.encodeBucketRecord(bucket_write.root_page_id);
+        const root_update = try tree.writePutWithFlags(
+            view.pageReader(),
+            self.arena.allocator(),
+            self.db.allocator,
+            self.db.page_size,
+            &self.working_page_allocator,
+            view.current_root_page_id,
+            bucket,
+            bucket_record[0..],
+            namespace.bucket_entry_flag,
+        );
+        try view.applyRootWriteResult(self.db.allocator, root_update);
+        self.has_pending_write = true;
+        self.state = .open_dirty;
+    }
+
+    pub fn deleteInBucket(self: *WriteTx, bucket: []const u8, key: []const u8) !void {
+        try self.ensureActiveForMutation();
+        const view = &self.view.?;
+        const bucket_root_page_id = try currentBucketRootPageId(view, self.arena.allocator(), bucket);
+        const delete_mutation = try tree.writeDelete(
+            view.pageReader(),
+            self.arena.allocator(),
+            self.db.allocator,
+            self.db.page_size,
+            &self.working_page_allocator,
+            bucket_root_page_id,
+            key,
+        );
+        switch (delete_mutation) {
+            .unchanged => {},
+            .changed => |write_result| {
+                try view.applyDetachedWriteResult(self.db.allocator, write_result);
+                const bucket_record = try namespace.encodeBucketRecord(write_result.root_page_id);
+                const root_update = try tree.writePutWithFlags(
+                    view.pageReader(),
+                    self.arena.allocator(),
+                    self.db.allocator,
+                    self.db.page_size,
+                    &self.working_page_allocator,
+                    view.current_root_page_id,
+                    bucket,
+                    bucket_record[0..],
+                    namespace.bucket_entry_flag,
+                );
+                try view.applyRootWriteResult(self.db.allocator, root_update);
                 self.has_pending_write = true;
                 self.state = .open_dirty;
             },
@@ -287,6 +434,85 @@ pub const WriteTx = struct {
     }
 };
 
+fn rootEntryValueOrError(allocator: std.mem.Allocator, entry: ?tree.LookupEntry) !?[]u8 {
+    const owned_entry = entry orelse return null;
+    if (namespace.isBucketFlags(owned_entry.flags)) {
+        var rejected_entry = owned_entry;
+        rejected_entry.deinit(allocator);
+        return error.KeyBelongsToBucket;
+    }
+    return owned_entry.value;
+}
+
+fn ensureRootKeyMutable(page_reader: tree.PageReader, allocator: std.mem.Allocator, root_page_id: u64, key: []const u8) !void {
+    const entry = try tree.lookupEntryPageReader(page_reader, allocator, root_page_id, key);
+    if (entry) |owned_entry| {
+        var owned = owned_entry;
+        defer owned.deinit(allocator);
+        if (namespace.isBucketFlags(owned.flags)) return error.KeyBelongsToBucket;
+    }
+}
+
+fn bucketRootPageIdFromLookup(allocator: std.mem.Allocator, entry: ?tree.LookupEntry) !u64 {
+    const owned_entry = entry orelse return error.BucketNotFound;
+    defer {
+        var released_entry = owned_entry;
+        released_entry.deinit(allocator);
+    }
+
+    return try owned_entry.bucketRootPageId();
+}
+
+fn currentBucketRootPageId(view: *const UncommittedView, allocator: std.mem.Allocator, bucket: []const u8) !u64 {
+    const entry = try tree.lookupEntryPageReader(view.pageReader(), allocator, view.current_root_page_id, bucket);
+    return try bucketRootPageIdFromLookup(allocator, entry);
+}
+
+fn collectCommittedTreePagesAlloc(page_reader: tree.PageReader, allocator: std.mem.Allocator, root_page_id: u64) ![]reclaim.ReleasedPage {
+    var released_pages = std.ArrayList(reclaim.ReleasedPage).empty;
+    defer released_pages.deinit(allocator);
+
+    var visited = std.AutoHashMap(u64, void).init(allocator);
+    defer visited.deinit();
+
+    try appendCommittedTreePages(&released_pages, &visited, page_reader, allocator, root_page_id);
+    return released_pages.toOwnedSlice(allocator);
+}
+
+fn appendCommittedTreePages(
+    released_pages: *std.ArrayList(reclaim.ReleasedPage),
+    visited: *std.AutoHashMap(u64, void),
+    page_reader: tree.PageReader,
+    allocator: std.mem.Allocator,
+    page_id: u64,
+) !void {
+    if (visited.contains(page_id)) return;
+    try visited.put(page_id, {});
+
+    const page_ref = try page_reader.readPage(allocator, page_id);
+    defer page_ref.deinit(allocator);
+
+    const page_bytes = page_ref.bytes();
+    const header = try page.decodeHeader(page_bytes);
+    try released_pages.append(allocator, .{
+        .page_id = header.page_id,
+        .order = header.order,
+    });
+
+    switch (header.page_type) {
+        .leaf => {},
+        .branch => {
+            const branch_page = try page.BranchPage.validate(page_bytes);
+            var index: u16 = 0;
+            while (index < branch_page.count()) : (index += 1) {
+                const child_entry = try branch_page.entry(index);
+                try appendCommittedTreePages(released_pages, visited, page_reader, allocator, child_entry.child_page_id);
+            }
+        },
+        else => return error.UnexpectedPageType,
+    }
+}
+
 const ReclaimPageKey = struct {
     page_id: u64,
     order: u8,
@@ -323,22 +549,53 @@ const UncommittedView = struct {
         };
     }
 
-    fn applyWriteResult(self: *UncommittedView, allocator: std.mem.Allocator, write_result: tree.WriteResult) !void {
+    fn applyRootWriteResult(self: *UncommittedView, allocator: std.mem.Allocator, write_result: tree.WriteResult) !void {
+        try self.applyDetachedWriteResult(allocator, write_result);
+        self.current_root_page_id = write_result.root_page_id;
+    }
+
+    fn applyDetachedWriteResult(self: *UncommittedView, allocator: std.mem.Allocator, write_result: tree.WriteResult) !void {
         for (write_result.new_pages) |pending_page| {
             try self.staged_pages.put(pending_page.page_id, pending_page);
         }
 
-        for (write_result.obsolete_pages) |obsolete_page| {
-            if (self.staged_pages.remove(obsolete_page.page_id)) continue;
+        try self.appendReleasedPages(allocator, write_result.obsolete_pages);
+
+        self.allocation_high_water_mark = write_result.allocation_high_water_mark;
+    }
+
+    fn appendReleasedPages(self: *UncommittedView, allocator: std.mem.Allocator, released_pages: []const reclaim.ReleasedPage) !void {
+        for (released_pages) |released_page| {
+            if (self.staged_pages.remove(released_page.page_id)) continue;
             try self.reclaim_committed_pages.put(.{
-                .page_id = obsolete_page.page_id,
-                .order = obsolete_page.order,
+                .page_id = released_page.page_id,
+                .order = released_page.order,
             }, {});
         }
-
-        self.current_root_page_id = write_result.root_page_id;
-        self.allocation_high_water_mark = write_result.allocation_high_water_mark;
         _ = allocator;
+    }
+
+    fn stageAllocatedPage(
+        self: *UncommittedView,
+        backing_allocator: std.mem.Allocator,
+        page_allocator: *allocator_mod.PageAllocator,
+        page_size: u32,
+        bytes: []u8,
+    ) !u64 {
+        var header = try page.decodeHeader(bytes);
+        const span_size = try page.spanSize(page_size, header.order);
+        if (bytes.len != span_size) return error.InvalidPageLayout;
+
+        const page_id = try page_allocator.allocate(backing_allocator, header.order);
+        header.page_id = page_id;
+        try page.encodeHeader(bytes, header);
+
+        try self.staged_pages.put(page_id, .{
+            .page_id = page_id,
+            .bytes = bytes,
+        });
+        self.allocation_high_water_mark = page_allocator.currentHighWaterMark();
+        return page_id;
     }
 
     fn sortedStagedPagesAlloc(self: *const UncommittedView, allocator: std.mem.Allocator) ![]tree.PendingPage {

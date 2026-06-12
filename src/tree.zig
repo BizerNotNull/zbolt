@@ -1,4 +1,5 @@
 const std = @import("std");
+const namespace = @import("namespace.zig");
 const page_allocator_mod = @import("allocator.zig");
 const meta = @import("meta.zig");
 const page = @import("page.zig");
@@ -30,6 +31,24 @@ pub const CursorError = ReadTreePageError || page.Error || page.LayoutError || T
 pub const PendingPage = struct {
     page_id: u64,
     bytes: []const u8,
+};
+
+pub const LookupEntry = struct {
+    value: []u8,
+    flags: u32,
+
+    pub fn deinit(self: *LookupEntry, allocator: std.mem.Allocator) void {
+        const owned_value = self.value;
+
+        self.value = &.{};
+        self.flags = 0;
+
+        if (owned_value.len > 0) allocator.free(owned_value);
+    }
+
+    pub fn bucketRootPageId(self: LookupEntry) namespace.Error!u64 {
+        return (try namespace.decodeBucketRecord(self.value, self.flags)).root_page_id;
+    }
 };
 
 pub const CursorRecord = struct {
@@ -296,6 +315,11 @@ const DeleteStep = union(enum) {
     removed,
 };
 
+const PutFlagMode = union(enum) {
+    preserve_existing,
+    explicit: u32,
+};
+
 const WriteContext = struct {
     page_reader: PageReader,
     backing_allocator: std.mem.Allocator,
@@ -303,6 +327,7 @@ const WriteContext = struct {
     temp_allocator: std.mem.Allocator,
     page_size: u32,
     page_allocator: *page_allocator_mod.PageAllocator,
+    flag_mode: PutFlagMode,
     new_pages: std.ArrayList(PendingPage),
     obsolete_pages: std.ArrayList(reclaim.ReleasedPage),
 
@@ -313,6 +338,7 @@ const WriteContext = struct {
         temp_allocator: std.mem.Allocator,
         page_size: u32,
         page_allocator: *page_allocator_mod.PageAllocator,
+        flag_mode: PutFlagMode,
     ) WriteContext {
         return .{
             .page_reader = page_reader,
@@ -321,6 +347,7 @@ const WriteContext = struct {
             .temp_allocator = temp_allocator,
             .page_size = page_size,
             .page_allocator = page_allocator,
+            .flag_mode = flag_mode,
             .new_pages = .empty,
             .obsolete_pages = .empty,
         };
@@ -398,13 +425,43 @@ pub fn lookupSnapshot(db: *db_mod.DB, allocator: std.mem.Allocator, snapshot: Re
     return lookupSnapshotSource(&snapshot_source, allocator, key);
 }
 
+pub fn lookupEntrySnapshot(db: *db_mod.DB, allocator: std.mem.Allocator, snapshot: ReadSnapshot, key: []const u8) !?LookupEntry {
+    const snapshot_source = SnapshotSource.init(db, snapshot, db.file);
+    return lookupEntrySnapshotSource(&snapshot_source, allocator, key);
+}
+
 pub fn lookupSnapshotSource(snapshot_source: *const SnapshotSource, allocator: std.mem.Allocator, key: []const u8) !?[]u8 {
-    var page_id = snapshot_source.snapshot.root_page_id;
+    const entry = try lookupEntrySnapshotSourceAtRoot(snapshot_source, allocator, snapshot_source.snapshot.root_page_id, key);
+    if (entry) |owned| return owned.value;
+    return null;
+}
+
+pub fn lookupEntrySnapshotSource(snapshot_source: *const SnapshotSource, allocator: std.mem.Allocator, key: []const u8) !?LookupEntry {
+    return lookupEntrySnapshotSourceAtRoot(snapshot_source, allocator, snapshot_source.snapshot.root_page_id, key);
+}
+
+pub fn lookupEntrySnapshotSourceAtRoot(
+    snapshot_source: *const SnapshotSource,
+    allocator: std.mem.Allocator,
+    root_page_id: u64,
+    key: []const u8,
+) !?LookupEntry {
+    return lookupEntryPageReader(snapshot_source.pageReader(), allocator, root_page_id, key);
+}
+
+pub fn lookupEntryPageReader(
+    page_reader: PageReader,
+    allocator: std.mem.Allocator,
+    root_page_id: u64,
+    key: []const u8,
+) !?LookupEntry {
+    var page_id = root_page_id;
 
     while (true) {
-        const page_bytes = try readTreePageSnapshot(snapshot_source, allocator, page_id);
-        defer allocator.free(page_bytes);
+        const page_ref = try page_reader.readPage(allocator, page_id);
+        defer page_ref.deinit(allocator);
 
+        const page_bytes = page_ref.bytes();
         const header = try page.decodeHeader(page_bytes);
         switch (header.page_type) {
             .branch => {
@@ -413,13 +470,25 @@ pub fn lookupSnapshotSource(snapshot_source: *const SnapshotSource, allocator: s
             },
             .leaf => {
                 const leaf_page = try page.LeafPage.validate(page_bytes);
-                return try findInLeaf(leaf_page, allocator, key);
+                return try findEntryInLeaf(leaf_page, allocator, key);
             },
-            // The read path only understands tree navigation pages. Reaching any
-            // other page type means the root or a child pointer escaped the tree.
             else => return error.UnexpectedPageType,
         }
     }
+}
+
+pub fn writePutWithFlags(
+    page_reader: PageReader,
+    allocator: std.mem.Allocator,
+    backing_allocator: std.mem.Allocator,
+    page_size: u32,
+    page_allocator: *page_allocator_mod.PageAllocator,
+    root_page_id: u64,
+    key: []const u8,
+    value: []const u8,
+    flags: u32,
+) !WriteResult {
+    return writePutImpl(page_reader, allocator, backing_allocator, page_size, page_allocator, root_page_id, key, value, .{ .explicit = flags });
 }
 
 pub fn writePut(
@@ -431,6 +500,20 @@ pub fn writePut(
     root_page_id: u64,
     key: []const u8,
     value: []const u8,
+) !WriteResult {
+    return writePutImpl(page_reader, allocator, backing_allocator, page_size, page_allocator, root_page_id, key, value, .preserve_existing);
+}
+
+fn writePutImpl(
+    page_reader: PageReader,
+    allocator: std.mem.Allocator,
+    backing_allocator: std.mem.Allocator,
+    page_size: u32,
+    page_allocator: *page_allocator_mod.PageAllocator,
+    root_page_id: u64,
+    key: []const u8,
+    value: []const u8,
+    flag_mode: PutFlagMode,
 ) !WriteResult {
     const root_page_ref = try page_reader.readPage(allocator, root_page_id);
     defer root_page_ref.deinit(allocator);
@@ -445,6 +528,7 @@ pub fn writePut(
         temp_arena.allocator(),
         page_size,
         page_allocator,
+        flag_mode,
     );
     const root_result = try writeNodePut(&ctx, root_page_ref.bytes(), key, value);
 
@@ -493,6 +577,7 @@ pub fn writeDelete(
         temp_arena.allocator(),
         page_size,
         page_allocator,
+        .preserve_existing,
     );
     const root_step = try writeNodeDelete(&ctx, root_page_ref.bytes(), key);
 
@@ -548,13 +633,22 @@ fn selectChildIndexForPut(branch_page: page.BranchPage, key: []const u8) !u16 {
 }
 
 fn findInLeaf(leaf_page: page.LeafPage, allocator: std.mem.Allocator, key: []const u8) !?[]u8 {
+    const entry = try findEntryInLeaf(leaf_page, allocator, key);
+    if (entry) |owned| return owned.value;
+    return null;
+}
+
+fn findEntryInLeaf(leaf_page: page.LeafPage, allocator: std.mem.Allocator, key: []const u8) !?LookupEntry {
     var index: u16 = 0;
     while (index < leaf_page.count()) : (index += 1) {
         const entry = try leaf_page.entry(index);
         switch (std.mem.order(u8, entry.key, key)) {
             // `lookup` frees the backing page buffer before returning, so callers
             // receive an owned copy instead of a borrowed slice into page memory.
-            .eq => return try allocator.dupe(u8, entry.value),
+            .eq => return .{
+                .value = try allocator.dupe(u8, entry.value),
+                .flags = entry.flags,
+            },
             // Leaf entries are sorted, so once we pass the target key the page
             // cannot contain a later match.
             .gt => return null,
@@ -786,7 +880,7 @@ fn writeLeafPut(ctx: *WriteContext, leaf_page_bytes: []const u8, key: []const u8
     const leaf_page = try page.LeafPage.validate(leaf_page_bytes);
 
     var next_entries = std.ArrayList(page.LeafEntry).empty;
-    try collectUpdatedLeafEntries(&next_entries, leaf_page, ctx.temp_allocator, key, value);
+    try collectUpdatedLeafEntries(&next_entries, leaf_page, ctx.temp_allocator, key, value, ctx.flag_mode);
 
     const leaf_bytes = encodeLeafPageAlloc(
         ctx.allocator,
@@ -1205,6 +1299,7 @@ fn collectUpdatedLeafEntries(
     allocator: std.mem.Allocator,
     key: []const u8,
     value: []const u8,
+    flag_mode: PutFlagMode,
 ) !void {
     var inserted = false;
     var index: u16 = 0;
@@ -1213,12 +1308,12 @@ fn collectUpdatedLeafEntries(
         switch (std.mem.order(u8, existing.key, key)) {
             .lt => try appendLeafEntry(entries, allocator, existing.key, existing.value, existing.flags),
             .eq => {
-                try appendLeafEntry(entries, allocator, key, value, existing.flags);
+                try appendLeafEntry(entries, allocator, key, value, resolvePutFlags(flag_mode, existing.flags, true));
                 inserted = true;
             },
             .gt => {
                 if (!inserted) {
-                    try appendLeafEntry(entries, allocator, key, value, 0);
+                    try appendLeafEntry(entries, allocator, key, value, resolvePutFlags(flag_mode, 0, false));
                     inserted = true;
                 }
                 try appendLeafEntry(entries, allocator, existing.key, existing.value, existing.flags);
@@ -1227,8 +1322,15 @@ fn collectUpdatedLeafEntries(
     }
 
     if (!inserted) {
-        try appendLeafEntry(entries, allocator, key, value, 0);
+        try appendLeafEntry(entries, allocator, key, value, resolvePutFlags(flag_mode, 0, false));
     }
+}
+
+fn resolvePutFlags(flag_mode: PutFlagMode, existing_flags: u32, replacing_existing: bool) u32 {
+    return switch (flag_mode) {
+        .preserve_existing => if (replacing_existing) existing_flags else 0,
+        .explicit => |flags| flags,
+    };
 }
 
 fn collectDeletedLeafEntries(
@@ -1350,7 +1452,7 @@ fn encodeSingleLeafPageBestFitAlloc(
     return TreeWriteError.KeyValueTooLarge;
 }
 
-fn allocateEmptyLeafPageAlloc(allocator: std.mem.Allocator, page_size: u32) ![]u8 {
+pub fn allocateEmptyLeafPageAlloc(allocator: std.mem.Allocator, page_size: u32) ![]u8 {
     const page_bytes = try allocator.alloc(u8, page_size);
     errdefer allocator.free(page_bytes);
     @memset(page_bytes, 0);
