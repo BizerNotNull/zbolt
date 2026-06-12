@@ -1,5 +1,6 @@
 const std = @import("std");
 const allocator_mod = @import("allocator.zig");
+const page = @import("page.zig");
 
 pub const ReleasedPage = struct {
     page_id: u64,
@@ -88,6 +89,45 @@ pub const State = struct {
             .visible_through_txid = visible_through_txid,
             .pages = released_pages_owned,
         });
+    }
+
+    pub fn initFromStateRecords(allocator: std.mem.Allocator, records: []const page.AllocatorStateRecord) !State {
+        var state = State.init(allocator);
+        errdefer state.deinit(allocator);
+
+        try state.pending.ensureTotalCapacity(allocator, records.len);
+        for (records) |record| {
+            std.debug.assert(record.kind == .pending);
+            const pages = try allocator.alloc(ReleasedPage, 1);
+            errdefer allocator.free(pages);
+            pages[0] = .{
+                .page_id = record.page_id,
+                .order = record.order,
+            };
+            state.pending.appendAssumeCapacity(.{
+                .visible_through_txid = record.visible_through_txid,
+                .pages = pages,
+            });
+        }
+
+        return state;
+    }
+
+    pub fn appendStateRecords(
+        self: *const State,
+        allocator: std.mem.Allocator,
+        records: *std.ArrayList(page.AllocatorStateRecord),
+    ) !void {
+        for (self.pending.items) |pending_release| {
+            for (pending_release.pages) |released_page| {
+                try records.append(allocator, .{
+                    .kind = .pending,
+                    .page_id = released_page.page_id,
+                    .order = released_page.order,
+                    .visible_through_txid = pending_release.visible_through_txid,
+                });
+            }
+        }
     }
 
     pub fn releaseReusableIntoAllocator(

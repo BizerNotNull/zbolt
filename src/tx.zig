@@ -2,6 +2,7 @@ const std = @import("std");
 const allocator_mod = @import("allocator.zig");
 const db_mod = @import("db.zig");
 const meta = @import("meta.zig");
+const page = @import("page.zig");
 const reclaim = @import("reclaim.zig");
 const storage = @import("storage.zig");
 const tree = @import("tree.zig");
@@ -153,12 +154,41 @@ pub const WriteTx = struct {
         if (!self.has_pending_write) return WriteTxError.NoPendingWrite;
         errdefer self.fail();
 
+        const allocator_root_release = try db_mod.currentAllocatorRootRelease(self.db);
+        const staged_reclaim_page_count = self.view.?.reclaim_committed_pages.count() + if (allocator_root_release == null) @as(usize, 0) else @as(usize, 1);
+
         var staged_reclaim_pages: []const reclaim.ReleasedPage = &.{};
-        if (self.view.?.reclaim_committed_pages.count() > 0) {
+        if (staged_reclaim_page_count > 0) {
             try self.db.reclaim.ensurePendingCapacity(self.db.allocator, 1);
-            staged_reclaim_pages = try self.view.?.ownedReclaimPagesAlloc(self.db.allocator);
+            var owned_pages = try self.db.allocator.alloc(reclaim.ReleasedPage, staged_reclaim_page_count);
+            errdefer self.db.allocator.free(owned_pages);
+
+            var index: usize = 0;
+            if (self.view.?.reclaim_committed_pages.count() > 0) {
+                const tree_reclaim_pages = try self.view.?.ownedReclaimPagesAlloc(self.db.allocator);
+                defer self.db.allocator.free(tree_reclaim_pages);
+                @memcpy(owned_pages[0..tree_reclaim_pages.len], tree_reclaim_pages);
+                index = tree_reclaim_pages.len;
+            }
+            if (allocator_root_release) |released_page| {
+                owned_pages[index] = released_page;
+            }
+            std.sort.pdq(reclaim.ReleasedPage, owned_pages, {}, reclaimPageLessThan);
+            staged_reclaim_pages = owned_pages;
         }
         errdefer if (staged_reclaim_pages.len > 0) self.db.allocator.free(staged_reclaim_pages);
+
+        var pending_records = std.ArrayList(page.AllocatorStateRecord).empty;
+        defer pending_records.deinit(self.db.allocator);
+        try self.db.reclaim.appendStateRecords(self.db.allocator, &pending_records);
+        for (staged_reclaim_pages) |released_page| {
+            try pending_records.append(self.db.allocator, .{
+                .kind = .pending,
+                .page_id = released_page.page_id,
+                .order = released_page.order,
+                .visible_through_txid = self.base_txid,
+            });
+        }
 
         const staged_pages = try self.view.?.sortedStagedPagesAlloc(self.db.allocator);
         defer self.db.allocator.free(staged_pages);
@@ -167,7 +197,7 @@ pub const WriteTx = struct {
         self.working_page_allocator = movedPageAllocator(self.db.allocator);
         self.owns_working_page_allocator = false;
 
-        var allocator_state = try db_mod.materializeAllocatorStatePage(self.db, baseline_page_allocator);
+        var allocator_state = try db_mod.materializeAllocatorStatePage(self.db, baseline_page_allocator, pending_records.items);
         defer self.db.allocator.free(allocator_state.bytes);
         errdefer allocator_state.page_allocator.deinit(self.db.allocator);
         std.debug.assert(self.base_txid == self.db.txid);
