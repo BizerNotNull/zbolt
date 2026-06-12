@@ -11,9 +11,11 @@ Current capabilities include:
 - bucket namespaces backed by independent B+Tree roots, including nested buckets
 - bucket existence checks and bucket enumeration at root or within parent buckets
 - snapshot read transactions
+- explicit write transactions with read-your-writes staging semantics
 - single-writer `put` / `delete`
 - bucket-scoped `put` / `delete`, including nested bucket paths
 - read cursor traversal, including nested bucket-scoped cursor traversal
+- range scan APIs at root or within bucket scopes
 - managed DB-owned read cursors for snapshot traversal without manual `ReadTx` lifecycle handling
 - persisted delayed reclaim through allocator state pages
 - explicit `compact()` file rewriting with state reload

@@ -3005,6 +3005,109 @@ test "write transaction keeps the last value for repeated puts to the same key" 
     try expectDbValue(db, "alpha", "two");
 }
 
+test "write transaction reads its staged root writes through get scan and cursor" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path = try tempFilePath(&path_buf, tmp.dir, "write-tx-staged-root-reads.db");
+
+    const db = try open(std.testing.allocator, std.testing.io, path);
+    defer db.close();
+
+    try db.put("alpha", "one");
+
+    var write_tx = try db.beginWrite();
+    defer write_tx.rollback() catch {};
+
+    try write_tx.put("alpha", "two");
+    try write_tx.put("beta", "three");
+
+    const staged_alpha = (try write_tx.get(std.testing.allocator, "alpha")).?;
+    defer std.testing.allocator.free(staged_alpha);
+    try std.testing.expectEqualSlices(u8, "two", staged_alpha);
+
+    try expectScanRecords(
+        try write_tx.scanAlloc(std.testing.allocator, .{
+            .start_inclusive = "alpha",
+            .end_exclusive = "z",
+        }),
+        &.{
+            .{ .key = "alpha", .value = "two" },
+            .{ .key = "beta", .value = "three" },
+        },
+    );
+
+    var cursor = try write_tx.cursor();
+    defer cursor.deinit();
+
+    var first = (try cursor.first(std.testing.allocator)).?;
+    defer first.deinit(std.testing.allocator);
+    try expectCursorRecord(first, "alpha", "two");
+
+    var second = (try cursor.next(std.testing.allocator)).?;
+    defer second.deinit(std.testing.allocator);
+    try expectCursorRecord(second, "beta", "three");
+
+    try std.testing.expect((try cursor.next(std.testing.allocator)) == null);
+    try expectDbValue(db, "alpha", "one");
+    try expectDbMissing(db, "beta");
+}
+
+test "write transaction reads staged nested bucket changes before commit" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path = try tempFilePath(&path_buf, tmp.dir, "write-tx-staged-bucket-reads.db");
+
+    const db = try open(std.testing.allocator, std.testing.io, path);
+    defer db.close();
+
+    try db.createBucket("orgs");
+
+    const orgs_path = [_][]const u8{"orgs"};
+    const engineering_path = [_][]const u8{ "orgs", "engineering" };
+
+    var write_tx = try db.beginWrite();
+    defer write_tx.rollback() catch {};
+
+    try write_tx.createBucketInBucketPath(orgs_path[0..], "engineering");
+    try write_tx.putInBucketPath(engineering_path[0..], "alice", "admin");
+    try write_tx.putInBucketPath(engineering_path[0..], "bob", "reader");
+
+    try std.testing.expect(try write_tx.bucketExistsInBucketPath(std.testing.allocator, orgs_path[0..], "engineering"));
+
+    const staged_alice = (try write_tx.getInBucketPath(std.testing.allocator, engineering_path[0..], "alice")).?;
+    defer std.testing.allocator.free(staged_alice);
+    try std.testing.expectEqualSlices(u8, "admin", staged_alice);
+
+    try expectBucketNames(
+        try write_tx.bucketNamesInBucketPathAlloc(std.testing.allocator, orgs_path[0..]),
+        &.{"engineering"},
+    );
+
+    try expectScanRecords(
+        try write_tx.scanInBucketPathAlloc(std.testing.allocator, engineering_path[0..], .{
+            .start_inclusive = "a",
+            .end_exclusive = "z",
+        }),
+        &.{
+            .{ .key = "alice", .value = "admin" },
+            .{ .key = "bob", .value = "reader" },
+        },
+    );
+
+    var cursor = try write_tx.cursorInBucketPath(engineering_path[0..]);
+    defer cursor.deinit();
+
+    var first = (try cursor.first(std.testing.allocator)).?;
+    defer first.deinit(std.testing.allocator);
+    try expectCursorRecord(first, "alice", "admin");
+
+    try std.testing.expectError(error.BucketNotFound, db.getInBucketPath(std.testing.allocator, engineering_path[0..], "alice"));
+}
+
 test "write transaction keeps earlier staged pages that are still referenced by the final root" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -3338,6 +3441,9 @@ test "rolled back write transaction rejects put commit and rollback" {
 
     try std.testing.expect(!db.write_tx_active);
     try std.testing.expectError(tx.WriteTxError.WriteTransactionClosed, write_tx.put("alpha", "one"));
+    try std.testing.expectError(tx.WriteTxError.WriteTransactionClosed, write_tx.get(std.testing.allocator, "alpha"));
+    try std.testing.expectError(tx.WriteTxError.WriteTransactionClosed, write_tx.cursor());
+    try std.testing.expectError(tx.WriteTxError.WriteTransactionClosed, write_tx.scanAlloc(std.testing.allocator, .{}));
     try std.testing.expectError(tx.WriteTxError.WriteTransactionClosed, write_tx.commit());
     try std.testing.expectError(tx.WriteTxError.WriteTransactionClosed, write_tx.rollback());
 }
