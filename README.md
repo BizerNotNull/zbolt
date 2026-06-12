@@ -9,6 +9,7 @@ Current capabilities include:
 
 - single-file open/bootstrap and meta recovery
 - top-level bucket namespaces backed by independent B+Tree roots
+- bucket existence checks and top-level bucket enumeration
 - snapshot read transactions
 - single-writer `put` / `delete`
 - bucket-scoped `put` / `delete`

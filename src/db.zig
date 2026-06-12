@@ -3,6 +3,7 @@ const errors = @import("errors.zig");
 const allocator_mod = @import("allocator.zig");
 const compact_mod = @import("compact.zig");
 const meta = @import("meta.zig");
+const namespace = @import("namespace.zig");
 const page = @import("page.zig");
 const reclaim = @import("reclaim.zig");
 const storage = @import("storage.zig");
@@ -71,6 +72,22 @@ pub const DB = struct {
         defer read_tx.deinit();
 
         return read_tx.getInBucket(allocator, bucket, key);
+    }
+
+    /// Returns whether `bucket` exists in the latest committed snapshot.
+    pub fn bucketExists(self: *DB, allocator: std.mem.Allocator, bucket: []const u8) !bool {
+        var read_tx = try self.beginRead();
+        defer read_tx.deinit();
+
+        return read_tx.bucketExists(allocator, bucket);
+    }
+
+    /// Returns the top-level bucket names in key order.
+    pub fn bucketNamesAlloc(self: *DB, allocator: std.mem.Allocator) !namespace.BucketNames {
+        var read_tx = try self.beginRead();
+        defer read_tx.deinit();
+
+        return read_tx.bucketNamesAlloc(allocator);
     }
 
     /// Opens a read-only view over the currently committed root.
@@ -841,6 +858,16 @@ fn expectBucketMissing(db: *DB, bucket: []const u8, key: []const u8) !void {
     const value = try db.getInBucket(std.testing.allocator, bucket, key);
     defer if (value) |owned| std.testing.allocator.free(owned);
     try std.testing.expect(value == null);
+}
+
+fn expectBucketNames(names: namespace.BucketNames, expected: []const []const u8) !void {
+    var owned_names = names;
+    defer owned_names.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(expected.len, owned_names.items.len);
+    for (expected, 0..) |expected_name, index| {
+        try std.testing.expectEqualSlices(u8, expected_name, owned_names.items[index]);
+    }
 }
 
 fn expectCursorRecord(record: tree.CursorRecord, expected_key: []const u8, expected_value: []const u8) !void {
@@ -3532,6 +3559,82 @@ test "bucket names are protected from root key operations" {
     try db.put("plain", "value");
     try std.testing.expectError(error.BucketNameConflict, db.createBucket("plain"));
     try std.testing.expectError(error.KeyNotBucket, db.putInBucket("plain", "alice", "admin"));
+}
+
+test "bucketExists distinguishes buckets from plain root keys and tracks deletes" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path = try tempFilePath(&path_buf, tmp.dir, "bucket-exists.db");
+
+    const db = try open(std.testing.allocator, std.testing.io, path);
+    defer db.close();
+
+    try std.testing.expect(!(try db.bucketExists(std.testing.allocator, "users")));
+    try db.put("plain", "value");
+    try db.createBucket("users");
+
+    try std.testing.expect(try db.bucketExists(std.testing.allocator, "users"));
+    try std.testing.expect(!(try db.bucketExists(std.testing.allocator, "plain")));
+
+    var read_tx = try db.beginRead();
+    defer read_tx.deinit();
+    try std.testing.expect(try read_tx.bucketExists(std.testing.allocator, "users"));
+    try std.testing.expect(!(try read_tx.bucketExists(std.testing.allocator, "plain")));
+
+    try db.deleteBucket("users");
+
+    try std.testing.expect(!(try db.bucketExists(std.testing.allocator, "users")));
+    try std.testing.expect(try read_tx.bucketExists(std.testing.allocator, "users"));
+}
+
+test "bucketNamesAlloc returns only bucket names in key order across reopen" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path = try tempFilePath(&path_buf, tmp.dir, "bucket-names.db");
+
+    {
+        const db = try open(std.testing.allocator, std.testing.io, path);
+        defer db.close();
+
+        try db.put("plain", "value");
+        try db.createBucket("users");
+        try db.createBucket("archive");
+        try db.createBucket("zeta");
+
+        try expectBucketNames(try db.bucketNamesAlloc(std.testing.allocator), &.{ "archive", "users", "zeta" });
+    }
+
+    const reopened = try open(std.testing.allocator, std.testing.io, path);
+    defer reopened.close();
+    try expectBucketNames(try reopened.bucketNamesAlloc(std.testing.allocator), &.{ "archive", "users", "zeta" });
+}
+
+test "bucketNamesAlloc keeps read snapshots stable after namespace changes" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path = try tempFilePath(&path_buf, tmp.dir, "bucket-names-snapshot.db");
+
+    const db = try open(std.testing.allocator, std.testing.io, path);
+    defer db.close();
+
+    try db.createBucket("users");
+    try db.createBucket("teams");
+
+    var read_tx = try db.beginRead();
+    defer read_tx.deinit();
+
+    try db.createBucket("archive");
+    try db.deleteBucket("teams");
+    try db.put("plain", "value");
+
+    try expectBucketNames(try read_tx.bucketNamesAlloc(std.testing.allocator), &.{ "teams", "users" });
+    try expectBucketNames(try db.bucketNamesAlloc(std.testing.allocator), &.{ "archive", "users" });
 }
 
 test "bucket writes keep earlier read snapshots stable" {

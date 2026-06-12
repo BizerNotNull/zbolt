@@ -10,6 +10,7 @@ pub const compact = @import("compact.zig");
 pub const Meta = meta.Meta;
 pub const MetaError = meta.Error;
 pub const BucketError = namespace.Error;
+pub const BucketNames = namespace.BucketNames;
 pub const PageError = page.Error;
 pub const PageLayoutError = page.LayoutError;
 pub const DbOpenError = errors.DbOpenError;

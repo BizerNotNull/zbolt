@@ -15,8 +15,31 @@ pub const BucketRecord = struct {
     root_page_id: u64,
 };
 
+pub const RootEntry = union(enum) {
+    value: []const u8,
+    bucket: BucketRecord,
+};
+
+pub const BucketNames = struct {
+    items: [][]u8,
+
+    pub fn deinit(self: *BucketNames, allocator: std.mem.Allocator) void {
+        for (self.items) |item| allocator.free(item);
+        allocator.free(self.items);
+        self.items = &.{};
+    }
+};
+
 pub fn isBucketFlags(flags: u32) bool {
     return flags == bucket_entry_flag;
+}
+
+pub fn decodeRootEntry(value: []const u8, flags: u32) Error!RootEntry {
+    if (!isBucketFlags(flags)) {
+        return .{ .value = value };
+    }
+
+    return .{ .bucket = try decodeBucketRecord(value, flags) };
 }
 
 pub fn encodeBucketRecord(root_page_id: u64) Error![8]u8 {
@@ -56,4 +79,23 @@ test "decodeBucketRecord rejects non bucket flags" {
 
 test "decodeBucketRecord rejects invalid payload length" {
     try std.testing.expectError(error.InvalidBucketRecord, decodeBucketRecord("bad", bucket_entry_flag));
+}
+
+test "decodeRootEntry keeps plain values opaque" {
+    const decoded = try decodeRootEntry("plain", 0);
+
+    switch (decoded) {
+        .value => |value| try std.testing.expectEqualSlices(u8, "plain", value),
+        .bucket => return error.UnexpectedBucketEntry,
+    }
+}
+
+test "decodeRootEntry recognizes bucket namespace entries" {
+    const encoded = try encodeBucketRecord(17);
+    const decoded = try decodeRootEntry(encoded[0..], bucket_entry_flag);
+
+    switch (decoded) {
+        .value => return error.UnexpectedPlainValue,
+        .bucket => |record| try std.testing.expectEqual(@as(u64, 17), record.root_page_id),
+    }
 }
