@@ -84,8 +84,7 @@ pub const ReadTx = struct {
         bucket: []const u8,
     ) !bool {
         std.debug.assert(self.db != null);
-        _ = allocator;
-        return self.readView().bucketExistsInBucketPath(parent_bucket_path, bucket);
+        return self.readView().bucketExistsInBucketPath(allocator, parent_bucket_path, bucket);
     }
 
     /// Returns the top-level bucket names visible in this snapshot in key order.
@@ -336,8 +335,7 @@ pub const WriteTx = struct {
         bucket: []const u8,
     ) !bool {
         try self.ensureActive();
-        _ = allocator;
-        return self.readView().bucketExistsInBucketPath(parent_bucket_path, bucket);
+        return self.readView().bucketExistsInBucketPath(allocator, parent_bucket_path, bucket);
     }
 
     /// Returns the top-level bucket names visible in the current staged state.
@@ -782,19 +780,24 @@ const TxReadView = struct {
     }
 
     fn getInBucketPath(self: TxReadView, allocator: std.mem.Allocator, bucket_path: []const []const u8, key: []const u8) !?[]u8 {
-        const bucket_root_page_id = try self.resolveBucketPathRootPageId(bucket_path);
+        const bucket_root_page_id = try self.resolveBucketPathRootPageId(allocator, bucket_path);
         const entry = try tree.lookupEntryPageReader(self.page_reader, allocator, bucket_root_page_id, key);
         return rootEntryValueOrError(allocator, entry);
     }
 
-    fn bucketExistsInBucketPath(self: TxReadView, parent_bucket_path: []const []const u8, bucket: []const u8) !bool {
-        const parent_root_page_id = try self.resolveBucketPathRootPageId(parent_bucket_path);
-        const entry = try tree.lookupEntryPageReader(self.page_reader, self.temp_allocator, parent_root_page_id, bucket);
-        return try lookupEntryIsBucket(self.temp_allocator, entry);
+    fn bucketExistsInBucketPath(
+        self: TxReadView,
+        allocator: std.mem.Allocator,
+        parent_bucket_path: []const []const u8,
+        bucket: []const u8,
+    ) !bool {
+        const parent_root_page_id = try self.resolveBucketPathRootPageId(allocator, parent_bucket_path);
+        const entry = try tree.lookupEntryPageReader(self.page_reader, allocator, parent_root_page_id, bucket);
+        return try lookupEntryIsBucket(allocator, entry);
     }
 
     fn bucketNamesInBucketPathAlloc(self: TxReadView, allocator: std.mem.Allocator, parent_bucket_path: []const []const u8) !namespace.BucketNames {
-        const parent_root_page_id = try self.resolveBucketPathRootPageId(parent_bucket_path);
+        const parent_root_page_id = try self.resolveBucketPathRootPageId(allocator, parent_bucket_path);
         var bucket_cursor = self.cursorAtRoot(parent_root_page_id);
         defer bucket_cursor.deinit();
         return collectBucketNamesAlloc(&bucket_cursor, allocator);
@@ -809,17 +812,17 @@ const TxReadView = struct {
     }
 
     fn cursorInBucketPath(self: TxReadView, bucket_path: []const []const u8) !tree.Cursor {
-        const bucket_root_page_id = try self.resolveBucketPathRootPageId(bucket_path);
+        const bucket_root_page_id = try self.resolveBucketPathRootPageId(self.temp_allocator, bucket_path);
         return self.cursorAtRoot(bucket_root_page_id);
     }
 
     fn scanInBucketPathAlloc(self: TxReadView, allocator: std.mem.Allocator, bucket_path: []const []const u8, bounds: ScanBounds) !ScanRecords {
-        const bucket_root_page_id = try self.resolveBucketPathRootPageId(bucket_path);
+        const bucket_root_page_id = try self.resolveBucketPathRootPageId(allocator, bucket_path);
         return self.scanRangeAtRootAlloc(allocator, bucket_root_page_id, bounds);
     }
 
-    fn resolveBucketPathRootPageId(self: TxReadView, bucket_path: []const []const u8) !u64 {
-        return resolveBucketPathPageReaderRootPageId(self.page_reader, self.temp_allocator, self.root_page_id, bucket_path);
+    fn resolveBucketPathRootPageId(self: TxReadView, allocator: std.mem.Allocator, bucket_path: []const []const u8) !u64 {
+        return resolveBucketPathPageReaderRootPageId(self.page_reader, allocator, self.root_page_id, bucket_path);
     }
 
     fn cursorAtRoot(self: TxReadView, root_page_id: u64) tree.Cursor {
