@@ -123,7 +123,7 @@ pub const SnapshotSource = struct {
 
     pub fn init(db: *db_mod.DB, snapshot: ReadSnapshot, file: std.Io.File) SnapshotSource {
         return .{
-            .io = db.io_threaded.io(),
+            .io = db.io,
             .file = file,
             .page_size = db.page_size,
             .snapshot = snapshot,
@@ -1744,13 +1744,13 @@ fn openTestDb(tmp: std.testing.TmpDir, file_name: []const u8, page_size: u32, ro
     var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const path = try tempFilePath(&path_buf, tmp.dir, file_name);
     try createDatabaseFile(path, page_size, root_page_id, pages);
-    return db_mod.open(std.testing.allocator, path);
+    return db_mod.open(std.testing.allocator, std.testing.io, path);
 }
 
 fn openEmptyDb(tmp: std.testing.TmpDir, file_name: []const u8) !*db_mod.DB {
     var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const path = try tempFilePath(&path_buf, tmp.dir, file_name);
-    return db_mod.open(std.testing.allocator, path);
+    return db_mod.open(std.testing.allocator, std.testing.io, path);
 }
 
 fn generatedKey(buf: []u8, index: usize) ![]const u8 {

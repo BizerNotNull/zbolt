@@ -2,6 +2,9 @@
 
 The zbolt project is an embedded kv database for zig. The specific architecture will be similar to bbolt.
 
+Callers provide the Zig `std.Io` context when opening a `zbolt.DB`, so the
+application keeps control over IO runtime selection and lifecycle.
+
 Current capabilities include:
 
 - single-file open/bootstrap and meta recovery
