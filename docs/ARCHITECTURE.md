@@ -150,7 +150,8 @@ The `flags` field can be used to mark:
 - bucket or table entries
 - large `page object` values or references to externally stored values
 
-If nested buckets are supported in the future, then some entries in a leaf page will not be ordinary values but rather the root information of child buckets.
+When nested buckets are used, some entries in a leaf page are not ordinary
+values but rather the root information of child buckets.
 
 ### 3.5 Top-Level Namespace
 
