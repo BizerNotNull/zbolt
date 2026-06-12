@@ -847,6 +847,11 @@ fn expectBucketMissing(db: *DB, bucket: []const u8, key: []const u8) !void {
     try std.testing.expect(value == null);
 }
 
+fn expectCursorRecord(record: tree.CursorRecord, expected_key: []const u8, expected_value: []const u8) !void {
+    try std.testing.expectEqualSlices(u8, expected_key, record.key);
+    try std.testing.expectEqualSlices(u8, expected_value, record.value);
+}
+
 fn expectReadTxValue(read_tx: tx.ReadTx, key: []const u8, expected: []const u8) !void {
     const value = (try read_tx.get(std.testing.allocator, key)).?;
     defer std.testing.allocator.free(value);
@@ -3517,6 +3522,91 @@ test "bucket writes keep earlier read snapshots stable" {
     try expectBucketValue(db, "users", "bob", "three");
 }
 
+test "bucket cursor traverses entries in order and supports seek" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path = try tempFilePath(&path_buf, tmp.dir, "bucket-cursor.db");
+
+    const db = try open(std.testing.allocator, path);
+    defer db.close();
+
+    try db.createBucket("users");
+    try db.putInBucket("users", "gamma", "three");
+    try db.putInBucket("users", "alpha", "one");
+    try db.putInBucket("users", "omega", "four");
+
+    var read_tx = try db.beginRead();
+    defer read_tx.deinit();
+    var cursor = try read_tx.cursorInBucket(std.testing.allocator, "users");
+    defer cursor.deinit();
+
+    var first = (try cursor.first(std.testing.allocator)).?;
+    defer first.deinit(std.testing.allocator);
+    try expectCursorRecord(first, "alpha", "one");
+
+    var seek = (try cursor.seek(std.testing.allocator, "delta")).?;
+    defer seek.deinit(std.testing.allocator);
+    try expectCursorRecord(seek, "gamma", "three");
+
+    var next = (try cursor.next(std.testing.allocator)).?;
+    defer next.deinit(std.testing.allocator);
+    try expectCursorRecord(next, "omega", "four");
+
+    try std.testing.expect((try cursor.next(std.testing.allocator)) == null);
+}
+
+test "bucket cursor reports missing and non-bucket namespace entries" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path = try tempFilePath(&path_buf, tmp.dir, "bucket-cursor-errors.db");
+
+    const db = try open(std.testing.allocator, path);
+    defer db.close();
+
+    try db.put("plain", "value");
+
+    var read_tx = try db.beginRead();
+    defer read_tx.deinit();
+
+    try std.testing.expectError(error.BucketNotFound, read_tx.cursorInBucket(std.testing.allocator, "users"));
+    try std.testing.expectError(error.KeyNotBucket, read_tx.cursorInBucket(std.testing.allocator, "plain"));
+}
+
+test "bucket cursor keeps its snapshot stable after bucket writes" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path = try tempFilePath(&path_buf, tmp.dir, "bucket-cursor-snapshot.db");
+
+    const db = try open(std.testing.allocator, path);
+    defer db.close();
+
+    try db.createBucket("users");
+    try db.putInBucket("users", "alice", "one");
+
+    var read_tx = try db.beginRead();
+    defer read_tx.deinit();
+    var cursor = try read_tx.cursorInBucket(std.testing.allocator, "users");
+    defer cursor.deinit();
+
+    try db.putInBucket("users", "alice", "two");
+    try db.putInBucket("users", "bob", "three");
+
+    var first = (try cursor.first(std.testing.allocator)).?;
+    defer first.deinit(std.testing.allocator);
+    try expectCursorRecord(first, "alice", "one");
+    try std.testing.expect((try cursor.next(std.testing.allocator)) == null);
+    try std.testing.expect((try cursor.seek(std.testing.allocator, "bob")) == null);
+
+    try expectBucketValue(db, "users", "alice", "two");
+    try expectBucketValue(db, "users", "bob", "three");
+}
+
 test "deleteBucket keeps the removed bucket visible to older snapshots" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -3539,5 +3629,38 @@ test "deleteBucket keeps the removed bucket visible to older snapshots" {
     defer std.testing.allocator.free(alice_before);
     try std.testing.expectEqualSlices(u8, "one", alice_before);
 
+    try std.testing.expectError(error.BucketNotFound, db.getInBucket(std.testing.allocator, "users", "alice"));
+}
+
+test "bucket cursor keeps the removed bucket visible to older snapshots" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path = try tempFilePath(&path_buf, tmp.dir, "bucket-cursor-delete-snapshot.db");
+
+    const db = try open(std.testing.allocator, path);
+    defer db.close();
+
+    try db.createBucket("users");
+    try db.putInBucket("users", "alice", "one");
+    try db.putInBucket("users", "bob", "two");
+
+    var read_tx = try db.beginRead();
+    defer read_tx.deinit();
+    var cursor = try read_tx.cursorInBucket(std.testing.allocator, "users");
+    defer cursor.deinit();
+
+    try db.deleteBucket("users");
+
+    var first = (try cursor.first(std.testing.allocator)).?;
+    defer first.deinit(std.testing.allocator);
+    try expectCursorRecord(first, "alice", "one");
+
+    var second = (try cursor.next(std.testing.allocator)).?;
+    defer second.deinit(std.testing.allocator);
+    try expectCursorRecord(second, "bob", "two");
+
+    try std.testing.expect((try cursor.next(std.testing.allocator)) == null);
     try std.testing.expectError(error.BucketNotFound, db.getInBucket(std.testing.allocator, "users", "alice"));
 }

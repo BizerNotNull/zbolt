@@ -211,13 +211,32 @@ pub const Cursor = struct {
     snapshot_source: ?*const SnapshotSource,
     owner_db: ?*const ?*db_mod.DB,
     temp_allocator: std.mem.Allocator,
+    root_page_id: u64,
     state: CursorState,
+
+    pub fn init(
+        snapshot_source: *const SnapshotSource,
+        owner_db: *const ?*db_mod.DB,
+        temp_allocator: std.mem.Allocator,
+        root_page_id: u64,
+    ) Cursor {
+        return .{
+            .snapshot_source = snapshot_source,
+            .owner_db = owner_db,
+            .temp_allocator = temp_allocator,
+            // The cursor root stays explicit so bucket traversal can reuse the
+            // same snapshot and page reader while starting from a detached
+            // subtree root.
+            .root_page_id = root_page_id,
+            .state = .unpositioned,
+        };
+    }
 
     /// Repositions the cursor to the first record visible in this snapshot.
     pub fn first(self: *Cursor, allocator: std.mem.Allocator) CursorError!?CursorRecord {
         const snapshot_source = self.snapshot_source orelse return error.CursorUnpositioned;
         if (!self.ownerIsActive()) return error.CursorUnpositioned;
-        const position = try locateFirstPosition(snapshot_source, self.temp_allocator);
+        const position = try locateFirstPosition(snapshot_source, self.temp_allocator, self.root_page_id);
         return try self.setPositionAndMaterialize(allocator, position);
     }
 
@@ -225,7 +244,7 @@ pub const Cursor = struct {
     pub fn seek(self: *Cursor, allocator: std.mem.Allocator, key: []const u8) CursorError!?CursorRecord {
         const snapshot_source = self.snapshot_source orelse return error.CursorUnpositioned;
         if (!self.ownerIsActive()) return error.CursorUnpositioned;
-        const position = try locateSeekPosition(snapshot_source, self.temp_allocator, key);
+        const position = try locateSeekPosition(snapshot_source, self.temp_allocator, self.root_page_id, key);
         return try self.setPositionAndMaterialize(allocator, position);
     }
 
@@ -659,13 +678,22 @@ fn findEntryInLeaf(leaf_page: page.LeafPage, allocator: std.mem.Allocator, key: 
     return null;
 }
 
-fn locateFirstPosition(snapshot_source: *const SnapshotSource, allocator: std.mem.Allocator) CursorError!?CursorPosition {
+fn locateFirstPosition(
+    snapshot_source: *const SnapshotSource,
+    allocator: std.mem.Allocator,
+    root_page_id: u64,
+) CursorError!?CursorPosition {
     const path = PathStack.init();
-    return try descendToLeftmostPosition(snapshot_source, allocator, snapshot_source.snapshot.root_page_id, path, true);
+    return try descendToLeftmostPosition(snapshot_source, allocator, root_page_id, path, true);
 }
 
-fn locateSeekPosition(snapshot_source: *const SnapshotSource, allocator: std.mem.Allocator, key: []const u8) CursorError!?CursorPosition {
-    var page_id = snapshot_source.snapshot.root_page_id;
+fn locateSeekPosition(
+    snapshot_source: *const SnapshotSource,
+    allocator: std.mem.Allocator,
+    root_page_id: u64,
+    key: []const u8,
+) CursorError!?CursorPosition {
+    var page_id = root_page_id;
     var path = PathStack.init();
 
     while (true) {

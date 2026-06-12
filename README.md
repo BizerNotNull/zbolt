@@ -9,6 +9,6 @@ Current capabilities include:
 - snapshot read transactions
 - single-writer `put` / `delete`
 - bucket-scoped `put` / `delete`
-- read cursor traversal
+- read cursor traversal, including bucket-scoped cursor traversal
 - persisted delayed reclaim through allocator state pages
 - explicit `compact()` file rewriting with state reload

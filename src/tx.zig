@@ -56,12 +56,24 @@ pub const ReadTx = struct {
     /// Opens a read-only cursor pinned to this transaction's snapshot.
     pub fn cursor(self: *const ReadTx) tree.Cursor {
         std.debug.assert(self.db != null);
-        return .{
-            .snapshot_source = &self.snapshot_source,
-            .owner_db = &self.db,
-            .temp_allocator = self.db.?.allocator,
-            .state = .unpositioned,
-        };
+        return tree.Cursor.init(
+            &self.snapshot_source,
+            &self.db,
+            self.db.?.allocator,
+            self.snapshot.root_page_id,
+        );
+    }
+
+    /// Opens a read-only cursor pinned to the snapshot root of `bucket`.
+    pub fn cursorInBucket(self: *const ReadTx, allocator: std.mem.Allocator, bucket: []const u8) !tree.Cursor {
+        std.debug.assert(self.db != null);
+        const bucket_root_page_id = try self.bucketRootPageId(allocator, bucket);
+        return tree.Cursor.init(
+            &self.snapshot_source,
+            &self.db,
+            self.db.?.allocator,
+            bucket_root_page_id,
+        );
     }
 };
 
