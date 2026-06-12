@@ -6,19 +6,21 @@ pub const Error = errors.StorageError;
 pub const OpenDatabaseFileError = std.Io.File.OpenError || error{
     DatabaseLocked,
 };
+const database_file_lock: std.Io.File.Lock = .exclusive;
+const database_file_lock_nonblocking = true;
 
 pub fn openDatabaseFileAbsolute(io: std.Io, path: []const u8) OpenDatabaseFileError!std.Io.File {
     return std.Io.Dir.openFileAbsolute(io, path, .{
         .mode = .read_write,
-        .lock = .exclusive,
-        .lock_nonblocking = true,
+        .lock = database_file_lock,
+        .lock_nonblocking = database_file_lock_nonblocking,
     }) catch |err| switch (err) {
         error.WouldBlock => error.DatabaseLocked,
         error.FileNotFound => std.Io.Dir.createFileAbsolute(io, path, .{
             .read = true,
             .truncate = false,
-            .lock = .exclusive,
-            .lock_nonblocking = true,
+            .lock = database_file_lock,
+            .lock_nonblocking = database_file_lock_nonblocking,
         }) catch |create_err| switch (create_err) {
             error.WouldBlock => error.DatabaseLocked,
             else => return create_err,
