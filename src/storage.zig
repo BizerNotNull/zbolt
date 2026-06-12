@@ -3,6 +3,29 @@ const errors = @import("errors.zig");
 const page = @import("page.zig");
 
 pub const Error = errors.StorageError;
+pub const OpenDatabaseFileError = std.Io.File.OpenError || error{
+    DatabaseLocked,
+};
+
+pub fn openDatabaseFileAbsolute(io: std.Io, path: []const u8) OpenDatabaseFileError!std.Io.File {
+    return std.Io.Dir.openFileAbsolute(io, path, .{
+        .mode = .read_write,
+        .lock = .exclusive,
+        .lock_nonblocking = true,
+    }) catch |err| switch (err) {
+        error.WouldBlock => error.DatabaseLocked,
+        error.FileNotFound => std.Io.Dir.createFileAbsolute(io, path, .{
+            .read = true,
+            .truncate = false,
+            .lock = .exclusive,
+            .lock_nonblocking = true,
+        }) catch |create_err| switch (create_err) {
+            error.WouldBlock => error.DatabaseLocked,
+            else => return create_err,
+        },
+        else => return err,
+    };
+}
 
 pub fn readPageAlloc(
     allocator: std.mem.Allocator,
@@ -180,4 +203,18 @@ test "writePageObject stores order one objects at base-page offsets" {
     const read_back = try readPageObjectAlloc(std.testing.allocator, &file, io, 2, page_size, 3, 1);
     defer std.testing.allocator.free(read_back);
     try std.testing.expectEqualSlices(u8, object_bytes[0..], read_back);
+}
+
+test "openDatabaseFileAbsolute returns database locked when exclusive lock is already held" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path = try tempFilePath(&path_buf, tmp.dir, "locked.db");
+
+    const io = std.testing.io;
+    var first = try openDatabaseFileAbsolute(io, path);
+    defer first.close(io);
+
+    try std.testing.expectError(error.DatabaseLocked, openDatabaseFileAbsolute(io, path));
 }

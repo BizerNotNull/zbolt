@@ -204,11 +204,8 @@ pub fn open(allocator: std.mem.Allocator, path: []const u8) !*DB {
 
     const io = db.io_threaded.io();
 
-    db.file = std.Io.Dir.openFileAbsolute(io, path, .{ .mode = .read_write }) catch |err| switch (err) {
-        error.FileNotFound => try std.Io.Dir.createFileAbsolute(io, path, .{
-            .read = true,
-            .truncate = false,
-        }),
+    db.file = storage.openDatabaseFileAbsolute(io, path) catch |err| switch (err) {
+        error.DatabaseLocked => return errors.DbOpenError.DatabaseLocked,
         else => return err,
     };
     db.file_open = true;
@@ -1250,6 +1247,37 @@ test "open maps invalid meta recovery into centralized db error" {
     }
 
     try std.testing.expectError(errors.DbOpenError.InvalidDatabaseFile, open(std.testing.allocator, path));
+}
+
+test "open fails with database locked while another handle owns the exclusive lock" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path = try tempFilePath(&path_buf, tmp.dir, "open-locked.db");
+
+    const db = try open(std.testing.allocator, path);
+    defer db.close();
+
+    try std.testing.expectError(errors.DbOpenError.DatabaseLocked, open(std.testing.allocator, path));
+}
+
+test "open succeeds again after the previous handle closes" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path = try tempFilePath(&path_buf, tmp.dir, "open-after-close.db");
+
+    {
+        const db = try open(std.testing.allocator, path);
+        db.close();
+    }
+
+    const reopened = try open(std.testing.allocator, path);
+    defer reopened.close();
+
+    try std.testing.expectEqual(default_page_size, reopened.page_size);
 }
 
 test "put commits a new root leaf and updates selected meta" {
@@ -2689,44 +2717,46 @@ test "write transaction keeps earlier staged pages that are still referenced by 
     var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const path = try tempFilePath(&path_buf, tmp.dir, "write-tx-staged-page-survives.db");
 
-    const db = try open(std.testing.allocator, path);
-    defer db.close();
+    {
+        const db = try open(std.testing.allocator, path);
+        defer db.close();
 
-    var value_buf = [_]u8{'x'} ** 160;
-    var index: usize = 0;
-    while (index < 24) : (index += 1) {
-        var key_buf: [5]u8 = undefined;
-        const key = try generatedKey(&key_buf, index);
-        try db.put(key, value_buf[0..]);
+        var value_buf = [_]u8{'x'} ** 160;
+        var index: usize = 0;
+        while (index < 24) : (index += 1) {
+            var key_buf: [5]u8 = undefined;
+            const key = try generatedKey(&key_buf, index);
+            try db.put(key, value_buf[0..]);
+        }
+
+        var write_tx = try db.beginWrite();
+        defer write_tx.rollback() catch {};
+
+        try write_tx.put("k0000", "left");
+
+        const first_root_page_id = write_tx.view.?.current_root_page_id;
+        const first_root_page = stagedPageBytes(&write_tx, first_root_page_id);
+        const first_root_branch = try page.BranchPage.validate(first_root_page);
+        const first_left_child = try first_root_branch.entry(0);
+        const first_right_child = try first_root_branch.entry(1);
+
+        try write_tx.put("k0023", "right");
+
+        try std.testing.expect(!write_tx.view.?.staged_pages.contains(first_root_page_id));
+        try std.testing.expect(write_tx.view.?.staged_pages.contains(first_left_child.child_page_id));
+
+        const second_root_branch = try stagedRootBranch(&write_tx);
+        try std.testing.expectEqual(@as(u16, 2), second_root_branch.count());
+        const second_left_child = try second_root_branch.entry(0);
+        const second_right_child = try second_root_branch.entry(1);
+        try std.testing.expectEqual(first_left_child.child_page_id, second_left_child.child_page_id);
+        try std.testing.expect(second_right_child.child_page_id != first_right_child.child_page_id);
+
+        try write_tx.commit();
+
+        try expectDbValue(db, "k0000", "left");
+        try expectDbValue(db, "k0023", "right");
     }
-
-    var write_tx = try db.beginWrite();
-    defer write_tx.rollback() catch {};
-
-    try write_tx.put("k0000", "left");
-
-    const first_root_page_id = write_tx.view.?.current_root_page_id;
-    const first_root_page = stagedPageBytes(&write_tx, first_root_page_id);
-    const first_root_branch = try page.BranchPage.validate(first_root_page);
-    const first_left_child = try first_root_branch.entry(0);
-    const first_right_child = try first_root_branch.entry(1);
-
-    try write_tx.put("k0023", "right");
-
-    try std.testing.expect(!write_tx.view.?.staged_pages.contains(first_root_page_id));
-    try std.testing.expect(write_tx.view.?.staged_pages.contains(first_left_child.child_page_id));
-
-    const second_root_branch = try stagedRootBranch(&write_tx);
-    try std.testing.expectEqual(@as(u16, 2), second_root_branch.count());
-    const second_left_child = try second_root_branch.entry(0);
-    const second_right_child = try second_root_branch.entry(1);
-    try std.testing.expectEqual(first_left_child.child_page_id, second_left_child.child_page_id);
-    try std.testing.expect(second_right_child.child_page_id != first_right_child.child_page_id);
-
-    try write_tx.commit();
-
-    try expectDbValue(db, "k0000", "left");
-    try expectDbValue(db, "k0023", "right");
 
     const reopened = try open(std.testing.allocator, path);
     defer reopened.close();
@@ -2741,16 +2771,18 @@ test "db delete removes a committed key and persists the change" {
     var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const path = try tempFilePath(&path_buf, tmp.dir, "db-delete-persist.db");
 
-    const db = try open(std.testing.allocator, path);
-    defer db.close();
+    {
+        const db = try open(std.testing.allocator, path);
+        defer db.close();
 
-    try db.put("alpha", "one");
-    try db.put("beta", "two");
+        try db.put("alpha", "one");
+        try db.put("beta", "two");
 
-    try db.delete("alpha");
+        try db.delete("alpha");
 
-    try expectDbMissing(db, "alpha");
-    try expectDbValue(db, "beta", "two");
+        try expectDbMissing(db, "alpha");
+        try expectDbValue(db, "beta", "two");
+    }
 
     const reopened = try open(std.testing.allocator, path);
     defer reopened.close();
