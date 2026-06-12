@@ -48,6 +48,21 @@ pub const ReadTx = struct {
         return rootEntryValueOrError(allocator, entry);
     }
 
+    /// Returns whether `bucket` exists in this snapshot and is a bucket namespace entry.
+    pub fn bucketExists(self: *const ReadTx, allocator: std.mem.Allocator, bucket: []const u8) !bool {
+        std.debug.assert(self.db != null);
+        const entry = try tree.lookupEntrySnapshotSource(&self.snapshot_source, allocator, bucket);
+        return try lookupEntryIsBucket(allocator, entry);
+    }
+
+    /// Returns the top-level bucket names visible in this snapshot in key order.
+    pub fn bucketNamesAlloc(self: *const ReadTx, allocator: std.mem.Allocator) !namespace.BucketNames {
+        std.debug.assert(self.db != null);
+        var bucket_cursor = self.cursor();
+        defer bucket_cursor.deinit();
+        return collectBucketNamesAlloc(&bucket_cursor, allocator);
+    }
+
     fn bucketRootPageId(self: *const ReadTx, allocator: std.mem.Allocator, bucket: []const u8) !u64 {
         const entry = try tree.lookupEntrySnapshotSource(&self.snapshot_source, allocator, bucket);
         return try bucketRootPageIdFromLookup(allocator, entry);
@@ -447,12 +462,14 @@ pub const WriteTx = struct {
 
 fn rootEntryValueOrError(allocator: std.mem.Allocator, entry: ?tree.LookupEntry) !?[]u8 {
     const owned_entry = entry orelse return null;
-    if (namespace.isBucketFlags(owned_entry.flags)) {
-        var rejected_entry = owned_entry;
-        rejected_entry.deinit(allocator);
-        return error.KeyBelongsToBucket;
+    switch (try namespace.decodeRootEntry(owned_entry.value, owned_entry.flags)) {
+        .value => return owned_entry.value,
+        .bucket => {
+            var rejected_entry = owned_entry;
+            rejected_entry.deinit(allocator);
+            return error.KeyBelongsToBucket;
+        },
     }
-    return owned_entry.value;
 }
 
 fn ensureRootKeyMutable(page_reader: tree.PageReader, allocator: std.mem.Allocator, root_page_id: u64, key: []const u8) !void {
@@ -471,12 +488,57 @@ fn bucketRootPageIdFromLookup(allocator: std.mem.Allocator, entry: ?tree.LookupE
         released_entry.deinit(allocator);
     }
 
-    return try owned_entry.bucketRootPageId();
+    return switch (try namespace.decodeRootEntry(owned_entry.value, owned_entry.flags)) {
+        .bucket => |record| record.root_page_id,
+        .value => error.KeyNotBucket,
+    };
 }
 
 fn currentBucketRootPageId(view: *const UncommittedView, allocator: std.mem.Allocator, bucket: []const u8) !u64 {
     const entry = try tree.lookupEntryPageReader(view.pageReader(), allocator, view.current_root_page_id, bucket);
     return try bucketRootPageIdFromLookup(allocator, entry);
+}
+
+fn lookupEntryIsBucket(allocator: std.mem.Allocator, entry: ?tree.LookupEntry) !bool {
+    const owned_entry = entry orelse return false;
+    defer {
+        var released_entry = owned_entry;
+        released_entry.deinit(allocator);
+    }
+
+    return switch (try namespace.decodeRootEntry(owned_entry.value, owned_entry.flags)) {
+        .bucket => true,
+        .value => false,
+    };
+}
+
+fn collectBucketNamesAlloc(cursor: *tree.Cursor, allocator: std.mem.Allocator) !namespace.BucketNames {
+    var names = std.ArrayList([]u8).empty;
+    errdefer {
+        for (names.items) |name| allocator.free(name);
+        names.deinit(allocator);
+    }
+
+    var next_record = try cursor.first(allocator);
+    while (next_record) |record| {
+        var owned_record = record;
+        defer owned_record.deinit(allocator);
+
+        switch (try namespace.decodeRootEntry(owned_record.value, owned_record.flags)) {
+            .value => {},
+            .bucket => {
+                const owned_name = try allocator.dupe(u8, owned_record.key);
+                errdefer allocator.free(owned_name);
+                try names.append(allocator, owned_name);
+            },
+        }
+
+        next_record = try cursor.next(allocator);
+    }
+
+    return .{
+        .items = try names.toOwnedSlice(allocator),
+    };
 }
 
 fn collectCommittedTreePagesAlloc(page_reader: tree.PageReader, allocator: std.mem.Allocator, root_page_id: u64) ![]reclaim.ReleasedPage {
