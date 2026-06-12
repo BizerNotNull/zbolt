@@ -158,25 +158,14 @@ pub const ReadTx = struct {
 
     fn resolveBucketPathRootPageId(self: *const ReadTx, allocator: std.mem.Allocator, bucket_path: []const []const u8) !u64 {
         std.debug.assert(self.db != null);
-
-        var current_root_page_id = self.snapshot.root_page_id;
-        for (bucket_path) |bucket| {
-            const entry = try tree.lookupEntrySnapshotSourceAtRoot(
-                &self.snapshot_source,
-                allocator,
-                current_root_page_id,
-                bucket,
-            );
-            current_root_page_id = try bucketRootPageIdFromLookup(allocator, entry);
-        }
-        return current_root_page_id;
+        return resolveBucketPathPageReaderRootPageId(self.snapshot_source.pageReader(), allocator, self.snapshot.root_page_id, bucket_path);
     }
 
     fn cursorAtRoot(self: *const ReadTx, root_page_id: u64) tree.Cursor {
         std.debug.assert(self.db != null);
         return tree.Cursor.init(
-            &self.snapshot_source,
-            &self.db,
+            self.snapshot_source.pageReader(),
+            cursorOwnerForReadTx(self),
             self.db.?.allocator,
             root_page_id,
         );
@@ -330,8 +319,157 @@ pub const WriteTx = struct {
         };
     }
 
+    /// Returns an owned copy of the latest value visible inside this write
+    /// transaction, including staged uncommitted changes.
+    pub fn get(self: *const WriteTx, allocator: std.mem.Allocator, key: []const u8) !?[]u8 {
+        try self.ensureActive();
+        const view = &self.view.?;
+        const entry = try tree.lookupEntryPageReader(view.pageReader(), allocator, view.current_root_page_id, key);
+        return rootEntryValueOrError(allocator, entry);
+    }
+
+    /// Returns an owned copy of the value stored inside `bucket` for `key`,
+    /// including staged bucket mutations in this transaction.
+    pub fn getInBucket(self: *const WriteTx, allocator: std.mem.Allocator, bucket: []const u8, key: []const u8) !?[]u8 {
+        const bucket_path = [_][]const u8{bucket};
+        return self.getInBucketPath(allocator, bucket_path[0..], key);
+    }
+
+    /// Returns an owned copy of the value stored inside the bucket at
+    /// `bucket_path`, including staged bucket mutations in this transaction.
+    pub fn getInBucketPath(
+        self: *const WriteTx,
+        allocator: std.mem.Allocator,
+        bucket_path: []const []const u8,
+        key: []const u8,
+    ) !?[]u8 {
+        try self.ensureActive();
+        const view = &self.view.?;
+        const bucket_root_page_id = try resolveBucketPathPageReaderRootPageId(
+            view.pageReader(),
+            self.db.allocator,
+            view.current_root_page_id,
+            bucket_path,
+        );
+        const entry = try tree.lookupEntryPageReader(view.pageReader(), allocator, bucket_root_page_id, key);
+        return rootEntryValueOrError(allocator, entry);
+    }
+
+    /// Returns whether `bucket` exists in the current staged root snapshot.
+    pub fn bucketExists(self: *const WriteTx, allocator: std.mem.Allocator, bucket: []const u8) !bool {
+        const parent_bucket_path: [0][]const u8 = .{};
+        return self.bucketExistsInBucketPath(allocator, parent_bucket_path[0..], bucket);
+    }
+
+    /// Returns whether `bucket` exists inside the bucket at
+    /// `parent_bucket_path`, including staged namespace mutations.
+    pub fn bucketExistsInBucketPath(
+        self: *const WriteTx,
+        allocator: std.mem.Allocator,
+        parent_bucket_path: []const []const u8,
+        bucket: []const u8,
+    ) !bool {
+        try self.ensureActive();
+        const view = &self.view.?;
+        const parent_root_page_id = try resolveBucketPathPageReaderRootPageId(
+            view.pageReader(),
+            allocator,
+            view.current_root_page_id,
+            parent_bucket_path,
+        );
+        const entry = try tree.lookupEntryPageReader(view.pageReader(), allocator, parent_root_page_id, bucket);
+        return try lookupEntryIsBucket(allocator, entry);
+    }
+
+    /// Returns the top-level bucket names visible in the current staged state.
+    pub fn bucketNamesAlloc(self: *const WriteTx, allocator: std.mem.Allocator) !namespace.BucketNames {
+        const parent_bucket_path: [0][]const u8 = .{};
+        return self.bucketNamesInBucketPathAlloc(allocator, parent_bucket_path[0..]);
+    }
+
+    /// Returns the direct child bucket names visible inside the bucket at
+    /// `parent_bucket_path`, including staged namespace mutations.
+    pub fn bucketNamesInBucketPathAlloc(
+        self: *const WriteTx,
+        allocator: std.mem.Allocator,
+        parent_bucket_path: []const []const u8,
+    ) !namespace.BucketNames {
+        try self.ensureActive();
+        const view = &self.view.?;
+        const parent_root_page_id = try resolveBucketPathPageReaderRootPageId(
+            view.pageReader(),
+            self.db.allocator,
+            view.current_root_page_id,
+            parent_bucket_path,
+        );
+        var bucket_cursor = self.cursorAtRoot(parent_root_page_id);
+        defer bucket_cursor.deinit();
+        return collectBucketNamesAlloc(&bucket_cursor, allocator);
+    }
+
+    /// Returns owned records whose keys fall within `[start_inclusive, end_exclusive)`
+    /// in the current staged root snapshot.
+    pub fn scanAlloc(self: *const WriteTx, allocator: std.mem.Allocator, bounds: ScanBounds) !ScanRecords {
+        try self.ensureActive();
+        const view = &self.view.?;
+        return self.scanRangeAtRootAlloc(allocator, view.current_root_page_id, bounds);
+    }
+
+    /// Opens a read-only cursor pinned to the current staged root snapshot.
+    pub fn cursor(self: *const WriteTx) !tree.Cursor {
+        try self.ensureActive();
+        return self.cursorAtRoot(self.view.?.current_root_page_id);
+    }
+
+    /// Opens a read-only cursor pinned to the current staged snapshot root of
+    /// `bucket`.
+    pub fn cursorInBucket(self: *const WriteTx, bucket: []const u8) !tree.Cursor {
+        const bucket_path = [_][]const u8{bucket};
+        return self.cursorInBucketPath(bucket_path[0..]);
+    }
+
+    /// Opens a read-only cursor pinned to the current staged snapshot root of
+    /// the bucket at `bucket_path`.
+    pub fn cursorInBucketPath(self: *const WriteTx, bucket_path: []const []const u8) !tree.Cursor {
+        try self.ensureActive();
+        const view = &self.view.?;
+        const bucket_root_page_id = try resolveBucketPathPageReaderRootPageId(
+            view.pageReader(),
+            self.db.allocator,
+            view.current_root_page_id,
+            bucket_path,
+        );
+        return self.cursorAtRoot(bucket_root_page_id);
+    }
+
+    /// Returns owned records from `bucket` whose keys fall within
+    /// `[start_inclusive, end_exclusive)` in the current staged snapshot.
+    pub fn scanInBucketAlloc(self: *const WriteTx, allocator: std.mem.Allocator, bucket: []const u8, bounds: ScanBounds) !ScanRecords {
+        const bucket_path = [_][]const u8{bucket};
+        return self.scanInBucketPathAlloc(allocator, bucket_path[0..], bounds);
+    }
+
+    /// Returns owned records from the bucket at `bucket_path` whose keys fall
+    /// within `[start_inclusive, end_exclusive)` in the current staged snapshot.
+    pub fn scanInBucketPathAlloc(
+        self: *const WriteTx,
+        allocator: std.mem.Allocator,
+        bucket_path: []const []const u8,
+        bounds: ScanBounds,
+    ) !ScanRecords {
+        try self.ensureActive();
+        const view = &self.view.?;
+        const bucket_root_page_id = try resolveBucketPathPageReaderRootPageId(
+            view.pageReader(),
+            self.db.allocator,
+            view.current_root_page_id,
+            bucket_path,
+        );
+        return self.scanRangeAtRootAlloc(allocator, bucket_root_page_id, bounds);
+    }
+
     pub fn put(self: *WriteTx, key: []const u8, value: []const u8) !void {
-        try self.ensureActiveForMutation();
+        try self.ensureActive();
         const view = &self.view.?;
         try ensureRootKeyMutable(view.pageReader(), self.arena.allocator(), view.current_root_page_id, key);
         const write_result = try tree.writePut(
@@ -350,7 +488,7 @@ pub const WriteTx = struct {
     }
 
     pub fn delete(self: *WriteTx, key: []const u8) !void {
-        try self.ensureActiveForMutation();
+        try self.ensureActive();
         const view = &self.view.?;
         try ensureRootKeyMutable(view.pageReader(), self.arena.allocator(), view.current_root_page_id, key);
         const delete_mutation = try tree.writeDelete(
@@ -378,7 +516,7 @@ pub const WriteTx = struct {
     }
 
     pub fn createBucketInBucketPath(self: *WriteTx, parent_bucket_path: []const []const u8, bucket: []const u8) !void {
-        try self.ensureActiveForMutation();
+        try self.ensureActive();
         const view = &self.view.?;
         const parent_root_page_id = try resolveBucketPathCurrentRootPageId(view, self.arena.allocator(), parent_bucket_path);
         const existing = try tree.lookupEntryPageReader(view.pageReader(), self.arena.allocator(), parent_root_page_id, bucket);
@@ -414,7 +552,7 @@ pub const WriteTx = struct {
     }
 
     pub fn deleteBucketInBucketPath(self: *WriteTx, parent_bucket_path: []const []const u8, bucket: []const u8) !void {
-        try self.ensureActiveForMutation();
+        try self.ensureActive();
         const view = &self.view.?;
         const parent_root_page_id = try resolveBucketPathCurrentRootPageId(view, self.arena.allocator(), parent_bucket_path);
         const bucket_root_page_id = try bucketRootPageIdAtTreeRoot(view.pageReader(), self.arena.allocator(), parent_root_page_id, bucket);
@@ -449,7 +587,7 @@ pub const WriteTx = struct {
     }
 
     pub fn putInBucketPath(self: *WriteTx, bucket_path: []const []const u8, key: []const u8, value: []const u8) !void {
-        try self.ensureActiveForMutation();
+        try self.ensureActive();
         const view = &self.view.?;
         const bucket_root_page_id = try resolveBucketPathCurrentRootPageId(view, self.arena.allocator(), bucket_path);
         const bucket_write = try tree.writePut(
@@ -473,7 +611,7 @@ pub const WriteTx = struct {
     }
 
     pub fn deleteInBucketPath(self: *WriteTx, bucket_path: []const []const u8, key: []const u8) !void {
-        try self.ensureActiveForMutation();
+        try self.ensureActive();
         const view = &self.view.?;
         const bucket_root_page_id = try resolveBucketPathCurrentRootPageId(view, self.arena.allocator(), bucket_path);
         const delete_mutation = try tree.writeDelete(
@@ -509,7 +647,7 @@ pub const WriteTx = struct {
     }
 
     pub fn commit(self: *WriteTx) !void {
-        try self.ensureActiveForMutation();
+        try self.ensureActive();
         if (!self.has_pending_write) return WriteTxError.NoPendingWrite;
         errdefer self.fail();
 
@@ -606,7 +744,7 @@ pub const WriteTx = struct {
         }
     }
 
-    fn ensureActiveForMutation(self: *WriteTx) WriteTxError!void {
+    fn ensureActive(self: *const WriteTx) WriteTxError!void {
         return switch (self.state) {
             .open_clean, .open_dirty => {},
             .failed => WriteTxError.WriteTransactionFailed,
@@ -684,6 +822,26 @@ pub const WriteTx = struct {
             current_child_root_page_id = write_result.root_page_id;
         }
     }
+
+    fn cursorAtRoot(self: *const WriteTx, root_page_id: u64) tree.Cursor {
+        return tree.Cursor.init(
+            self.view.?.pageReader(),
+            cursorOwnerForWriteTx(self),
+            self.db.allocator,
+            root_page_id,
+        );
+    }
+
+    fn scanRangeAtRootAlloc(self: *const WriteTx, allocator: std.mem.Allocator, root_page_id: u64, bounds: ScanBounds) !ScanRecords {
+        if (rangeIsKnownEmpty(bounds)) {
+            return .{ .items = &.{} };
+        }
+
+        var range_cursor = self.cursorAtRoot(root_page_id);
+        defer range_cursor.deinit();
+
+        return collectScanRangeAlloc(&range_cursor, allocator, bounds);
+    }
 };
 
 fn rootEntryValueOrError(allocator: std.mem.Allocator, entry: ?tree.LookupEntry) !?[]u8 {
@@ -730,21 +888,57 @@ fn bucketRootPageIdAtTreeRoot(
     return try bucketRootPageIdFromLookup(allocator, entry);
 }
 
-fn resolveBucketPathCurrentRootPageId(
-    view: *const UncommittedView,
+fn resolveBucketPathPageReaderRootPageId(
+    page_reader: tree.PageReader,
     allocator: std.mem.Allocator,
+    root_page_id: u64,
     bucket_path: []const []const u8,
 ) !u64 {
-    var current_root_page_id = view.current_root_page_id;
+    var current_root_page_id = root_page_id;
     for (bucket_path) |bucket| {
         current_root_page_id = try bucketRootPageIdAtTreeRoot(
-            view.pageReader(),
+            page_reader,
             allocator,
             current_root_page_id,
             bucket,
         );
     }
     return current_root_page_id;
+}
+
+fn resolveBucketPathCurrentRootPageId(
+    view: *const UncommittedView,
+    allocator: std.mem.Allocator,
+    bucket_path: []const []const u8,
+) !u64 {
+    return resolveBucketPathPageReaderRootPageId(view.pageReader(), allocator, view.current_root_page_id, bucket_path);
+}
+
+fn cursorOwnerForReadTx(read_tx: *const ReadTx) tree.CursorOwner {
+    return .{
+        .context = read_tx,
+        .is_active_fn = readTxCursorOwnerIsActive,
+    };
+}
+
+fn readTxCursorOwnerIsActive(context: *const anyopaque) bool {
+    const read_tx: *const ReadTx = @ptrCast(@alignCast(context));
+    return read_tx.db != null;
+}
+
+fn cursorOwnerForWriteTx(write_tx: *const WriteTx) tree.CursorOwner {
+    return .{
+        .context = write_tx,
+        .is_active_fn = writeTxCursorOwnerIsActive,
+    };
+}
+
+fn writeTxCursorOwnerIsActive(context: *const anyopaque) bool {
+    const write_tx: *const WriteTx = @ptrCast(@alignCast(context));
+    return switch (write_tx.state) {
+        .open_clean, .open_dirty => true,
+        .committed, .rolled_back, .failed => false,
+    };
 }
 
 fn writeBucketEntry(
