@@ -3539,7 +3539,7 @@ test "bucket cursor traverses entries in order and supports seek" {
 
     var read_tx = try db.beginRead();
     defer read_tx.deinit();
-    var cursor = try read_tx.cursorInBucket(std.testing.allocator, "users");
+    var cursor = try read_tx.cursorInBucket("users");
     defer cursor.deinit();
 
     var first = (try cursor.first(std.testing.allocator)).?;
@@ -3572,8 +3572,8 @@ test "bucket cursor reports missing and non-bucket namespace entries" {
     var read_tx = try db.beginRead();
     defer read_tx.deinit();
 
-    try std.testing.expectError(error.BucketNotFound, read_tx.cursorInBucket(std.testing.allocator, "users"));
-    try std.testing.expectError(error.KeyNotBucket, read_tx.cursorInBucket(std.testing.allocator, "plain"));
+    try std.testing.expectError(error.BucketNotFound, read_tx.cursorInBucket("users"));
+    try std.testing.expectError(error.KeyNotBucket, read_tx.cursorInBucket("plain"));
 }
 
 test "bucket cursor keeps its snapshot stable after bucket writes" {
@@ -3591,7 +3591,7 @@ test "bucket cursor keeps its snapshot stable after bucket writes" {
 
     var read_tx = try db.beginRead();
     defer read_tx.deinit();
-    var cursor = try read_tx.cursorInBucket(std.testing.allocator, "users");
+    var cursor = try read_tx.cursorInBucket("users");
     defer cursor.deinit();
 
     try db.putInBucket("users", "alice", "two");
@@ -3648,7 +3648,7 @@ test "bucket cursor keeps the removed bucket visible to older snapshots" {
 
     var read_tx = try db.beginRead();
     defer read_tx.deinit();
-    var cursor = try read_tx.cursorInBucket(std.testing.allocator, "users");
+    var cursor = try read_tx.cursorInBucket("users");
     defer cursor.deinit();
 
     try db.deleteBucket("users");

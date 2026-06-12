@@ -65,9 +65,9 @@ pub const ReadTx = struct {
     }
 
     /// Opens a read-only cursor pinned to the snapshot root of `bucket`.
-    pub fn cursorInBucket(self: *const ReadTx, allocator: std.mem.Allocator, bucket: []const u8) !tree.Cursor {
+    pub fn cursorInBucket(self: *const ReadTx, bucket: []const u8) !tree.Cursor {
         std.debug.assert(self.db != null);
-        const bucket_root_page_id = try self.bucketRootPageId(allocator, bucket);
+        const bucket_root_page_id = try self.bucketRootPageId(self.db.?.allocator, bucket);
         return tree.Cursor.init(
             &self.snapshot_source,
             &self.db,
