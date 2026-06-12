@@ -14,5 +14,6 @@ Current capabilities include:
 - single-writer `put` / `delete`
 - bucket-scoped `put` / `delete`
 - read cursor traversal, including bucket-scoped cursor traversal
+- managed DB-owned read cursors for snapshot traversal without manual `ReadTx` lifecycle handling
 - persisted delayed reclaim through allocator state pages
 - explicit `compact()` file rewriting with state reload

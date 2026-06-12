@@ -106,6 +106,16 @@ pub const DB = struct {
         return read_tx.scanInBucketAlloc(allocator, bucket, bounds);
     }
 
+    /// Opens a cursor over the latest committed root snapshot and owns its read transaction.
+    pub fn cursor(self: *DB) !tx.ManagedCursor {
+        return tx.ManagedCursor.init(self);
+    }
+
+    /// Opens a cursor over the latest committed snapshot root of `bucket`.
+    pub fn cursorInBucket(self: *DB, bucket: []const u8) !tx.ManagedCursor {
+        return try tx.ManagedCursor.initInBucket(self, bucket);
+    }
+
     /// Opens a read-only view over the currently committed root.
     pub fn beginRead(self: *DB) !tx.ReadTx {
         const snapshot = tree.ReadSnapshot{
@@ -3844,6 +3854,96 @@ test "bucket cursor keeps the removed bucket visible to older snapshots" {
 
     try std.testing.expect((try cursor.next(std.testing.allocator)) == null);
     try std.testing.expectError(error.BucketNotFound, db.getInBucket(std.testing.allocator, "users", "alice"));
+}
+
+test "managed cursor traverses the latest root snapshot and releases its reader" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path = try tempFilePath(&path_buf, tmp.dir, "managed-cursor-root.db");
+
+    const db = try open(std.testing.allocator, std.testing.io, path);
+    defer db.close();
+
+    try db.put("gamma", "three");
+    try db.put("alpha", "one");
+    try db.put("omega", "four");
+
+    try std.testing.expectEqual(@as(usize, 0), db.reclaim.activeReaderCount());
+
+    {
+        var cursor = try db.cursor();
+        defer cursor.deinit();
+
+        try std.testing.expectEqual(@as(usize, 1), db.reclaim.activeReaderCount());
+
+        var first = (try cursor.first(std.testing.allocator)).?;
+        defer first.deinit(std.testing.allocator);
+        try expectCursorRecord(first, "alpha", "one");
+
+        var seek = (try cursor.seek(std.testing.allocator, "delta")).?;
+        defer seek.deinit(std.testing.allocator);
+        try expectCursorRecord(seek, "gamma", "three");
+
+        var next = (try cursor.next(std.testing.allocator)).?;
+        defer next.deinit(std.testing.allocator);
+        try expectCursorRecord(next, "omega", "four");
+
+        try std.testing.expect((try cursor.next(std.testing.allocator)) == null);
+    }
+
+    try std.testing.expectEqual(@as(usize, 0), db.reclaim.activeReaderCount());
+}
+
+test "managed bucket cursor keeps its snapshot stable after later writes" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path = try tempFilePath(&path_buf, tmp.dir, "managed-cursor-bucket.db");
+
+    const db = try open(std.testing.allocator, std.testing.io, path);
+    defer db.close();
+
+    try db.createBucket("users");
+    try db.putInBucket("users", "alice", "one");
+
+    var cursor = try db.cursorInBucket("users");
+    defer cursor.deinit();
+
+    try db.putInBucket("users", "alice", "two");
+    try db.putInBucket("users", "bob", "three");
+
+    var first = (try cursor.first(std.testing.allocator)).?;
+    defer first.deinit(std.testing.allocator);
+    try expectCursorRecord(first, "alice", "one");
+
+    try std.testing.expect((try cursor.next(std.testing.allocator)) == null);
+    try std.testing.expect((try cursor.seek(std.testing.allocator, "bob")) == null);
+
+    try expectBucketValue(db, "users", "alice", "two");
+    try expectBucketValue(db, "users", "bob", "three");
+}
+
+test "managed bucket cursor closes failed read snapshots on bucket lookup errors" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path = try tempFilePath(&path_buf, tmp.dir, "managed-cursor-bucket-errors.db");
+
+    const db = try open(std.testing.allocator, std.testing.io, path);
+    defer db.close();
+
+    try db.put("plain", "value");
+
+    try std.testing.expectEqual(@as(usize, 0), db.reclaim.activeReaderCount());
+    try std.testing.expectError(error.BucketNotFound, db.cursorInBucket("users"));
+    try std.testing.expectEqual(@as(usize, 0), db.reclaim.activeReaderCount());
+
+    try std.testing.expectError(error.KeyNotBucket, db.cursorInBucket("plain"));
+    try std.testing.expectEqual(@as(usize, 0), db.reclaim.activeReaderCount());
 }
 
 test "scanAlloc returns root records within inclusive start and exclusive end bounds" {

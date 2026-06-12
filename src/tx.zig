@@ -138,6 +138,79 @@ pub const ReadTx = struct {
     }
 };
 
+pub const ManagedCursor = struct {
+    allocator: std.mem.Allocator,
+    read_tx: ?*ReadTx,
+    cursor: tree.Cursor,
+
+    /// Opens a cursor that owns the underlying read transaction.
+    ///
+    /// The cursor and its snapshot remain valid until `deinit`, so callers can
+    /// traverse the latest committed state without manually managing `ReadTx`.
+    pub fn init(db: *db_mod.DB) !ManagedCursor {
+        const owned_read_tx = try db.allocator.create(ReadTx);
+        errdefer db.allocator.destroy(owned_read_tx);
+        owned_read_tx.* = try db.beginRead();
+        errdefer owned_read_tx.deinit();
+
+        var managed = ManagedCursor{
+            .allocator = db.allocator,
+            .read_tx = owned_read_tx,
+            .cursor = undefined,
+        };
+        // The wrapped tree cursor keeps pointers into the owning ReadTx, so the
+        // transaction lives on the heap to preserve a stable address even if
+        // the ManagedCursor itself is moved by value.
+        managed.cursor = owned_read_tx.cursor();
+        return managed;
+    }
+
+    /// Opens a bucket-scoped cursor that owns the underlying read transaction.
+    pub fn initInBucket(db: *db_mod.DB, bucket: []const u8) !ManagedCursor {
+        const owned_read_tx = try db.allocator.create(ReadTx);
+        errdefer db.allocator.destroy(owned_read_tx);
+        owned_read_tx.* = try db.beginRead();
+        errdefer owned_read_tx.deinit();
+
+        var managed = ManagedCursor{
+            .allocator = db.allocator,
+            .read_tx = owned_read_tx,
+            .cursor = undefined,
+        };
+        managed.cursor = try owned_read_tx.cursorInBucket(bucket);
+        return managed;
+    }
+
+    pub fn first(self: *ManagedCursor, allocator: std.mem.Allocator) tree.CursorError!?tree.CursorRecord {
+        return self.cursor.first(allocator);
+    }
+
+    pub fn last(self: *ManagedCursor, allocator: std.mem.Allocator) tree.CursorError!?tree.CursorRecord {
+        return self.cursor.last(allocator);
+    }
+
+    pub fn seek(self: *ManagedCursor, allocator: std.mem.Allocator, key: []const u8) tree.CursorError!?tree.CursorRecord {
+        return self.cursor.seek(allocator, key);
+    }
+
+    pub fn next(self: *ManagedCursor, allocator: std.mem.Allocator) tree.CursorError!?tree.CursorRecord {
+        return self.cursor.next(allocator);
+    }
+
+    pub fn prev(self: *ManagedCursor, allocator: std.mem.Allocator) tree.CursorError!?tree.CursorRecord {
+        return self.cursor.prev(allocator);
+    }
+
+    /// Releases both the cursor handle and the owned read transaction snapshot.
+    pub fn deinit(self: *ManagedCursor) void {
+        self.cursor.deinit();
+        const owned_read_tx = self.read_tx orelse return;
+        self.read_tx = null;
+        owned_read_tx.deinit();
+        self.allocator.destroy(owned_read_tx);
+    }
+};
+
 pub const WriteTx = struct {
     db: *db_mod.DB,
     base_txid: u64,
