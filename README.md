@@ -10,7 +10,3 @@ Current capabilities include:
 - read cursor traversal
 - persisted delayed reclaim through allocator state pages
 - explicit `compact()` file rewriting with state reload
-
-Current limitations include:
-
-- `compact()` requires no active read or write transactions

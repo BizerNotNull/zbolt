@@ -4,6 +4,7 @@ const meta = @import("meta.zig");
 const page = @import("page.zig");
 const db_mod = @import("db.zig");
 const reclaim = @import("reclaim.zig");
+const storage = @import("storage.zig");
 const test_page_size = 4096;
 
 pub const TreeLookupError = error{
@@ -95,6 +96,48 @@ pub const ReadSnapshot = struct {
     high_water_mark: u64,
 };
 
+pub const SnapshotSource = struct {
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    file: std.Io.File,
+    page_size: u32,
+    snapshot: ReadSnapshot,
+
+    pub fn init(db: *db_mod.DB, snapshot: ReadSnapshot, file: std.Io.File) SnapshotSource {
+        return .{
+            .allocator = db.allocator,
+            .io = db.io_threaded.io(),
+            .file = file,
+            .page_size = db.page_size,
+            .snapshot = snapshot,
+        };
+    }
+
+    pub fn readPageAlloc(self: *const SnapshotSource, allocator: std.mem.Allocator, page_id: u64) ![]u8 {
+        return storage.readPageObjectAlloc(
+            allocator,
+            &self.file,
+            self.io,
+            page_id,
+            self.page_size,
+            self.snapshot.high_water_mark,
+            try page.maxOrderForSpanSize(self.page_size, std.math.maxInt(u16)),
+        );
+    }
+
+    pub fn pageReader(self: *const SnapshotSource) PageReader {
+        return .{
+            .context = self,
+            .read_page_fn = readPage,
+        };
+    }
+
+    fn readPage(context: *const anyopaque, allocator: std.mem.Allocator, page_id: u64) !PageRef {
+        const self: *const SnapshotSource = @ptrCast(@alignCast(context));
+        return .{ .owned = try self.readPageAlloc(allocator, page_id) };
+    }
+};
+
 const max_cursor_depth: usize = @bitSizeOf(u64);
 
 const PathFrame = struct {
@@ -148,32 +191,31 @@ const CursorState = union(enum) {
 };
 
 pub const Cursor = struct {
-    db: ?*db_mod.DB,
-    snapshot: ReadSnapshot,
+    snapshot_source: ?*const SnapshotSource,
     state: CursorState,
 
     /// Repositions the cursor to the first record visible in this snapshot.
     pub fn first(self: *Cursor, allocator: std.mem.Allocator) CursorError!?CursorRecord {
-        const db = self.db orelse return error.CursorUnpositioned;
-        const position = try locateFirstPosition(db, self.snapshot);
+        const snapshot_source = self.snapshot_source orelse return error.CursorUnpositioned;
+        const position = try locateFirstPosition(snapshot_source);
         return try self.setPositionAndMaterialize(allocator, position);
     }
 
     /// Repositions the cursor to the first record whose key is not less than `key`.
     pub fn seek(self: *Cursor, allocator: std.mem.Allocator, key: []const u8) CursorError!?CursorRecord {
-        const db = self.db orelse return error.CursorUnpositioned;
-        const position = try locateSeekPosition(db, self.snapshot, key);
+        const snapshot_source = self.snapshot_source orelse return error.CursorUnpositioned;
+        const position = try locateSeekPosition(snapshot_source, key);
         return try self.setPositionAndMaterialize(allocator, position);
     }
 
     /// Returns the next record after the current cursor position.
     pub fn next(self: *Cursor, allocator: std.mem.Allocator) CursorError!?CursorRecord {
-        const db = self.db orelse return error.CursorUnpositioned;
+        const snapshot_source = self.snapshot_source orelse return error.CursorUnpositioned;
 
         const position = switch (self.state) {
             .unpositioned => return error.CursorUnpositioned,
             .eof => return null,
-            .positioned => |current| try advancePosition(db, self.snapshot, current),
+            .positioned => |current| try advancePosition(snapshot_source, current),
         };
 
         return try self.setPositionAndMaterialize(allocator, position);
@@ -181,49 +223,33 @@ pub const Cursor = struct {
 
     /// Releases the cursor handle. Returned records remain owned by the caller.
     pub fn deinit(self: *Cursor) void {
-        self.db = null;
+        self.snapshot_source = null;
         self.state = .eof;
     }
 
     fn setPositionAndMaterialize(self: *Cursor, allocator: std.mem.Allocator, position: ?CursorPosition) CursorError!?CursorRecord {
-        const db = self.db orelse return error.CursorUnpositioned;
+        const snapshot_source = self.snapshot_source orelse return error.CursorUnpositioned;
         const resolved_position = position orelse {
             self.state = .eof;
             return null;
         };
 
         self.state = .{ .positioned = resolved_position };
-        return try materializeRecord(db, self.snapshot, allocator, resolved_position);
+        return try materializeRecord(snapshot_source, allocator, resolved_position);
     }
 };
 
 pub const SnapshotPageReader = struct {
-    db: *db_mod.DB,
-    snapshot: ReadSnapshot,
+    source: SnapshotSource,
 
     pub fn init(db: *db_mod.DB, snapshot: ReadSnapshot) SnapshotPageReader {
         return .{
-            .db = db,
-            .snapshot = snapshot,
+            .source = SnapshotSource.init(db, snapshot, db.file),
         };
     }
 
     pub fn pageReader(self: *const SnapshotPageReader) PageReader {
-        return .{
-            .context = self,
-            .read_page_fn = readPage,
-        };
-    }
-
-    fn readPage(context: *const anyopaque, allocator: std.mem.Allocator, page_id: u64) !PageRef {
-        const self: *const SnapshotPageReader = @ptrCast(@alignCast(context));
-        return .{
-            .owned = try self.db.readPageAllocAtHighWater(
-                allocator,
-                page_id,
-                self.snapshot.high_water_mark,
-            ),
-        };
+        return self.source.pageReader();
     }
 };
 
@@ -358,10 +384,15 @@ pub fn lookup(db: *db_mod.DB, allocator: std.mem.Allocator, key: []const u8) !?[
 }
 
 pub fn lookupSnapshot(db: *db_mod.DB, allocator: std.mem.Allocator, snapshot: ReadSnapshot, key: []const u8) !?[]u8 {
-    var page_id = snapshot.root_page_id;
+    const snapshot_source = SnapshotSource.init(db, snapshot, db.file);
+    return lookupSnapshotSource(&snapshot_source, allocator, key);
+}
+
+pub fn lookupSnapshotSource(snapshot_source: *const SnapshotSource, allocator: std.mem.Allocator, key: []const u8) !?[]u8 {
+    var page_id = snapshot_source.snapshot.root_page_id;
 
     while (true) {
-        const page_bytes = try readTreePageSnapshot(db, allocator, snapshot, page_id);
+        const page_bytes = try readTreePageSnapshot(snapshot_source, allocator, page_id);
         defer allocator.free(page_bytes);
 
         const header = try page.decodeHeader(page_bytes);
@@ -472,8 +503,8 @@ pub fn writeDelete(
     } };
 }
 
-fn readTreePageSnapshot(db: *db_mod.DB, allocator: std.mem.Allocator, snapshot: ReadSnapshot, page_id: u64) ![]u8 {
-    return db.readPageAllocAtHighWater(allocator, page_id, snapshot.high_water_mark);
+fn readTreePageSnapshot(snapshot_source: *const SnapshotSource, allocator: std.mem.Allocator, page_id: u64) ![]u8 {
+    return snapshot_source.readPageAlloc(allocator, page_id);
 }
 
 fn selectChildForLookup(branch_page: page.BranchPage, key: []const u8) !?u64 {
@@ -524,18 +555,18 @@ fn findInLeaf(leaf_page: page.LeafPage, allocator: std.mem.Allocator, key: []con
     return null;
 }
 
-fn locateFirstPosition(db: *db_mod.DB, snapshot: ReadSnapshot) CursorError!?CursorPosition {
+fn locateFirstPosition(snapshot_source: *const SnapshotSource) CursorError!?CursorPosition {
     const path = PathStack.init();
-    return try descendToLeftmostPosition(db, snapshot, snapshot.root_page_id, path, true);
+    return try descendToLeftmostPosition(snapshot_source, snapshot_source.snapshot.root_page_id, path, true);
 }
 
-fn locateSeekPosition(db: *db_mod.DB, snapshot: ReadSnapshot, key: []const u8) CursorError!?CursorPosition {
-    var page_id = snapshot.root_page_id;
+fn locateSeekPosition(snapshot_source: *const SnapshotSource, key: []const u8) CursorError!?CursorPosition {
+    var page_id = snapshot_source.snapshot.root_page_id;
     var path = PathStack.init();
 
     while (true) {
-        const page_bytes = try readTreePageSnapshot(db, db.allocator, snapshot, page_id);
-        defer db.allocator.free(page_bytes);
+        const page_bytes = try readTreePageSnapshot(snapshot_source, snapshot_source.allocator, page_id);
+        defer snapshot_source.allocator.free(page_bytes);
 
         const header = try page.decodeHeader(page_bytes);
         switch (header.page_type) {
@@ -561,16 +592,16 @@ fn locateSeekPosition(db: *db_mod.DB, snapshot: ReadSnapshot, key: []const u8) C
                     };
                 }
 
-                return try successorPositionFromPath(db, snapshot, path);
+                return try successorPositionFromPath(snapshot_source, path);
             },
             else => return error.UnexpectedPageType,
         }
     }
 }
 
-fn advancePosition(db: *db_mod.DB, snapshot: ReadSnapshot, current: CursorPosition) CursorError!?CursorPosition {
-    const page_bytes = try readTreePageSnapshot(db, db.allocator, snapshot, current.leaf_page_id);
-    defer db.allocator.free(page_bytes);
+fn advancePosition(snapshot_source: *const SnapshotSource, current: CursorPosition) CursorError!?CursorPosition {
+    const page_bytes = try readTreePageSnapshot(snapshot_source, snapshot_source.allocator, current.leaf_page_id);
+    defer snapshot_source.allocator.free(page_bytes);
 
     const leaf_page = try page.LeafPage.validate(page_bytes);
     if (current.entry_index >= leaf_page.count()) return error.CorruptTreePath;
@@ -584,17 +615,16 @@ fn advancePosition(db: *db_mod.DB, snapshot: ReadSnapshot, current: CursorPositi
         };
     }
 
-    return try successorPositionFromPath(db, snapshot, current.path);
+    return try successorPositionFromPath(snapshot_source, current.path);
 }
 
 fn materializeRecord(
-    db: *db_mod.DB,
-    snapshot: ReadSnapshot,
+    snapshot_source: *const SnapshotSource,
     allocator: std.mem.Allocator,
     position: CursorPosition,
 ) CursorError!CursorRecord {
-    const page_bytes = try readTreePageSnapshot(db, db.allocator, snapshot, position.leaf_page_id);
-    defer db.allocator.free(page_bytes);
+    const page_bytes = try readTreePageSnapshot(snapshot_source, snapshot_source.allocator, position.leaf_page_id);
+    defer snapshot_source.allocator.free(page_bytes);
 
     const leaf_page = try page.LeafPage.validate(page_bytes);
     const entry = try leaf_page.entry(position.entry_index);
@@ -611,8 +641,7 @@ fn materializeRecord(
 }
 
 fn descendToLeftmostPosition(
-    db: *db_mod.DB,
-    snapshot: ReadSnapshot,
+    snapshot_source: *const SnapshotSource,
     start_page_id: u64,
     initial_path: PathStack,
     allow_empty_leaf: bool,
@@ -621,8 +650,8 @@ fn descendToLeftmostPosition(
     var path = initial_path;
 
     while (true) {
-        const page_bytes = try readTreePageSnapshot(db, db.allocator, snapshot, page_id);
-        defer db.allocator.free(page_bytes);
+        const page_bytes = try readTreePageSnapshot(snapshot_source, snapshot_source.allocator, page_id);
+        defer snapshot_source.allocator.free(page_bytes);
 
         const header = try page.decodeHeader(page_bytes);
         switch (header.page_type) {
@@ -656,14 +685,14 @@ fn descendToLeftmostPosition(
     }
 }
 
-fn successorPositionFromPath(db: *db_mod.DB, snapshot: ReadSnapshot, path: PathStack) CursorError!?CursorPosition {
+fn successorPositionFromPath(snapshot_source: *const SnapshotSource, path: PathStack) CursorError!?CursorPosition {
     var branch_level = path.len;
     while (branch_level > 0) {
         branch_level -= 1;
 
         const frame = path.get(branch_level).*;
-        const page_bytes = try readTreePageSnapshot(db, db.allocator, snapshot, frame.branch_page_id);
-        defer db.allocator.free(page_bytes);
+        const page_bytes = try readTreePageSnapshot(snapshot_source, snapshot_source.allocator, frame.branch_page_id);
+        defer snapshot_source.allocator.free(page_bytes);
 
         const branch_page = try page.BranchPage.validate(page_bytes);
         if (frame.child_index >= branch_page.count()) return error.CorruptTreePath;
@@ -679,7 +708,7 @@ fn successorPositionFromPath(db: *db_mod.DB, snapshot: ReadSnapshot, path: PathS
             .child_index = next_child_index,
         });
 
-        return try descendToLeftmostPosition(db, snapshot, next_child.child_page_id, next_path, false);
+        return try descendToLeftmostPosition(snapshot_source, next_child.child_page_id, next_path, false);
     }
 
     return null;
@@ -1593,10 +1622,11 @@ fn appendSnapshotPathPages(
     snapshot: ReadSnapshot,
     key: []const u8,
 ) !void {
+    const snapshot_source = SnapshotSource.init(db, snapshot, db.file);
     var page_id = snapshot.root_page_id;
 
     while (true) {
-        const page_bytes = try readTreePageSnapshot(db, allocator, snapshot, page_id);
+        const page_bytes = try readTreePageSnapshot(&snapshot_source, allocator, page_id);
         defer allocator.free(page_bytes);
 
         const header = try page.decodeHeader(page_bytes);
