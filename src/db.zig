@@ -66,6 +66,14 @@ pub const DB = struct {
         return read_tx.get(allocator, key);
     }
 
+    /// Returns an owned copy of the value stored in `bucket` for `key`.
+    pub fn getInBucket(self: *DB, allocator: std.mem.Allocator, bucket: []const u8, key: []const u8) !?[]u8 {
+        var read_tx = try self.beginRead();
+        defer read_tx.deinit();
+
+        return read_tx.getInBucket(allocator, bucket, key);
+    }
+
     /// Opens a read-only view over the currently committed root.
     pub fn beginRead(self: *DB) !tx.ReadTx {
         const snapshot = tree.ReadSnapshot{
@@ -99,6 +107,20 @@ pub const DB = struct {
         try write_tx.commit();
     }
 
+    pub fn createBucket(self: *DB, bucket: []const u8) !void {
+        var write_tx = try self.beginWrite();
+        defer write_tx.deinit();
+        try write_tx.createBucket(bucket);
+        try write_tx.commit();
+    }
+
+    pub fn putInBucket(self: *DB, bucket: []const u8, key: []const u8, value: []const u8) !void {
+        var write_tx = try self.beginWrite();
+        defer write_tx.deinit();
+        try write_tx.putInBucket(bucket, key, value);
+        try write_tx.commit();
+    }
+
     /// Deletes `key` when it exists and otherwise leaves the committed state unchanged.
     pub fn delete(self: *DB, key: []const u8) !void {
         var write_tx = try self.beginWrite();
@@ -107,6 +129,22 @@ pub const DB = struct {
         if (write_tx.has_pending_write) {
             try write_tx.commit();
         }
+    }
+
+    pub fn deleteInBucket(self: *DB, bucket: []const u8, key: []const u8) !void {
+        var write_tx = try self.beginWrite();
+        defer write_tx.deinit();
+        try write_tx.deleteInBucket(bucket, key);
+        if (write_tx.has_pending_write) {
+            try write_tx.commit();
+        }
+    }
+
+    pub fn deleteBucket(self: *DB, bucket: []const u8) !void {
+        var write_tx = try self.beginWrite();
+        defer write_tx.deinit();
+        try write_tx.deleteBucket(bucket);
+        try write_tx.commit();
     }
 
     pub fn readPageAlloc(self: *DB, allocator: std.mem.Allocator, page_id: u64) ![]u8 {
@@ -792,6 +830,19 @@ fn expectDbValue(db: *DB, key: []const u8, expected: []const u8) !void {
 
 fn expectDbMissing(db: *DB, key: []const u8) !void {
     const value = try db.get(std.testing.allocator, key);
+    defer if (value) |owned| std.testing.allocator.free(owned);
+    try std.testing.expect(value == null);
+}
+
+fn expectBucketValue(db: *DB, bucket: []const u8, key: []const u8, expected: []const u8) !void {
+    const value = (try db.getInBucket(std.testing.allocator, bucket, key)).?;
+    defer std.testing.allocator.free(value);
+
+    try std.testing.expectEqualSlices(u8, expected, value);
+}
+
+fn expectBucketMissing(db: *DB, bucket: []const u8, key: []const u8) !void {
+    const value = try db.getInBucket(std.testing.allocator, bucket, key);
     defer if (value) |owned| std.testing.allocator.free(owned);
     try std.testing.expect(value == null);
 }
@@ -3384,4 +3435,109 @@ test "compact rejects an active write transaction" {
     var write_tx = try db.beginWrite();
     defer write_tx.rollback() catch {};
     try std.testing.expectError(error.WriteTransactionActive, db.compact(std.testing.allocator));
+}
+
+test "bucket create put delete round trips across reopen" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path = try tempFilePath(&path_buf, tmp.dir, "bucket-round-trip.db");
+
+    {
+        const db = try open(std.testing.allocator, path);
+        defer db.close();
+
+        try db.createBucket("users");
+        try db.putInBucket("users", "alice", "admin");
+        try db.putInBucket("users", "bob", "reader");
+        try expectBucketValue(db, "users", "alice", "admin");
+        try expectBucketValue(db, "users", "bob", "reader");
+    }
+
+    const reopened = try open(std.testing.allocator, path);
+    defer reopened.close();
+    try expectBucketValue(reopened, "users", "alice", "admin");
+    try expectBucketValue(reopened, "users", "bob", "reader");
+
+    try reopened.deleteInBucket("users", "alice");
+    try expectBucketMissing(reopened, "users", "alice");
+    try reopened.deleteBucket("users");
+    try std.testing.expectError(error.BucketNotFound, reopened.getInBucket(std.testing.allocator, "users", "bob"));
+}
+
+test "bucket names are protected from root key operations" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path = try tempFilePath(&path_buf, tmp.dir, "bucket-root-guards.db");
+
+    const db = try open(std.testing.allocator, path);
+    defer db.close();
+
+    try db.createBucket("users");
+    try std.testing.expectError(error.KeyBelongsToBucket, db.get(std.testing.allocator, "users"));
+    try std.testing.expectError(error.KeyBelongsToBucket, db.put("users", "conflict"));
+    try std.testing.expectError(error.KeyBelongsToBucket, db.delete("users"));
+
+    try db.put("plain", "value");
+    try std.testing.expectError(error.BucketNameConflict, db.createBucket("plain"));
+    try std.testing.expectError(error.KeyNotBucket, db.putInBucket("plain", "alice", "admin"));
+}
+
+test "bucket writes keep earlier read snapshots stable" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path = try tempFilePath(&path_buf, tmp.dir, "bucket-snapshot.db");
+
+    const db = try open(std.testing.allocator, path);
+    defer db.close();
+
+    try db.createBucket("users");
+    try db.putInBucket("users", "alice", "one");
+
+    var read_tx = try db.beginRead();
+    defer read_tx.deinit();
+
+    try db.putInBucket("users", "alice", "two");
+    try db.putInBucket("users", "bob", "three");
+
+    const alice_before = (try read_tx.getInBucket(std.testing.allocator, "users", "alice")).?;
+    defer std.testing.allocator.free(alice_before);
+    try std.testing.expectEqualSlices(u8, "one", alice_before);
+
+    const bob_before = try read_tx.getInBucket(std.testing.allocator, "users", "bob");
+    defer if (bob_before) |owned| std.testing.allocator.free(owned);
+    try std.testing.expect(bob_before == null);
+
+    try expectBucketValue(db, "users", "alice", "two");
+    try expectBucketValue(db, "users", "bob", "three");
+}
+
+test "deleteBucket keeps the removed bucket visible to older snapshots" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path = try tempFilePath(&path_buf, tmp.dir, "bucket-delete-reclaim.db");
+
+    const db = try open(std.testing.allocator, path);
+    defer db.close();
+
+    try db.createBucket("users");
+    try db.putInBucket("users", "alice", "one");
+    try db.putInBucket("users", "bob", "two");
+
+    var read_tx = try db.beginRead();
+    defer read_tx.deinit();
+    try db.deleteBucket("users");
+
+    const alice_before = (try read_tx.getInBucket(std.testing.allocator, "users", "alice")).?;
+    defer std.testing.allocator.free(alice_before);
+    try std.testing.expectEqualSlices(u8, "one", alice_before);
+
+    try std.testing.expectError(error.BucketNotFound, db.getInBucket(std.testing.allocator, "users", "alice"));
 }

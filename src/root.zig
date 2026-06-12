@@ -1,5 +1,6 @@
 pub const allocator = @import("allocator.zig");
 pub const meta = @import("meta.zig");
+pub const namespace = @import("namespace.zig");
 pub const page = @import("page.zig");
 pub const tree = @import("tree.zig");
 pub const errors = @import("errors.zig");
@@ -8,6 +9,7 @@ pub const tx = @import("tx.zig");
 pub const compact = @import("compact.zig");
 pub const Meta = meta.Meta;
 pub const MetaError = meta.Error;
+pub const BucketError = namespace.Error;
 pub const PageError = page.Error;
 pub const PageLayoutError = page.LayoutError;
 pub const DbOpenError = errors.DbOpenError;
@@ -59,6 +61,7 @@ test {
     _ = @import("allocator.zig");
     _ = @import("db.zig");
     _ = @import("meta.zig");
+    _ = @import("namespace.zig");
     _ = @import("page.zig");
     _ = @import("storage.zig");
     _ = @import("tree.zig");
