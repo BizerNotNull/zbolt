@@ -3598,6 +3598,14 @@ test "bucket cursor traverses entries in order and supports seek" {
     try expectCursorRecord(next, "omega", "four");
 
     try std.testing.expect((try cursor.next(std.testing.allocator)) == null);
+
+    var last = (try cursor.last(std.testing.allocator)).?;
+    defer last.deinit(std.testing.allocator);
+    try expectCursorRecord(last, "omega", "four");
+
+    var prev = (try cursor.prev(std.testing.allocator)).?;
+    defer prev.deinit(std.testing.allocator);
+    try expectCursorRecord(prev, "gamma", "three");
 }
 
 test "bucket cursor reports missing and non-bucket namespace entries" {
