@@ -43,6 +43,8 @@ pub const ReadTx = struct {
         std.debug.assert(self.db != null);
         return .{
             .snapshot_source = &self.snapshot_source,
+            .owner_db = &self.db,
+            .temp_allocator = self.db.?.allocator,
             .state = .unpositioned,
         };
     }
