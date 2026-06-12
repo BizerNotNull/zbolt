@@ -375,16 +375,15 @@ pub const WriteTx = struct {
         const next_meta_page = try meta.encode(self.db.allocator, next_meta);
         defer self.db.allocator.free(next_meta_page);
 
-        const io = self.db.io_threaded.io();
         for (staged_pages) |pending_page| {
-            try storage.writePageObject(&self.db.file, io, self.db.page_size, pending_page.page_id, pending_page.bytes);
+            try storage.writePageObject(&self.db.file, self.db.io, self.db.page_size, pending_page.page_id, pending_page.bytes);
         }
-        try storage.writePageObject(&self.db.file, io, self.db.page_size, allocator_state.page_id, allocator_state.bytes);
-        try storage.sync(self.db.file, io);
+        try storage.writePageObject(&self.db.file, self.db.io, self.db.page_size, allocator_state.page_id, allocator_state.bytes);
+        try storage.sync(self.db.file, self.db.io);
 
         const next_meta_slot = inactiveMetaSlot(self.db.meta_slot);
-        try storage.writePageObject(&self.db.file, io, self.db.page_size, metaSlotPageId(next_meta_slot), next_meta_page);
-        try storage.sync(self.db.file, io);
+        try storage.writePageObject(&self.db.file, self.db.io, self.db.page_size, metaSlotPageId(next_meta_slot), next_meta_page);
+        try storage.sync(self.db.file, self.db.io);
 
         db_mod.applyCommittedState(self.db, next_meta_slot, next_meta, allocator_state.page_allocator);
         allocator_state.page_allocator = movedPageAllocator(self.db.allocator);

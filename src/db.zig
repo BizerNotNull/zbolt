@@ -28,7 +28,7 @@ const RecoverableSnapshot = struct {
 
 pub const DB = struct {
     allocator: std.mem.Allocator,
-    io_threaded: std.Io.Threaded,
+    io: std.Io,
     file: std.Io.File,
     file_open: bool,
     path: []u8,
@@ -48,13 +48,12 @@ pub const DB = struct {
         std.debug.assert(!self.write_tx_active);
         std.debug.assert(self.reclaim.activeReaderCount() == 0);
         if (self.file_open) {
-            self.file.close(self.io_threaded.io());
+            self.file.close(self.io);
             self.file_open = false;
         }
         self.reclaim.deinit(self.allocator);
         self.page_allocator.deinit(self.allocator);
         self.allocator.free(self.path);
-        self.io_threaded.deinit();
         self.allocator.destroy(self);
     }
 
@@ -80,11 +79,10 @@ pub const DB = struct {
             .root_page_id = self.root_page_id,
             .high_water_mark = self.high_water_mark,
         };
-        const io = self.io_threaded.io();
-        const snapshot_file = try std.Io.Dir.openFileAbsolute(io, self.path, .{
+        const snapshot_file = try std.Io.Dir.openFileAbsolute(self.io, self.path, .{
             .mode = .read_only,
         });
-        errdefer snapshot_file.close(io);
+        errdefer snapshot_file.close(self.io);
         try self.reclaim.beginRead(self.txid);
         return .{
             .db = self,
@@ -148,11 +146,11 @@ pub const DB = struct {
     }
 
     pub fn readPageAlloc(self: *DB, allocator: std.mem.Allocator, page_id: u64) ![]u8 {
-        return readTreePageObjectAlloc(allocator, &self.file, self.io_threaded.io(), page_id, self.page_size, self.high_water_mark);
+        return readTreePageObjectAlloc(allocator, &self.file, self.io, page_id, self.page_size, self.high_water_mark);
     }
 
     pub fn readPageAllocAtHighWater(self: *DB, allocator: std.mem.Allocator, page_id: u64, high_water_mark: u64) ![]u8 {
-        return readTreePageObjectAlloc(allocator, &self.file, self.io_threaded.io(), page_id, self.page_size, high_water_mark);
+        return readTreePageObjectAlloc(allocator, &self.file, self.io, page_id, self.page_size, high_water_mark);
     }
 
     /// Rewrites the latest committed snapshot into a compact replacement file.
@@ -184,39 +182,40 @@ pub const DB = struct {
         const backup_path = try std.fmt.allocPrint(allocator, "{s}.compact.bak", .{self.path});
         defer allocator.free(backup_path);
 
-        const io = self.io_threaded.io();
-        errdefer compact_mod.deleteFileIfExists(temp_path, io) catch {};
+        errdefer compact_mod.deleteFileIfExists(temp_path, self.io) catch {};
 
         try compact_mod.FileReplacement.writeCompactedFile(
             allocator,
             temp_path,
-            io,
+            self.io,
             self.page_size,
             walker.descriptors.items,
             compact_meta,
         );
-        try validateCompactedFile(allocator, temp_path, compact_meta);
+        try validateCompactedFile(allocator, self.io, temp_path, compact_meta);
 
-        self.file.close(io);
+        self.file.close(self.io);
         self.file_open = false;
-        compact_mod.FileReplacement.replaceFileWithRollback(self.path, temp_path, backup_path, io) catch |err| {
+        compact_mod.FileReplacement.replaceFileWithRollback(self.path, temp_path, backup_path, self.io) catch |err| {
             switch (err) {
                 error.FileReplaceRollbackFailed => return err,
                 else => {
-                    self.file = try std.Io.Dir.openFileAbsolute(io, self.path, .{ .mode = .read_write });
+                    self.file = try std.Io.Dir.openFileAbsolute(self.io, self.path, .{ .mode = .read_write });
                     self.file_open = true;
                     return err;
                 },
             }
         };
 
-        self.file = try std.Io.Dir.openFileAbsolute(io, self.path, .{ .mode = .read_write });
+        self.file = try std.Io.Dir.openFileAbsolute(self.io, self.path, .{ .mode = .read_write });
         self.file_open = true;
         try reloadCompactedStateFromOpenFile(self);
     }
 };
 
-pub fn open(allocator: std.mem.Allocator, path: []const u8) !*DB {
+/// Opens a database handle that borrows the caller-provided `io` context for
+/// all file operations during the DB lifetime.
+pub fn open(allocator: std.mem.Allocator, io: std.Io, path: []const u8) !*DB {
     var db = try allocator.create(DB);
     errdefer allocator.destroy(db);
 
@@ -224,7 +223,7 @@ pub fn open(allocator: std.mem.Allocator, path: []const u8) !*DB {
 
     db.* = .{
         .allocator = allocator,
-        .io_threaded = .init(allocator, .{}),
+        .io = io,
         .file = undefined,
         .file_open = false,
         .path = owned_path,
@@ -241,10 +240,7 @@ pub fn open(allocator: std.mem.Allocator, path: []const u8) !*DB {
     };
     errdefer db.reclaim.deinit(allocator);
     errdefer allocator.free(db.path);
-    errdefer db.io_threaded.deinit();
     errdefer db.page_allocator.deinit(allocator);
-
-    const io = db.io_threaded.io();
 
     db.file = storage.openDatabaseFileAbsolute(io, path) catch |err| switch (err) {
         error.DatabaseLocked => return errors.DbOpenError.DatabaseLocked,
@@ -301,7 +297,7 @@ pub fn currentAllocatorRootRelease(db: *DB) !?reclaim.ReleasedPage {
     const allocator_page = try readAllocatorStatePageObjectAlloc(
         db.allocator,
         &db.file,
-        db.io_threaded.io(),
+        db.io,
         db.allocator_root,
         db.page_size,
         db.high_water_mark,
@@ -336,7 +332,7 @@ pub fn applyCommittedState(
 }
 
 fn recoverOrInitialize(db: *DB) !void {
-    const io = db.io_threaded.io();
+    const io = db.io;
     const stat = try db.file.stat(io);
 
     if (stat.size == 0) {
@@ -349,7 +345,7 @@ fn recoverOrInitialize(db: *DB) !void {
 }
 
 pub fn reloadCommittedStateFromOpenFile(db: *DB) !void {
-    const io = db.io_threaded.io();
+    const io = db.io;
     var selected = loadNewestRecoverableSnapshot(db.allocator, &db.file, io, default_page_size) catch |err| switch (err) {
         error.NoValidMetaPage => return errors.DbOpenError.InvalidDatabaseFile,
         else => return err,
@@ -376,7 +372,7 @@ pub fn reloadCommittedStateFromOpenFile(db: *DB) !void {
 }
 
 fn reloadCompactedStateFromOpenFile(db: *DB) !void {
-    const io = db.io_threaded.io();
+    const io = db.io;
     var selected = loadNewestRecoverableSnapshot(db.allocator, &db.file, io, default_page_size) catch |err| switch (err) {
         error.NoValidMetaPage => return errors.DbOpenError.InvalidDatabaseFile,
         else => return err,
@@ -422,7 +418,7 @@ fn initializeEmptyDatabase(db: *DB) !void {
     const root_page = try allocateEmptyRootPage(db.allocator, default_page_size, initial_meta.root_page_id);
     defer db.allocator.free(root_page);
 
-    const io = db.io_threaded.io();
+    const io = db.io;
     // A valid meta page is the recovery commit point, so the bootstrap root
     // must reach durable storage before either meta page can reference it.
     try storage.writePageObject(&db.file, io, default_page_size, initial_meta.root_page_id, root_page);
@@ -645,8 +641,8 @@ fn metaSlotPageId(slot: meta.MetaSlot) u64 {
     };
 }
 
-fn validateCompactedFile(allocator: std.mem.Allocator, path: []const u8, expected_meta: meta.Meta) !void {
-    const compacted = try open(allocator, path);
+fn validateCompactedFile(allocator: std.mem.Allocator, io: std.Io, path: []const u8, expected_meta: meta.Meta) !void {
+    const compacted = try open(allocator, io, path);
     defer compacted.close();
 
     if (compacted.root_page_id != expected_meta.root_page_id) return error.TempFileValidationFailed;
@@ -1080,10 +1076,10 @@ test "open returns DB for an existing file" {
     const path = try tempFilePath(&path_buf, tmp.dir, "existing.db");
     try bootstrapFile(path);
 
-    const db = try open(std.testing.allocator, path);
+    const db = try open(std.testing.allocator, std.testing.io, path);
     defer db.close();
 
-    const stat = try db.file.stat(db.io_threaded.io());
+    const stat = try db.file.stat(db.io);
     try std.testing.expectEqual(std.Io.File.Kind.file, stat.kind);
     try std.testing.expectEqual(@as(u64, default_page_size) * bootstrap_page_count, stat.size);
     try std.testing.expectEqual(default_page_size, db.page_size);
@@ -1098,7 +1094,7 @@ test "open creates and returns DB for a missing file" {
     var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const path = try tempFilePath(&path_buf, tmp.dir, "created.db");
 
-    const db = try open(std.testing.allocator, path);
+    const db = try open(std.testing.allocator, std.testing.io, path);
     defer db.close();
 
     const stat = try tmp.dir.statFile(std.testing.io, "created.db", .{});
@@ -1109,6 +1105,53 @@ test "open creates and returns DB for a missing file" {
     try std.testing.expectEqual(@as(u64, 0), db.txid);
 }
 
+test "open accepts caller-managed threaded io" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path = try tempFilePath(&path_buf, tmp.dir, "threaded.db");
+
+    var threaded = std.Io.Threaded.init(std.testing.allocator, .{});
+    defer threaded.deinit();
+
+    const db = try open(std.testing.allocator, threaded.io(), path);
+    defer db.close();
+
+    const stat = try db.file.stat(db.io);
+    try std.testing.expectEqual(std.Io.File.Kind.file, stat.kind);
+    try std.testing.expectEqual(default_page_size, db.page_size);
+    try std.testing.expectEqual(@as(u64, 2), db.root_page_id);
+}
+
+test "caller-managed threaded io supports put and reopen" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path = try tempFilePath(&path_buf, tmp.dir, "threaded-put.db");
+
+    var threaded = std.Io.Threaded.init(std.testing.allocator, .{});
+    defer threaded.deinit();
+
+    {
+        const db = try open(std.testing.allocator, threaded.io(), path);
+        defer db.close();
+        try db.put("alpha", "beta");
+    }
+
+    {
+        const reopened = try open(std.testing.allocator, threaded.io(), path);
+        defer reopened.close();
+
+        const value = try reopened.get(std.testing.allocator, "alpha");
+        defer if (value) |owned| std.testing.allocator.free(owned);
+
+        try std.testing.expect(value != null);
+        try std.testing.expectEqualStrings("beta", value.?);
+    }
+}
+
 test "open initializes empty file with meta0 meta1 and root page" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -1116,10 +1159,10 @@ test "open initializes empty file with meta0 meta1 and root page" {
     var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const path = try tempFilePath(&path_buf, tmp.dir, "initialized.db");
 
-    const db = try open(std.testing.allocator, path);
+    const db = try open(std.testing.allocator, std.testing.io, path);
     defer db.close();
 
-    const stat = try db.file.stat(db.io_threaded.io());
+    const stat = try db.file.stat(db.io);
     try std.testing.expectEqual(@as(u64, default_page_size) * bootstrap_page_count, stat.size);
     try std.testing.expectEqual(default_page_size, db.page_size);
     try std.testing.expectEqual(@as(u64, 2), db.root_page_id);
@@ -1133,13 +1176,13 @@ test "open writes identical valid meta pages on bootstrap" {
     var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const path = try tempFilePath(&path_buf, tmp.dir, "bootstrap-meta.db");
 
-    const db = try open(std.testing.allocator, path);
+    const db = try open(std.testing.allocator, std.testing.io, path);
     defer db.close();
 
-    const meta0_page = try storage.readPageAlloc(std.testing.allocator, &db.file, db.io_threaded.io(), 0, default_page_size);
+    const meta0_page = try storage.readPageAlloc(std.testing.allocator, &db.file, db.io, 0, default_page_size);
     defer std.testing.allocator.free(meta0_page);
 
-    const meta1_page = try storage.readPageAlloc(std.testing.allocator, &db.file, db.io_threaded.io(), 1, default_page_size);
+    const meta1_page = try storage.readPageAlloc(std.testing.allocator, &db.file, db.io, 1, default_page_size);
     defer std.testing.allocator.free(meta1_page);
 
     const decoded0 = try meta.decode(meta0_page);
@@ -1164,10 +1207,10 @@ test "open bootstraps a valid empty leaf root page" {
     var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const path = try tempFilePath(&path_buf, tmp.dir, "bootstrap-root.db");
 
-    const db = try open(std.testing.allocator, path);
+    const db = try open(std.testing.allocator, std.testing.io, path);
     defer db.close();
 
-    const root_page = try storage.readPageAlloc(std.testing.allocator, &db.file, db.io_threaded.io(), 2, default_page_size);
+    const root_page = try storage.readPageAlloc(std.testing.allocator, &db.file, db.io, 2, default_page_size);
     defer std.testing.allocator.free(root_page);
 
     const leaf_page = try page.LeafPage.validate(root_page);
@@ -1196,7 +1239,7 @@ test "open rejects bootstrap root written without committed meta pages" {
         try storage.sync(file, io);
     }
 
-    try std.testing.expectError(errors.DbOpenError.InvalidDatabaseFile, open(std.testing.allocator, path));
+    try std.testing.expectError(errors.DbOpenError.InvalidDatabaseFile, open(std.testing.allocator, std.testing.io, path));
 }
 
 test "open recovers cached state from an existing valid database" {
@@ -1222,7 +1265,7 @@ test "open recovers cached state from an existing valid database" {
         .txid = 9,
     });
 
-    const db = try open(std.testing.allocator, path);
+    const db = try open(std.testing.allocator, std.testing.io, path);
     defer db.close();
 
     try std.testing.expectEqual(default_page_size, db.page_size);
@@ -1267,7 +1310,7 @@ test "open prefers only valid meta when the other one is invalid" {
         try storage.writePageObject(&file, io, default_page_size, 1, invalid_page);
     }
 
-    const db = try open(std.testing.allocator, path);
+    const db = try open(std.testing.allocator, std.testing.io, path);
     defer db.close();
 
     try std.testing.expectEqual(default_page_size, db.page_size);
@@ -1288,7 +1331,7 @@ test "open rejects existing invalid non-empty file" {
     var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const path = try tempFilePath(&path_buf, tmp.dir, "invalid.db");
 
-    try std.testing.expectError(errors.DbOpenError.DatabaseFileTooSmall, open(std.testing.allocator, path));
+    try std.testing.expectError(errors.DbOpenError.DatabaseFileTooSmall, open(std.testing.allocator, std.testing.io, path));
 }
 
 test "open rejects too-small non-empty file" {
@@ -1304,7 +1347,7 @@ test "open rejects too-small non-empty file" {
     var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const path = try tempFilePath(&path_buf, tmp.dir, "too-small.db");
 
-    try std.testing.expectError(errors.DbOpenError.DatabaseFileTooSmall, open(std.testing.allocator, path));
+    try std.testing.expectError(errors.DbOpenError.DatabaseFileTooSmall, open(std.testing.allocator, std.testing.io, path));
 }
 
 test "open maps invalid meta recovery into centralized db error" {
@@ -1347,7 +1390,7 @@ test "open maps invalid meta recovery into centralized db error" {
         try storage.writePageObject(&file, io, default_page_size, 1, meta1_page);
     }
 
-    try std.testing.expectError(errors.DbOpenError.InvalidDatabaseFile, open(std.testing.allocator, path));
+    try std.testing.expectError(errors.DbOpenError.InvalidDatabaseFile, open(std.testing.allocator, std.testing.io, path));
 }
 
 test "open fails with database locked while another handle owns the exclusive lock" {
@@ -1357,10 +1400,10 @@ test "open fails with database locked while another handle owns the exclusive lo
     var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const path = try tempFilePath(&path_buf, tmp.dir, "open-locked.db");
 
-    const db = try open(std.testing.allocator, path);
+    const db = try open(std.testing.allocator, std.testing.io, path);
     defer db.close();
 
-    try std.testing.expectError(errors.DbOpenError.DatabaseLocked, open(std.testing.allocator, path));
+    try std.testing.expectError(errors.DbOpenError.DatabaseLocked, open(std.testing.allocator, std.testing.io, path));
 }
 
 test "open succeeds again after the previous handle closes" {
@@ -1371,11 +1414,11 @@ test "open succeeds again after the previous handle closes" {
     const path = try tempFilePath(&path_buf, tmp.dir, "open-after-close.db");
 
     {
-        const db = try open(std.testing.allocator, path);
+        const db = try open(std.testing.allocator, std.testing.io, path);
         db.close();
     }
 
-    const reopened = try open(std.testing.allocator, path);
+    const reopened = try open(std.testing.allocator, std.testing.io, path);
     defer reopened.close();
 
     try std.testing.expectEqual(default_page_size, reopened.page_size);
@@ -1388,7 +1431,7 @@ test "put commits a new root leaf and updates selected meta" {
     var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const path = try tempFilePath(&path_buf, tmp.dir, "put-commit.db");
 
-    const db = try open(std.testing.allocator, path);
+    const db = try open(std.testing.allocator, std.testing.io, path);
     defer db.close();
 
     try db.put("alpha", "one");
@@ -1403,7 +1446,7 @@ test "put commits a new root leaf and updates selected meta" {
     defer std.testing.allocator.free(value);
     try std.testing.expectEqualSlices(u8, "one", value);
 
-    const selected = try loadSelectedMeta(std.testing.allocator, &db.file, db.io_threaded.io(), db.page_size);
+    const selected = try loadSelectedMeta(std.testing.allocator, &db.file, db.io, db.page_size);
     try std.testing.expectEqual(meta.MetaSlot.meta1, selected.slot);
     try std.testing.expectEqual(@as(u64, 3), selected.meta.root_page_id);
     try std.testing.expectEqual(@as(u64, 4), selected.meta.allocator_root);
@@ -1420,7 +1463,7 @@ test "read transaction keeps old snapshot after later commits" {
     var value_buf = [_]u8{'x'} ** 160;
 
     {
-        const db = try open(std.testing.allocator, path);
+        const db = try open(std.testing.allocator, std.testing.io, path);
         defer db.close();
 
         var index: usize = 0;
@@ -1449,7 +1492,7 @@ test "read transaction keeps old snapshot after later commits" {
         try expectDbValue(db, "zzzz", "tail");
     }
 
-    const reopened = try open(std.testing.allocator, path);
+    const reopened = try open(std.testing.allocator, std.testing.io, path);
     defer reopened.close();
 
     try expectDbValue(reopened, "k0000", "updated");
@@ -1463,7 +1506,7 @@ test "read transaction uses captured high water for higher-order root leaf" {
     var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const path = try tempFilePath(&path_buf, tmp.dir, "read-tx-high-water.db");
 
-    const db = try open(std.testing.allocator, path);
+    const db = try open(std.testing.allocator, std.testing.io, path);
     defer db.close();
 
     var large_value = [_]u8{'L'} ** 7000;
@@ -1494,7 +1537,7 @@ test "reopen ignores dirty pages written before meta switch" {
     const path = try tempFilePath(&path_buf, tmp.dir, "dirty-before-meta.db");
 
     {
-        const db = try open(std.testing.allocator, path);
+        const db = try open(std.testing.allocator, std.testing.io, path);
         defer db.close();
 
         try db.put("alpha", "one");
@@ -1522,7 +1565,7 @@ test "reopen ignores dirty pages written before meta switch" {
             "beta",
             "two",
         );
-        const io = db.io_threaded.io();
+        const io = db.io;
         for (write_result.new_pages) |pending_page| {
             try storage.writePageObject(&db.file, io, db.page_size, pending_page.page_id, pending_page.bytes);
         }
@@ -1533,7 +1576,7 @@ test "reopen ignores dirty pages written before meta switch" {
         try std.testing.expectEqual(old_txid, db.txid);
     }
 
-    const reopened = try open(std.testing.allocator, path);
+    const reopened = try open(std.testing.allocator, std.testing.io, path);
     defer reopened.close();
 
     try std.testing.expectEqual(@as(u64, 3), reopened.root_page_id);
@@ -1554,7 +1597,7 @@ test "reopen selects inactive meta after data and allocator pages are durable" {
     const path = try tempFilePath(&path_buf, tmp.dir, "meta-after-data.db");
 
     {
-        const db = try open(std.testing.allocator, path);
+        const db = try open(std.testing.allocator, std.testing.io, path);
         defer db.close();
 
         try db.put("alpha", "one");
@@ -1597,7 +1640,7 @@ test "reopen selects inactive meta after data and allocator pages are durable" {
         const next_meta_page = try meta.encode(std.testing.allocator, next_meta);
         defer std.testing.allocator.free(next_meta_page);
 
-        const io = db.io_threaded.io();
+        const io = db.io;
         for (write_result.new_pages) |pending_page| {
             try storage.writePageObject(&db.file, io, db.page_size, pending_page.page_id, pending_page.bytes);
         }
@@ -1612,7 +1655,7 @@ test "reopen selects inactive meta after data and allocator pages are durable" {
         try std.testing.expectEqual(@as(u64, 1), db.txid);
     }
 
-    const reopened = try open(std.testing.allocator, path);
+    const reopened = try open(std.testing.allocator, std.testing.io, path);
     defer reopened.close();
 
     try std.testing.expectEqual(@as(u64, 5), reopened.root_page_id);
@@ -1630,7 +1673,7 @@ test "put inserts in sorted order and overwrites existing keys across reopen" {
     const path = try tempFilePath(&path_buf, tmp.dir, "put-overwrite.db");
 
     {
-        const db = try open(std.testing.allocator, path);
+        const db = try open(std.testing.allocator, std.testing.io, path);
         defer db.close();
 
         try db.put("beta", "two");
@@ -1643,7 +1686,7 @@ test "put inserts in sorted order and overwrites existing keys across reopen" {
         try std.testing.expectEqual(@as(u64, 3), db.txid);
     }
 
-    const reopened = try open(std.testing.allocator, path);
+    const reopened = try open(std.testing.allocator, std.testing.io, path);
     defer reopened.close();
 
     const alpha = (try reopened.get(std.testing.allocator, "alpha")).?;
@@ -1677,7 +1720,7 @@ test "put splits a full root leaf into a branch root" {
     const path = try tempFilePath(&path_buf, tmp.dir, "put-root-split.db");
 
     {
-        const db = try open(std.testing.allocator, path);
+        const db = try open(std.testing.allocator, std.testing.io, path);
         defer db.close();
 
         var value_buf: [160]u8 = undefined;
@@ -1694,13 +1737,13 @@ test "put splits a full root leaf into a branch root" {
         try std.testing.expectEqual(@as(u64, 24), db.txid);
         try expectBranchRootMatchesChildren(db, 2);
 
-        const selected = try loadSelectedMeta(std.testing.allocator, &db.file, db.io_threaded.io(), db.page_size);
+        const selected = try loadSelectedMeta(std.testing.allocator, &db.file, db.io, db.page_size);
         try std.testing.expectEqual(db.root_page_id, selected.meta.root_page_id);
         try std.testing.expectEqual(db.high_water_mark, selected.meta.high_water_mark);
         try std.testing.expectEqual(db.txid, selected.meta.txid);
     }
 
-    const reopened = try open(std.testing.allocator, path);
+    const reopened = try open(std.testing.allocator, std.testing.io, path);
     defer reopened.close();
 
     var index: usize = 0;
@@ -1750,7 +1793,7 @@ test "put updates a branch-root leaf child without changing its upper bound" {
         right_leaf[0..],
     });
 
-    const db = try open(std.testing.allocator, path);
+    const db = try open(std.testing.allocator, std.testing.io, path);
     defer db.close();
 
     try db.put("alpha", "updated");
@@ -1804,7 +1847,7 @@ test "put appends past the largest branch upper bound into the rightmost child" 
         right_leaf[0..],
     });
 
-    const db = try open(std.testing.allocator, path);
+    const db = try open(std.testing.allocator, std.testing.io, path);
     defer db.close();
 
     try db.put("zzzz", "tail");
@@ -1869,7 +1912,7 @@ test "put splits a full branch child leaf and updates the branch root" {
     });
 
     {
-        const db = try open(std.testing.allocator, path);
+        const db = try open(std.testing.allocator, std.testing.io, path);
         defer db.close();
 
         const old_high_water_mark = db.high_water_mark;
@@ -1890,7 +1933,7 @@ test "put splits a full branch child leaf and updates the branch root" {
         try expectDbValue(db, "zzzz", fillFixedValue(&value_buf, 'y'));
     }
 
-    const reopened = try open(std.testing.allocator, path);
+    const reopened = try open(std.testing.allocator, std.testing.io, path);
     defer reopened.close();
 
     var value_buf: [160]u8 = undefined;
@@ -1996,7 +2039,7 @@ test "put splits branch root after a child leaf split fills the root" {
     try writeTreeDatabase(path, 2, pages.items);
 
     {
-        const db = try open(std.testing.allocator, path);
+        const db = try open(std.testing.allocator, std.testing.io, path);
         defer db.close();
 
         const old_high_water_mark = db.high_water_mark;
@@ -2018,7 +2061,7 @@ test "put splits branch root after a child leaf split fills the root" {
     }
 
     {
-        const reopened = try open(std.testing.allocator, path);
+        const reopened = try open(std.testing.allocator, std.testing.io, path);
         defer reopened.close();
 
         try std.testing.expectEqual(@as(u64, 246), reopened.root_page_id);
@@ -2046,7 +2089,7 @@ test "put splits branch root after a child leaf split fills the root" {
         try assertTreeInvariants(reopened);
     }
 
-    const final_reopen = try open(std.testing.allocator, path);
+    const final_reopen = try open(std.testing.allocator, std.testing.io, path);
     defer final_reopen.close();
     var huge_value = [_]u8{'h'} ** 3500;
     try expectDbValue(final_reopen, "a0000", "head");
@@ -2070,7 +2113,7 @@ test "put matches deterministic oracle across reopen cycles" {
     var state: u64 = 0xB01DBA5E;
 
     {
-        var db = try open(std.testing.allocator, path);
+        var db = try open(std.testing.allocator, std.testing.io, path);
 
         var op_index: usize = 0;
         while (op_index < 260) : (op_index += 1) {
@@ -2094,7 +2137,7 @@ test "put matches deterministic oracle across reopen cycles" {
                 try assertOracleMatches(db, &present, &expected_len, &expected_byte);
                 try assertTreeInvariants(db);
                 db.close();
-                db = try open(std.testing.allocator, path);
+                db = try open(std.testing.allocator, std.testing.io, path);
             }
         }
 
@@ -2103,7 +2146,7 @@ test "put matches deterministic oracle across reopen cycles" {
         db.close();
     }
 
-    const reopened = try open(std.testing.allocator, path);
+    const reopened = try open(std.testing.allocator, std.testing.io, path);
     defer reopened.close();
     try assertOracleMatches(reopened, &present, &expected_len, &expected_byte);
     try assertTreeInvariants(reopened);
@@ -2173,7 +2216,7 @@ test "put rejects non-tree root pages" {
         try storage.writePageObject(&file, io, default_page_size, 2, branch_root[0..]);
     }
 
-    const db = try open(std.testing.allocator, path);
+    const db = try open(std.testing.allocator, std.testing.io, path);
     defer db.close();
 
     try std.testing.expectError(error.UnexpectedPageType, db.put("alpha", "one"));
@@ -2277,7 +2320,7 @@ test "put stores a single large value in a higher-order root leaf across reopen"
     var large_value = [_]u8{'L'} ** 7000;
 
     {
-        const db = try open(std.testing.allocator, path);
+        const db = try open(std.testing.allocator, std.testing.io, path);
         defer db.close();
 
         try db.put("large", large_value[0..]);
@@ -2292,7 +2335,7 @@ test "put stores a single large value in a higher-order root leaf across reopen"
         try std.testing.expectEqual(@as(u8, 1), root_header.order);
     }
 
-    const reopened = try open(std.testing.allocator, path);
+    const reopened = try open(std.testing.allocator, std.testing.io, path);
     defer reopened.close();
 
     const value = (try reopened.get(std.testing.allocator, "large")).?;
@@ -2307,7 +2350,7 @@ test "put failure does not commit working allocator state" {
     var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const path = try tempFilePath(&path_buf, tmp.dir, "put-too-large-keeps-allocator.db");
 
-    const db = try open(std.testing.allocator, path);
+    const db = try open(std.testing.allocator, std.testing.io, path);
     defer db.close();
 
     const initial_high_water_mark = db.high_water_mark;
@@ -2336,7 +2379,7 @@ test "open keeps legacy allocator_root zero as empty free lists" {
     const path = try tempFilePath(&path_buf, tmp.dir, "legacy-empty-allocator.db");
     try bootstrapFile(path);
 
-    const db = try open(std.testing.allocator, path);
+    const db = try open(std.testing.allocator, std.testing.io, path);
     defer db.close();
 
     try std.testing.expectEqual(@as(u64, 0), db.allocator_root);
@@ -2351,13 +2394,13 @@ test "open restores older snapshot when newer allocator state is corrupt" {
     const path = try tempFilePath(&path_buf, tmp.dir, "allocator-state-fallback.db");
 
     {
-        const db = try open(std.testing.allocator, path);
+        const db = try open(std.testing.allocator, std.testing.io, path);
         defer db.close();
         try db.put("old", "one");
         try db.put("new", "two");
 
         const newest_allocator_root = db.allocator_root;
-        const io = db.io_threaded.io();
+        const io = db.io;
         var allocator_state = try readAllocatorStatePageObjectAlloc(
             std.testing.allocator,
             &db.file,
@@ -2372,7 +2415,7 @@ test "open restores older snapshot when newer allocator state is corrupt" {
         try storage.writePageObject(&db.file, io, db.page_size, newest_allocator_root, allocator_state);
     }
 
-    const reopened = try open(std.testing.allocator, path);
+    const reopened = try open(std.testing.allocator, std.testing.io, path);
     defer reopened.close();
 
     try std.testing.expectEqual(@as(u64, 1), reopened.txid);
@@ -2390,13 +2433,13 @@ test "open restores older snapshot when newer allocator pending txid is impossib
     const path = try tempFilePath(&path_buf, tmp.dir, "allocator-state-pending-txid-fallback.db");
 
     {
-        const db = try open(std.testing.allocator, path);
+        const db = try open(std.testing.allocator, std.testing.io, path);
         defer db.close();
         try db.put("old", "one");
         try db.put("new", "two");
 
         const newest_allocator_root = db.allocator_root;
-        const io = db.io_threaded.io();
+        const io = db.io;
         const allocator_state = try readAllocatorStatePageObjectAlloc(
             std.testing.allocator,
             &db.file,
@@ -2424,7 +2467,7 @@ test "open restores older snapshot when newer allocator pending txid is impossib
         try storage.writePageObject(&db.file, io, db.page_size, newest_allocator_root, invalid_state);
     }
 
-    const reopened = try open(std.testing.allocator, path);
+    const reopened = try open(std.testing.allocator, std.testing.io, path);
     defer reopened.close();
 
     try std.testing.expectEqual(@as(u64, 1), reopened.txid);
@@ -2442,7 +2485,7 @@ test "open ignores allocator state page that is not referenced by meta" {
     const path = try tempFilePath(&path_buf, tmp.dir, "unreferenced-allocator-state.db");
 
     {
-        const db = try open(std.testing.allocator, path);
+        const db = try open(std.testing.allocator, std.testing.io, path);
         defer db.close();
         try db.put("old", "one");
 
@@ -2451,10 +2494,10 @@ test "open ignores allocator state page that is not referenced by meta" {
         const unreferenced_root = try candidate.allocate(db.allocator, 0);
         const state_page = try candidate.encodeStatePageAlloc(std.testing.allocator, db.page_size, unreferenced_root, 0, &.{});
         defer std.testing.allocator.free(state_page);
-        try storage.writePageObject(&db.file, db.io_threaded.io(), db.page_size, unreferenced_root, state_page);
+        try storage.writePageObject(&db.file, db.io, db.page_size, unreferenced_root, state_page);
     }
 
-    const reopened = try open(std.testing.allocator, path);
+    const reopened = try open(std.testing.allocator, std.testing.io, path);
     defer reopened.close();
 
     try std.testing.expectEqual(@as(u64, 1), reopened.txid);
@@ -2469,7 +2512,7 @@ test "open restores order greater than zero allocator state pages" {
     const path = try tempFilePath(&path_buf, tmp.dir, "higher-order-allocator-state.db");
 
     {
-        const db = try open(std.testing.allocator, path);
+        const db = try open(std.testing.allocator, std.testing.io, path);
         defer db.close();
         db.page_allocator.high_water_mark = 2040;
 
@@ -2483,13 +2526,13 @@ test "open restores order greater than zero allocator state pages" {
         defer std.testing.allocator.free(allocator_state);
     }
 
-    const reopened = try open(std.testing.allocator, path);
+    const reopened = try open(std.testing.allocator, std.testing.io, path);
     defer reopened.close();
 
     const state_page = try readAllocatorStatePageObjectAlloc(
         std.testing.allocator,
         &reopened.file,
-        reopened.io_threaded.io(),
+        reopened.io,
         reopened.allocator_root,
         reopened.page_size,
         reopened.high_water_mark,
@@ -2508,7 +2551,7 @@ test "allocator state fixed point retry discards failed candidate allocations" {
     var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const path = try tempFilePath(&path_buf, tmp.dir, "allocator-state-fixed-point.db");
 
-    const db = try open(std.testing.allocator, path);
+    const db = try open(std.testing.allocator, std.testing.io, path);
     defer db.close();
     db.page_allocator.high_water_mark = 2040;
 
@@ -2522,7 +2565,7 @@ test "allocator state fixed point retry discards failed candidate allocations" {
     const state_page = try readAllocatorStatePageObjectAlloc(
         std.testing.allocator,
         &db.file,
-        db.io_threaded.io(),
+        db.io,
         db.allocator_root,
         db.page_size,
         db.high_water_mark,
@@ -2542,7 +2585,7 @@ test "root leaf split uses actual non adjacent allocated page ids" {
     var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const path = try tempFilePath(&path_buf, tmp.dir, "put-root-split-non-adjacent-free.db");
 
-    const db = try open(std.testing.allocator, path);
+    const db = try open(std.testing.allocator, std.testing.io, path);
     defer db.close();
 
     var value_buf: [160]u8 = undefined;
@@ -2589,7 +2632,7 @@ test "put rejects a single value larger than the u16-bounded tree page span" {
     var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const path = try tempFilePath(&path_buf, tmp.dir, "put-too-large-root-leaf.db");
 
-    const db = try open(std.testing.allocator, path);
+    const db = try open(std.testing.allocator, std.testing.io, path);
     defer db.close();
 
     const huge_value = try std.testing.allocator.alloc(u8, 40000);
@@ -2623,7 +2666,7 @@ test "readPageAlloc rejects page object order beyond the tree layout limit" {
         try storage.writePageObject(&file, io, default_page_size, 2, root_page[0..]);
     }
 
-    const db = try open(std.testing.allocator, path);
+    const db = try open(std.testing.allocator, std.testing.io, path);
     defer db.close();
 
     try std.testing.expectError(error.InvalidPageOrder, db.readPageAlloc(std.testing.allocator, 2));
@@ -2648,7 +2691,7 @@ test "readPageAlloc rejects page object spans beyond the high water mark" {
         try storage.writePageObject(&file, io, default_page_size, 2, root_page);
     }
 
-    const db = try open(std.testing.allocator, path);
+    const db = try open(std.testing.allocator, std.testing.io, path);
     defer db.close();
 
     try std.testing.expectError(error.EntryOutOfBounds, db.readPageAlloc(std.testing.allocator, 2));
@@ -2678,7 +2721,7 @@ test "readPageAlloc rejects page objects whose header id does not match the requ
         try storage.writePageObject(&file, io, default_page_size, 2, root_page[0..]);
     }
 
-    const db = try open(std.testing.allocator, path);
+    const db = try open(std.testing.allocator, std.testing.io, path);
     defer db.close();
 
     try std.testing.expectError(error.InvalidPageLayout, db.readPageAlloc(std.testing.allocator, 2));
@@ -2691,7 +2734,7 @@ test "explicit write transaction commit persists a staged put" {
     var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const path = try tempFilePath(&path_buf, tmp.dir, "write-tx-commit.db");
 
-    const db = try open(std.testing.allocator, path);
+    const db = try open(std.testing.allocator, std.testing.io, path);
     defer db.close();
 
     var write_tx = try db.beginWrite();
@@ -2709,7 +2752,7 @@ test "explicit write transaction rollback discards staged pages and preserves co
     var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const path = try tempFilePath(&path_buf, tmp.dir, "write-tx-rollback.db");
 
-    const db = try open(std.testing.allocator, path);
+    const db = try open(std.testing.allocator, std.testing.io, path);
     defer db.close();
 
     const initial_txid = db.txid;
@@ -2736,7 +2779,7 @@ test "write transaction exposes a single writer slot" {
     var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const path = try tempFilePath(&path_buf, tmp.dir, "write-tx-single-writer.db");
 
-    const db = try open(std.testing.allocator, path);
+    const db = try open(std.testing.allocator, std.testing.io, path);
     defer db.close();
 
     var write_tx = try db.beginWrite();
@@ -2752,7 +2795,7 @@ test "write transaction deinit releases the writer slot" {
     var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const path = try tempFilePath(&path_buf, tmp.dir, "write-tx-deinit.db");
 
-    const db = try open(std.testing.allocator, path);
+    const db = try open(std.testing.allocator, std.testing.io, path);
     defer db.close();
 
     {
@@ -2777,7 +2820,7 @@ test "write transaction commits multiple staged puts" {
     var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const path = try tempFilePath(&path_buf, tmp.dir, "write-tx-single-put.db");
 
-    const db = try open(std.testing.allocator, path);
+    const db = try open(std.testing.allocator, std.testing.io, path);
     defer db.close();
 
     var write_tx = try db.beginWrite();
@@ -2798,7 +2841,7 @@ test "write transaction keeps the last value for repeated puts to the same key" 
     var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const path = try tempFilePath(&path_buf, tmp.dir, "write-tx-repeat-key.db");
 
-    const db = try open(std.testing.allocator, path);
+    const db = try open(std.testing.allocator, std.testing.io, path);
     defer db.close();
 
     var write_tx = try db.beginWrite();
@@ -2819,7 +2862,7 @@ test "write transaction keeps earlier staged pages that are still referenced by 
     const path = try tempFilePath(&path_buf, tmp.dir, "write-tx-staged-page-survives.db");
 
     {
-        const db = try open(std.testing.allocator, path);
+        const db = try open(std.testing.allocator, std.testing.io, path);
         defer db.close();
 
         var value_buf = [_]u8{'x'} ** 160;
@@ -2859,7 +2902,7 @@ test "write transaction keeps earlier staged pages that are still referenced by 
         try expectDbValue(db, "k0023", "right");
     }
 
-    const reopened = try open(std.testing.allocator, path);
+    const reopened = try open(std.testing.allocator, std.testing.io, path);
     defer reopened.close();
     try expectDbValue(reopened, "k0000", "left");
     try expectDbValue(reopened, "k0023", "right");
@@ -2873,7 +2916,7 @@ test "db delete removes a committed key and persists the change" {
     const path = try tempFilePath(&path_buf, tmp.dir, "db-delete-persist.db");
 
     {
-        const db = try open(std.testing.allocator, path);
+        const db = try open(std.testing.allocator, std.testing.io, path);
         defer db.close();
 
         try db.put("alpha", "one");
@@ -2885,7 +2928,7 @@ test "db delete removes a committed key and persists the change" {
         try expectDbValue(db, "beta", "two");
     }
 
-    const reopened = try open(std.testing.allocator, path);
+    const reopened = try open(std.testing.allocator, std.testing.io, path);
     defer reopened.close();
     try expectDbMissing(reopened, "alpha");
     try expectDbValue(reopened, "beta", "two");
@@ -2898,7 +2941,7 @@ test "db delete missing key is a no-op for txid high water mark and reclaim" {
     var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const path = try tempFilePath(&path_buf, tmp.dir, "db-delete-missing.db");
 
-    const db = try open(std.testing.allocator, path);
+    const db = try open(std.testing.allocator, std.testing.io, path);
     defer db.close();
 
     try db.put("alpha", "one");
@@ -2920,7 +2963,7 @@ test "write transaction delete can be combined with staged puts" {
     var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const path = try tempFilePath(&path_buf, tmp.dir, "write-tx-delete-with-put.db");
 
-    const db = try open(std.testing.allocator, path);
+    const db = try open(std.testing.allocator, std.testing.io, path);
     defer db.close();
 
     try db.put("alpha", "one");
@@ -2943,7 +2986,7 @@ test "write transaction delete of a staged key still allows commit" {
     var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const path = try tempFilePath(&path_buf, tmp.dir, "write-tx-delete-staged-key.db");
 
-    const db = try open(std.testing.allocator, path);
+    const db = try open(std.testing.allocator, std.testing.io, path);
     defer db.close();
 
     var write_tx = try db.beginWrite();
@@ -2965,7 +3008,7 @@ test "db delete collapses a merged two leaf root back into one leaf" {
     var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const path = try tempFilePath(&path_buf, tmp.dir, "db-delete-root-collapse.db");
 
-    const db = try open(std.testing.allocator, path);
+    const db = try open(std.testing.allocator, std.testing.io, path);
     defer db.close();
 
     var value_buf = [_]u8{'x'} ** 160;
@@ -2998,7 +3041,7 @@ test "db delete of the final key leaves an empty root leaf" {
     var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const path = try tempFilePath(&path_buf, tmp.dir, "db-delete-final-key.db");
 
-    const db = try open(std.testing.allocator, path);
+    const db = try open(std.testing.allocator, std.testing.io, path);
     defer db.close();
 
     try db.put("alpha", "one");
@@ -3018,7 +3061,7 @@ test "write transaction does not reclaim superseded staged pages as committed pa
     var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const path = try tempFilePath(&path_buf, tmp.dir, "write-tx-staged-vs-committed-reclaim.db");
 
-    const db = try open(std.testing.allocator, path);
+    const db = try open(std.testing.allocator, std.testing.io, path);
     defer db.close();
 
     try db.put("alpha", "zero");
@@ -3045,7 +3088,7 @@ test "read transaction keeps its snapshot after an explicit write commit" {
     var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const path = try tempFilePath(&path_buf, tmp.dir, "write-tx-read-snapshot.db");
 
-    const db = try open(std.testing.allocator, path);
+    const db = try open(std.testing.allocator, std.testing.io, path);
     defer db.close();
 
     try db.put("alpha", "one");
@@ -3077,7 +3120,7 @@ test "commit failure releases the writer slot and leaves the transaction failed"
     var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const path = try tempFilePath(&path_buf, tmp.dir, "write-tx-commit-failure.db");
 
-    const db = try open(std.testing.allocator, path);
+    const db = try open(std.testing.allocator, std.testing.io, path);
     defer db.close();
 
     var write_tx = try db.beginWrite();
@@ -3085,7 +3128,7 @@ test "commit failure releases the writer slot and leaves the transaction failed"
 
     const initial_txid = db.txid;
     const initial_high_water_mark = db.high_water_mark;
-    const io = db.io_threaded.io();
+    const io = db.io;
     db.file.close(io);
     db.file_open = false;
 
@@ -3119,7 +3162,7 @@ test "write transaction commit without a staged write returns NoPendingWrite" {
     var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const path = try tempFilePath(&path_buf, tmp.dir, "write-tx-no-pending-write.db");
 
-    const db = try open(std.testing.allocator, path);
+    const db = try open(std.testing.allocator, std.testing.io, path);
     defer db.close();
 
     var write_tx = try db.beginWrite();
@@ -3136,7 +3179,7 @@ test "rolled back write transaction rejects put commit and rollback" {
     var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const path = try tempFilePath(&path_buf, tmp.dir, "write-tx-closed-after-rollback.db");
 
-    const db = try open(std.testing.allocator, path);
+    const db = try open(std.testing.allocator, std.testing.io, path);
     defer db.close();
 
     var write_tx = try db.beginWrite();
@@ -3155,7 +3198,7 @@ test "reclaim reuses released pages on the next write when no readers block reus
     var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const path = try tempFilePath(&path_buf, tmp.dir, "reclaim-reuses-without-readers.db");
 
-    const db = try open(std.testing.allocator, path);
+    const db = try open(std.testing.allocator, std.testing.io, path);
     defer db.close();
 
     try db.put("alpha", "one");
@@ -3178,7 +3221,7 @@ test "reclaim keeps released pages pending while a read transaction is still act
     var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const path = try tempFilePath(&path_buf, tmp.dir, "reclaim-blocked-by-reader.db");
 
-    const db = try open(std.testing.allocator, path);
+    const db = try open(std.testing.allocator, std.testing.io, path);
     defer db.close();
 
     try db.put("alpha", "one");
@@ -3203,7 +3246,7 @@ test "reclaim reuses released pages after the blocking read transaction ends" {
     var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const path = try tempFilePath(&path_buf, tmp.dir, "reclaim-reuses-after-reader-ends.db");
 
-    const db = try open(std.testing.allocator, path);
+    const db = try open(std.testing.allocator, std.testing.io, path);
     defer db.close();
 
     try db.put("alpha", "one");
@@ -3230,7 +3273,7 @@ test "reopen restores and safely releases persisted pending reclaim" {
     var released_allocator_root: reclaim.ReleasedPage = undefined;
 
     {
-        const db = try open(std.testing.allocator, path);
+        const db = try open(std.testing.allocator, std.testing.io, path);
         defer db.close();
 
         try db.put("alpha", "one");
@@ -3241,7 +3284,7 @@ test "reopen restores and safely releases persisted pending reclaim" {
         try std.testing.expectEqual(@as(usize, 0), try db.page_allocator.freeBlockCount());
     }
 
-    const reopened = try open(std.testing.allocator, path);
+    const reopened = try open(std.testing.allocator, std.testing.io, path);
     defer reopened.close();
 
     try std.testing.expectEqual(@as(usize, 0), reopened.reclaim.pending.items.len);
@@ -3262,7 +3305,7 @@ test "compact rewrites an empty database into a reopenable file" {
     var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const path = try tempFilePath(&path_buf, tmp.dir, "compact-empty.db");
 
-    const db = try open(std.testing.allocator, path);
+    const db = try open(std.testing.allocator, std.testing.io, path);
     defer db.close();
 
     try db.compact(std.testing.allocator);
@@ -3271,7 +3314,7 @@ test "compact rewrites an empty database into a reopenable file" {
     try std.testing.expectEqual(@as(u64, 2), db.high_water_mark);
     try std.testing.expectEqual(@as(u64, 0), db.allocator_root);
 
-    const reopened = try open(std.testing.allocator, path);
+    const reopened = try open(std.testing.allocator, std.testing.io, path);
     defer reopened.close();
     try std.testing.expectEqual(@as(u64, 2), reopened.root_page_id);
     try std.testing.expectEqual(@as(u64, 2), reopened.high_water_mark);
@@ -3284,7 +3327,7 @@ test "compact preserves data clears pending reclaim and shrinks the high water m
     var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const path = try tempFilePath(&path_buf, tmp.dir, "compact-shrinks.db");
 
-    const db = try open(std.testing.allocator, path);
+    const db = try open(std.testing.allocator, std.testing.io, path);
     defer db.close();
 
     try db.put("alpha", "one");
@@ -3304,7 +3347,7 @@ test "compact preserves data clears pending reclaim and shrinks the high water m
     try std.testing.expectEqual(@as(u64, 0), db.allocator_root);
     try expectDbValue(db, "alpha", "three");
 
-    const reopened = try open(std.testing.allocator, path);
+    const reopened = try open(std.testing.allocator, std.testing.io, path);
     defer reopened.close();
     try expectDbValue(reopened, "alpha", "three");
     try std.testing.expectEqual(db.high_water_mark, reopened.high_water_mark);
@@ -3317,7 +3360,7 @@ test "compact preserves cursor order across a multi-level tree" {
     var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const path = try tempFilePath(&path_buf, tmp.dir, "compact-cursor.db");
 
-    const db = try open(std.testing.allocator, path);
+    const db = try open(std.testing.allocator, std.testing.io, path);
     defer db.close();
 
     var value_buf = [_]u8{'x'} ** 160;
@@ -3354,7 +3397,7 @@ test "compact preserves higher-order leaf pages" {
     var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const path = try tempFilePath(&path_buf, tmp.dir, "compact-large-value.db");
 
-    const db = try open(std.testing.allocator, path);
+    const db = try open(std.testing.allocator, std.testing.io, path);
     defer db.close();
 
     var large_value = [_]u8{'L'} ** 7000;
@@ -3380,7 +3423,7 @@ test "compact keeps active read transactions on their original snapshot" {
     var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const path = try tempFilePath(&path_buf, tmp.dir, "compact-active-reader.db");
 
-    const db = try open(std.testing.allocator, path);
+    const db = try open(std.testing.allocator, std.testing.io, path);
     defer db.close();
 
     try db.put("alpha", "one");
@@ -3434,7 +3477,7 @@ test "compact rejects an active write transaction" {
     var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const path = try tempFilePath(&path_buf, tmp.dir, "compact-active-write.db");
 
-    const db = try open(std.testing.allocator, path);
+    const db = try open(std.testing.allocator, std.testing.io, path);
     defer db.close();
 
     var write_tx = try db.beginWrite();
@@ -3450,7 +3493,7 @@ test "bucket create put delete round trips across reopen" {
     const path = try tempFilePath(&path_buf, tmp.dir, "bucket-round-trip.db");
 
     {
-        const db = try open(std.testing.allocator, path);
+        const db = try open(std.testing.allocator, std.testing.io, path);
         defer db.close();
 
         try db.createBucket("users");
@@ -3460,7 +3503,7 @@ test "bucket create put delete round trips across reopen" {
         try expectBucketValue(db, "users", "bob", "reader");
     }
 
-    const reopened = try open(std.testing.allocator, path);
+    const reopened = try open(std.testing.allocator, std.testing.io, path);
     defer reopened.close();
     try expectBucketValue(reopened, "users", "alice", "admin");
     try expectBucketValue(reopened, "users", "bob", "reader");
@@ -3478,7 +3521,7 @@ test "bucket names are protected from root key operations" {
     var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const path = try tempFilePath(&path_buf, tmp.dir, "bucket-root-guards.db");
 
-    const db = try open(std.testing.allocator, path);
+    const db = try open(std.testing.allocator, std.testing.io, path);
     defer db.close();
 
     try db.createBucket("users");
@@ -3498,7 +3541,7 @@ test "bucket writes keep earlier read snapshots stable" {
     var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const path = try tempFilePath(&path_buf, tmp.dir, "bucket-snapshot.db");
 
-    const db = try open(std.testing.allocator, path);
+    const db = try open(std.testing.allocator, std.testing.io, path);
     defer db.close();
 
     try db.createBucket("users");
@@ -3529,7 +3572,7 @@ test "bucket cursor traverses entries in order and supports seek" {
     var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const path = try tempFilePath(&path_buf, tmp.dir, "bucket-cursor.db");
 
-    const db = try open(std.testing.allocator, path);
+    const db = try open(std.testing.allocator, std.testing.io, path);
     defer db.close();
 
     try db.createBucket("users");
@@ -3564,7 +3607,7 @@ test "bucket cursor reports missing and non-bucket namespace entries" {
     var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const path = try tempFilePath(&path_buf, tmp.dir, "bucket-cursor-errors.db");
 
-    const db = try open(std.testing.allocator, path);
+    const db = try open(std.testing.allocator, std.testing.io, path);
     defer db.close();
 
     try db.put("plain", "value");
@@ -3583,7 +3626,7 @@ test "bucket cursor keeps its snapshot stable after bucket writes" {
     var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const path = try tempFilePath(&path_buf, tmp.dir, "bucket-cursor-snapshot.db");
 
-    const db = try open(std.testing.allocator, path);
+    const db = try open(std.testing.allocator, std.testing.io, path);
     defer db.close();
 
     try db.createBucket("users");
@@ -3614,7 +3657,7 @@ test "deleteBucket keeps the removed bucket visible to older snapshots" {
     var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const path = try tempFilePath(&path_buf, tmp.dir, "bucket-delete-reclaim.db");
 
-    const db = try open(std.testing.allocator, path);
+    const db = try open(std.testing.allocator, std.testing.io, path);
     defer db.close();
 
     try db.createBucket("users");
@@ -3639,7 +3682,7 @@ test "bucket cursor keeps the removed bucket visible to older snapshots" {
     var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const path = try tempFilePath(&path_buf, tmp.dir, "bucket-cursor-delete-snapshot.db");
 
-    const db = try open(std.testing.allocator, path);
+    const db = try open(std.testing.allocator, std.testing.io, path);
     defer db.close();
 
     try db.createBucket("users");
