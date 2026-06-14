@@ -174,6 +174,18 @@ pub const DB = struct {
         return tx.ManagedReadView.init(self);
     }
 
+    /// Opens a stable read snapshot rooted at the direct child bucket `bucket`.
+    pub fn readViewInBucket(self: *DB, bucket: []const u8) !tx.ManagedBucketView {
+        const bucket_path = [_][]const u8{bucket};
+        return self.readViewInBucketPath(bucket_path[0..]);
+    }
+
+    /// Opens a stable read snapshot rooted at the descendant bucket
+    /// `bucket_path`.
+    pub fn readViewInBucketPath(self: *DB, bucket_path: []const []const u8) !tx.ManagedBucketView {
+        return tx.ManagedBucketView.initInBucketPath(self, bucket_path);
+    }
+
     /// Opens a cursor over the latest committed snapshot root of `bucket`.
     pub fn cursorInBucket(self: *DB, bucket: []const u8) !tx.ManagedCursor {
         const bucket_path = [_][]const u8{bucket};
@@ -4504,6 +4516,77 @@ test "managed read view stays usable after bucket lookup errors" {
     const root_value = (try view.get(std.testing.allocator, "plain")).?;
     defer std.testing.allocator.free(root_value);
     try std.testing.expectEqualSlices(u8, "value", root_value);
+}
+
+test "managed bucket view keeps a stable bucket snapshot and supports nested scopes" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path = try tempFilePath(&path_buf, tmp.dir, "managed-bucket-view-snapshot.db");
+
+    const db = try open(std.testing.allocator, std.testing.io, path);
+    defer db.close();
+
+    const orgs_path = [_][]const u8{"orgs"};
+    const engineering_path = [_][]const u8{ "orgs", "engineering" };
+
+    try db.createBucket("orgs");
+    try db.createBucketInBucketPath(orgs_path[0..], "engineering");
+    try db.putInBucketPath(engineering_path[0..], "alice", "one");
+    try db.createBucketInBucketPath(engineering_path[0..], "birds");
+    try db.putInBucketPath(&[_][]const u8{ "orgs", "engineering", "birds" }, "crow", "three");
+
+    var view = try db.readViewInBucketPath(engineering_path[0..]);
+    defer view.deinit();
+
+    try db.putInBucketPath(engineering_path[0..], "alice", "updated");
+    try db.putInBucketPath(engineering_path[0..], "bob", "two");
+    try db.putInBucketPath(&[_][]const u8{ "orgs", "engineering", "birds" }, "crow", "updated");
+
+    const alice = (try view.get(std.testing.allocator, "alice")).?;
+    defer std.testing.allocator.free(alice);
+    try std.testing.expectEqualSlices(u8, "one", alice);
+
+    try std.testing.expect(try view.bucketExists(std.testing.allocator, "birds"));
+    var scan = try view.scanAlloc(std.testing.allocator, .{
+        .start_inclusive = "a",
+        .end_exclusive = "z",
+    });
+    defer scan.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 2), scan.items.len);
+    try expectCursorRecord(scan.items[0], "alice", "one");
+    try std.testing.expectEqualStrings("birds", scan.items[1].key);
+    try std.testing.expect(namespace.isBucketFlags(scan.items[1].flags));
+
+    var birds = try view.bucketViewInBucket("birds");
+    const crow = (try birds.get(std.testing.allocator, "crow")).?;
+    defer std.testing.allocator.free(crow);
+    try std.testing.expectEqualSlices(u8, "three", crow);
+
+    try expectBucketPathValue(db, engineering_path[0..], "alice", "updated");
+    try expectBucketPathValue(db, engineering_path[0..], "bob", "two");
+}
+
+test "readViewInBucketPath closes failed snapshots on lookup errors" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path = try tempFilePath(&path_buf, tmp.dir, "managed-bucket-view-errors.db");
+
+    const db = try open(std.testing.allocator, std.testing.io, path);
+    defer db.close();
+
+    try db.createBucket("users");
+    try db.put("plain", "value");
+
+    try std.testing.expectEqual(@as(usize, 0), db.reclaim.activeReaderCount());
+    try std.testing.expectError(error.BucketNotFound, db.readViewInBucket("missing"));
+    try std.testing.expectEqual(@as(usize, 0), db.reclaim.activeReaderCount());
+
+    try std.testing.expectError(error.KeyNotBucket, db.readViewInBucket("plain"));
+    try std.testing.expectEqual(@as(usize, 0), db.reclaim.activeReaderCount());
 }
 
 test "scanAlloc returns root records within inclusive start and exclusive end bounds" {
