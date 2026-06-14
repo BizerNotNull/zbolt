@@ -27,6 +27,17 @@ const RecoverableSnapshot = struct {
     reclaim_state: reclaim.State,
 };
 
+const MetaPages = struct {
+    meta0: []u8,
+    meta1: []u8,
+
+    fn deinit(self: *MetaPages, allocator: std.mem.Allocator) void {
+        allocator.free(self.meta0);
+        allocator.free(self.meta1);
+        self.* = undefined;
+    }
+};
+
 pub const DB = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -551,24 +562,53 @@ fn initializeEmptyDatabase(db: *DB) !void {
 }
 
 fn loadSelectedMeta(allocator: std.mem.Allocator, file: *std.Io.File, io: std.Io, page_size: u32) !meta.SelectedMeta {
-    const meta0_page = try storage.readPageAlloc(allocator, file, io, 0, page_size);
-    defer allocator.free(meta0_page);
+    var meta_pages = try readMetaPagesAlloc(allocator, file, io, page_size);
+    defer meta_pages.deinit(allocator);
 
-    const meta1_page = try storage.readPageAlloc(allocator, file, io, 1, page_size);
-    defer allocator.free(meta1_page);
-
-    // TODO: parse meta pages need to be explicited decomposition
-    return meta.selectNewestValid(meta0_page, meta1_page);
+    return meta.selectNewestValid(meta_pages.meta0, meta_pages.meta1);
 }
 
 fn loadNewestRecoverableSnapshot(allocator: std.mem.Allocator, file: *std.Io.File, io: std.Io, page_size: u32) !RecoverableSnapshot {
+    var meta_pages = try readMetaPagesAlloc(allocator, file, io, page_size);
+    defer meta_pages.deinit(allocator);
+
+    const snapshot0 = try tryLoadRecoverableSnapshotForMeta(
+        allocator,
+        file,
+        io,
+        meta.MetaSlot.meta0,
+        meta_pages.meta0,
+    );
+    const snapshot1 = try tryLoadRecoverableSnapshotForMeta(
+        allocator,
+        file,
+        io,
+        meta.MetaSlot.meta1,
+        meta_pages.meta1,
+    );
+
+    return selectNewestRecoverableSnapshot(allocator, snapshot0, snapshot1);
+}
+
+fn readMetaPagesAlloc(allocator: std.mem.Allocator, file: *std.Io.File, io: std.Io, page_size: u32) !MetaPages {
     const meta0_page = try storage.readPageAlloc(allocator, file, io, 0, page_size);
-    defer allocator.free(meta0_page);
-
+    errdefer allocator.free(meta0_page);
     const meta1_page = try storage.readPageAlloc(allocator, file, io, 1, page_size);
-    defer allocator.free(meta1_page);
 
-    const snapshot0 = loadRecoverableSnapshotForMeta(allocator, file, io, meta.MetaSlot.meta0, meta0_page) catch |err| switch (err) {
+    return .{
+        .meta0 = meta0_page,
+        .meta1 = meta1_page,
+    };
+}
+
+fn tryLoadRecoverableSnapshotForMeta(
+    allocator: std.mem.Allocator,
+    file: *std.Io.File,
+    io: std.Io,
+    slot: meta.MetaSlot,
+    meta_page: []const u8,
+) !?RecoverableSnapshot {
+    return loadRecoverableSnapshotForMeta(allocator, file, io, slot, meta_page) catch |err| switch (err) {
         error.InvalidMagic,
         error.InvalidVersion,
         error.InvalidChecksum,
@@ -594,47 +634,27 @@ fn loadNewestRecoverableSnapshot(allocator: std.mem.Allocator, file: *std.Io.Fil
         => null,
         else => return err,
     };
-    const snapshot1 = loadRecoverableSnapshotForMeta(allocator, file, io, meta.MetaSlot.meta1, meta1_page) catch |err| switch (err) {
-        error.InvalidMagic,
-        error.InvalidVersion,
-        error.InvalidChecksum,
-        error.InvalidPageSize,
-        error.PageTooSmall,
-        error.PageLengthMismatch,
-        error.RootPageOutOfRange,
-        error.AllocatorRootOutOfRange,
-        error.InvalidAllocatorState,
-        error.AllocatorStateTooLarge,
-        error.InvalidPageType,
-        error.InvalidBasePageSize,
-        error.InvalidPageOrder,
-        error.PageIdOverflow,
-        error.SpanSizeOverflow,
-        error.UnexpectedPageType,
-        error.InvalidPageLayout,
-        error.EntryOutOfBounds,
-        error.EntriesNotSorted,
-        error.PageFull,
-        error.InvalidFreeBlock,
-        error.FreeBlockOverlap,
-        => null,
-        else => return err,
-    };
+}
 
+fn selectNewestRecoverableSnapshot(
+    allocator: std.mem.Allocator,
+    snapshot0: ?RecoverableSnapshot,
+    snapshot1: ?RecoverableSnapshot,
+) !RecoverableSnapshot {
     if (snapshot0 == null and snapshot1 == null) return error.NoValidMetaPage;
     if (snapshot0 != null and snapshot1 == null) return snapshot0.?;
     if (snapshot0 == null and snapshot1 != null) return snapshot1.?;
 
     if (snapshot0.?.meta.txid >= snapshot1.?.meta.txid) {
         var older = snapshot1.?;
-        older.page_allocator.deinit(allocator);
-        older.reclaim_state.deinit(allocator);
+        defer older.page_allocator.deinit(allocator);
+        defer older.reclaim_state.deinit(allocator);
         return snapshot0.?;
     }
 
     var older = snapshot0.?;
-    older.page_allocator.deinit(allocator);
-    older.reclaim_state.deinit(allocator);
+    defer older.page_allocator.deinit(allocator);
+    defer older.reclaim_state.deinit(allocator);
     return snapshot1.?;
 }
 
@@ -1427,6 +1447,45 @@ test "open recovers cached state from an existing valid database" {
     try std.testing.expectEqual(default_page_size, db.page_size);
     try std.testing.expectEqual(@as(u64, 3), db.root_page_id);
     try std.testing.expectEqual(@as(u64, 9), db.txid);
+}
+
+test "loadNewestRecoverableSnapshot prefers meta0 when txids tie" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path = try tempFilePath(&path_buf, tmp.dir, "recover-tie-prefers-meta0.db");
+
+    try writeSeededDatabase(path, .{
+        .page_size = default_page_size,
+        .flags = 11,
+        .root_page_id = 2,
+        .allocator_root = 0,
+        .high_water_mark = 2,
+        .txid = 5,
+    }, .{
+        .page_size = default_page_size,
+        .flags = 22,
+        .root_page_id = 3,
+        .allocator_root = 0,
+        .high_water_mark = 3,
+        .txid = 5,
+    });
+
+    const io = std.testing.io;
+    var file = try std.Io.Dir.openFileAbsolute(io, path, .{ .mode = .read_only });
+    defer file.close(io);
+
+    var snapshot = try loadNewestRecoverableSnapshot(std.testing.allocator, &file, io, default_page_size);
+    defer {
+        snapshot.page_allocator.deinit(std.testing.allocator);
+        snapshot.reclaim_state.deinit(std.testing.allocator);
+    }
+
+    try std.testing.expectEqual(meta.MetaSlot.meta0, snapshot.slot);
+    try std.testing.expectEqual(@as(u32, 11), snapshot.meta.flags);
+    try std.testing.expectEqual(@as(u64, 2), snapshot.meta.root_page_id);
+    try std.testing.expectEqual(@as(u64, 5), snapshot.meta.txid);
 }
 
 test "open prefers only valid meta when the other one is invalid" {
