@@ -158,6 +158,128 @@ pub const ReadTx = struct {
     }
 };
 
+pub const ManagedReadView = struct {
+    allocator: std.mem.Allocator,
+    read_tx: ?*ReadTx,
+
+    /// Opens a stable read snapshot that owns the underlying transaction.
+    pub fn init(db: *db_mod.DB) !ManagedReadView {
+        return .{
+            .allocator = db.allocator,
+            .read_tx = try initOwnedReadTx(db),
+        };
+    }
+
+    /// Returns an owned copy of the value visible to this stable snapshot.
+    pub fn get(self: *const ManagedReadView, allocator: std.mem.Allocator, key: []const u8) !?[]u8 {
+        std.debug.assert(self.read_tx != null);
+        return self.read_tx.?.get(allocator, key);
+    }
+
+    /// Returns an owned copy of the value stored inside `bucket` for `key`.
+    pub fn getInBucket(self: *const ManagedReadView, allocator: std.mem.Allocator, bucket: []const u8, key: []const u8) !?[]u8 {
+        std.debug.assert(self.read_tx != null);
+        return self.read_tx.?.getInBucket(allocator, bucket, key);
+    }
+
+    /// Returns an owned copy of the value stored inside the bucket at
+    /// `bucket_path` for `key`.
+    pub fn getInBucketPath(
+        self: *const ManagedReadView,
+        allocator: std.mem.Allocator,
+        bucket_path: []const []const u8,
+        key: []const u8,
+    ) !?[]u8 {
+        std.debug.assert(self.read_tx != null);
+        return self.read_tx.?.getInBucketPath(allocator, bucket_path, key);
+    }
+
+    /// Returns whether `bucket` exists in this stable snapshot.
+    pub fn bucketExists(self: *const ManagedReadView, allocator: std.mem.Allocator, bucket: []const u8) !bool {
+        std.debug.assert(self.read_tx != null);
+        return self.read_tx.?.bucketExists(allocator, bucket);
+    }
+
+    /// Returns whether `bucket` exists inside the bucket at
+    /// `parent_bucket_path` in this stable snapshot.
+    pub fn bucketExistsInBucketPath(
+        self: *const ManagedReadView,
+        allocator: std.mem.Allocator,
+        parent_bucket_path: []const []const u8,
+        bucket: []const u8,
+    ) !bool {
+        std.debug.assert(self.read_tx != null);
+        return self.read_tx.?.bucketExistsInBucketPath(allocator, parent_bucket_path, bucket);
+    }
+
+    /// Returns the top-level bucket names visible in this stable snapshot.
+    pub fn bucketNamesAlloc(self: *const ManagedReadView, allocator: std.mem.Allocator) !namespace.BucketNames {
+        std.debug.assert(self.read_tx != null);
+        return self.read_tx.?.bucketNamesAlloc(allocator);
+    }
+
+    /// Returns the direct child bucket names visible inside the bucket at
+    /// `parent_bucket_path`.
+    pub fn bucketNamesInBucketPathAlloc(
+        self: *const ManagedReadView,
+        allocator: std.mem.Allocator,
+        parent_bucket_path: []const []const u8,
+    ) !namespace.BucketNames {
+        std.debug.assert(self.read_tx != null);
+        return self.read_tx.?.bucketNamesInBucketPathAlloc(allocator, parent_bucket_path);
+    }
+
+    /// Returns owned records whose keys fall within `[start_inclusive, end_exclusive)`.
+    pub fn scanAlloc(self: *const ManagedReadView, allocator: std.mem.Allocator, bounds: ScanBounds) !ScanRecords {
+        std.debug.assert(self.read_tx != null);
+        return self.read_tx.?.scanAlloc(allocator, bounds);
+    }
+
+    /// Opens a read-only cursor pinned to this stable snapshot.
+    pub fn cursor(self: *const ManagedReadView) tree.Cursor {
+        std.debug.assert(self.read_tx != null);
+        return self.read_tx.?.cursor();
+    }
+
+    /// Opens a read-only cursor pinned to the snapshot root of `bucket`.
+    pub fn cursorInBucket(self: *const ManagedReadView, bucket: []const u8) !tree.Cursor {
+        std.debug.assert(self.read_tx != null);
+        return self.read_tx.?.cursorInBucket(bucket);
+    }
+
+    /// Opens a read-only cursor pinned to the snapshot root of the bucket at
+    /// `bucket_path`.
+    pub fn cursorInBucketPath(self: *const ManagedReadView, bucket_path: []const []const u8) !tree.Cursor {
+        std.debug.assert(self.read_tx != null);
+        return self.read_tx.?.cursorInBucketPath(bucket_path);
+    }
+
+    /// Returns owned records from `bucket` whose keys fall within `[start_inclusive, end_exclusive)`.
+    pub fn scanInBucketAlloc(self: *const ManagedReadView, allocator: std.mem.Allocator, bucket: []const u8, bounds: ScanBounds) !ScanRecords {
+        std.debug.assert(self.read_tx != null);
+        return self.read_tx.?.scanInBucketAlloc(allocator, bucket, bounds);
+    }
+
+    /// Returns owned records from the bucket at `bucket_path` whose keys fall
+    /// within `[start_inclusive, end_exclusive)`.
+    pub fn scanInBucketPathAlloc(
+        self: *const ManagedReadView,
+        allocator: std.mem.Allocator,
+        bucket_path: []const []const u8,
+        bounds: ScanBounds,
+    ) !ScanRecords {
+        std.debug.assert(self.read_tx != null);
+        return self.read_tx.?.scanInBucketPathAlloc(allocator, bucket_path, bounds);
+    }
+
+    /// Releases the owned read transaction snapshot.
+    pub fn deinit(self: *ManagedReadView) void {
+        const owned_read_tx = self.read_tx orelse return;
+        self.read_tx = null;
+        destroyOwnedReadTx(self.allocator, owned_read_tx);
+    }
+};
+
 pub const ManagedCursor = struct {
     allocator: std.mem.Allocator,
     read_tx: ?*ReadTx,
@@ -231,19 +353,21 @@ pub const ManagedCursor = struct {
         owned_read_tx.deinit();
         self.allocator.destroy(owned_read_tx);
     }
-
-    fn initOwnedReadTx(db: *db_mod.DB) !*ReadTx {
-        const owned_read_tx = try db.allocator.create(ReadTx);
-        errdefer db.allocator.destroy(owned_read_tx);
-        owned_read_tx.* = try db.beginRead();
-        return owned_read_tx;
-    }
-
-    fn destroyOwnedReadTx(allocator: std.mem.Allocator, owned_read_tx: *ReadTx) void {
-        owned_read_tx.deinit();
-        allocator.destroy(owned_read_tx);
-    }
 };
+
+fn initOwnedReadTx(db: *db_mod.DB) !*ReadTx {
+    const owned_read_tx = try db.allocator.create(ReadTx);
+    errdefer db.allocator.destroy(owned_read_tx);
+    // Managed wrappers can be moved by value, so the shared ReadTx lives on
+    // the heap to keep cursor owner pointers stable for the snapshot lifetime.
+    owned_read_tx.* = try db.beginRead();
+    return owned_read_tx;
+}
+
+fn destroyOwnedReadTx(allocator: std.mem.Allocator, owned_read_tx: *ReadTx) void {
+    owned_read_tx.deinit();
+    allocator.destroy(owned_read_tx);
+}
 
 pub const WriteTx = struct {
     db: *db_mod.DB,
@@ -1288,7 +1412,7 @@ test "write transaction staged read view reflects namespace scan and cursor stat
     try write_tx.putInBucket("animals", "ant", "one");
     try write_tx.putInBucket("animals", "bat", "two");
     try write_tx.createBucketInBucketPath(&[_][]const u8{"animals"}, "birds");
-    try write_tx.putInBucketPath(&[_][]const u8{"animals", "birds"}, "crow", "three");
+    try write_tx.putInBucketPath(&[_][]const u8{ "animals", "birds" }, "crow", "three");
 
     try std.testing.expect(try write_tx.bucketExists(std.testing.allocator, "animals"));
     try std.testing.expect(try write_tx.bucketExistsInBucketPath(std.testing.allocator, &[_][]const u8{"animals"}, "birds"));
@@ -1309,12 +1433,12 @@ test "write transaction staged read view reflects namespace scan and cursor stat
     try std.testing.expectEqualStrings("birds", scan.items[2].key);
     try std.testing.expect(namespace.isBucketFlags(scan.items[2].flags));
 
-    var nested_scan = try write_tx.scanInBucketPathAlloc(std.testing.allocator, &[_][]const u8{"animals", "birds"}, .{});
+    var nested_scan = try write_tx.scanInBucketPathAlloc(std.testing.allocator, &[_][]const u8{ "animals", "birds" }, .{});
     defer nested_scan.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(usize, 1), nested_scan.items.len);
     try expectScanRecord(nested_scan.items[0], "crow", "three");
 
-    var cursor = try write_tx.cursorInBucketPath(&[_][]const u8{"animals", "birds"});
+    var cursor = try write_tx.cursorInBucketPath(&[_][]const u8{ "animals", "birds" });
     defer cursor.deinit();
     var first = (try cursor.first(std.testing.allocator)).?;
     defer first.deinit(std.testing.allocator);

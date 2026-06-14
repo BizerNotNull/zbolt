@@ -23,6 +23,7 @@ pub const TreeWriteError = tree.TreeWriteError;
 pub const CursorError = tree.CursorError;
 pub const ReadTx = tx.ReadTx;
 pub const WriteTx = tx.WriteTx;
+pub const ManagedReadView = tx.ManagedReadView;
 pub const ManagedCursor = tx.ManagedCursor;
 pub const WriteTxError = tx.WriteTxError;
 pub const ScanBounds = tx.ScanBounds;
