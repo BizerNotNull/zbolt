@@ -32,6 +32,127 @@ pub const ScanRecords = struct {
     }
 };
 
+/// Borrowed bucket-scoped read helper.
+///
+/// This view reuses transaction-owned page readers and cursor ownership, so it
+/// remains valid only while the originating ReadTx, WriteTx, or managed view is
+/// still alive.
+pub const BucketReadView = struct {
+    read_view: TxReadView,
+
+    /// Returns an owned copy of the value visible at this bucket scope.
+    pub fn get(self: *const BucketReadView, allocator: std.mem.Allocator, key: []const u8) !?[]u8 {
+        return self.read_view.get(allocator, key);
+    }
+
+    /// Returns an owned copy of the value stored in the direct child bucket
+    /// `bucket` for `key`.
+    pub fn getInBucket(self: *const BucketReadView, allocator: std.mem.Allocator, bucket: []const u8, key: []const u8) !?[]u8 {
+        const bucket_path = [_][]const u8{bucket};
+        return self.getInBucketPath(allocator, bucket_path[0..], key);
+    }
+
+    /// Returns an owned copy of the value stored inside the descendant bucket
+    /// at `bucket_path` for `key`.
+    pub fn getInBucketPath(
+        self: *const BucketReadView,
+        allocator: std.mem.Allocator,
+        bucket_path: []const []const u8,
+        key: []const u8,
+    ) !?[]u8 {
+        return self.read_view.getInBucketPath(allocator, bucket_path, key);
+    }
+
+    /// Returns whether the direct child bucket `bucket` exists.
+    pub fn bucketExists(self: *const BucketReadView, allocator: std.mem.Allocator, bucket: []const u8) !bool {
+        const parent_bucket_path: [0][]const u8 = .{};
+        return self.bucketExistsInBucketPath(allocator, parent_bucket_path[0..], bucket);
+    }
+
+    /// Returns whether `bucket` exists inside the descendant parent bucket at
+    /// `parent_bucket_path`.
+    pub fn bucketExistsInBucketPath(
+        self: *const BucketReadView,
+        allocator: std.mem.Allocator,
+        parent_bucket_path: []const []const u8,
+        bucket: []const u8,
+    ) !bool {
+        return self.read_view.bucketExistsInBucketPath(allocator, parent_bucket_path, bucket);
+    }
+
+    /// Returns the direct child bucket names visible at this bucket scope.
+    pub fn bucketNamesAlloc(self: *const BucketReadView, allocator: std.mem.Allocator) !namespace.BucketNames {
+        const parent_bucket_path: [0][]const u8 = .{};
+        return self.bucketNamesInBucketPathAlloc(allocator, parent_bucket_path[0..]);
+    }
+
+    /// Returns the direct child bucket names inside the descendant parent
+    /// bucket at `parent_bucket_path`.
+    pub fn bucketNamesInBucketPathAlloc(
+        self: *const BucketReadView,
+        allocator: std.mem.Allocator,
+        parent_bucket_path: []const []const u8,
+    ) !namespace.BucketNames {
+        return self.read_view.bucketNamesInBucketPathAlloc(allocator, parent_bucket_path);
+    }
+
+    /// Returns owned records whose keys fall within
+    /// `[start_inclusive, end_exclusive)` at this bucket scope.
+    pub fn scanAlloc(self: *const BucketReadView, allocator: std.mem.Allocator, bounds: ScanBounds) !ScanRecords {
+        return self.read_view.scanAlloc(allocator, bounds);
+    }
+
+    /// Opens a read-only cursor pinned to this bucket scope.
+    pub fn cursor(self: *const BucketReadView) tree.Cursor {
+        return self.read_view.cursor();
+    }
+
+    /// Opens a read-only cursor pinned to the direct child bucket `bucket`.
+    pub fn cursorInBucket(self: *const BucketReadView, bucket: []const u8) !tree.Cursor {
+        const bucket_path = [_][]const u8{bucket};
+        return self.cursorInBucketPath(bucket_path[0..]);
+    }
+
+    /// Opens a read-only cursor pinned to the descendant bucket at
+    /// `bucket_path`.
+    pub fn cursorInBucketPath(self: *const BucketReadView, bucket_path: []const []const u8) !tree.Cursor {
+        return self.read_view.cursorInBucketPath(bucket_path);
+    }
+
+    /// Returns owned records from the direct child bucket `bucket` whose keys
+    /// fall within `[start_inclusive, end_exclusive)`.
+    pub fn scanInBucketAlloc(self: *const BucketReadView, allocator: std.mem.Allocator, bucket: []const u8, bounds: ScanBounds) !ScanRecords {
+        const bucket_path = [_][]const u8{bucket};
+        return self.scanInBucketPathAlloc(allocator, bucket_path[0..], bounds);
+    }
+
+    /// Returns owned records from the descendant bucket at `bucket_path` whose
+    /// keys fall within `[start_inclusive, end_exclusive)`.
+    pub fn scanInBucketPathAlloc(
+        self: *const BucketReadView,
+        allocator: std.mem.Allocator,
+        bucket_path: []const []const u8,
+        bounds: ScanBounds,
+    ) !ScanRecords {
+        return self.read_view.scanInBucketPathAlloc(allocator, bucket_path, bounds);
+    }
+
+    /// Returns a further bucket-scoped borrowed view rooted at the direct child
+    /// bucket `bucket`.
+    pub fn bucketViewInBucket(self: *const BucketReadView, bucket: []const u8) !BucketReadView {
+        const bucket_path = [_][]const u8{bucket};
+        return self.bucketViewInBucketPath(bucket_path[0..]);
+    }
+
+    /// Returns a further bucket-scoped borrowed view rooted at the descendant
+    /// bucket `bucket_path`.
+    pub fn bucketViewInBucketPath(self: *const BucketReadView, bucket_path: []const []const u8) !BucketReadView {
+        return .{
+            .read_view = try self.read_view.scopedToBucketPath(bucket_path),
+        };
+    }
+};
+
 pub const ReadTx = struct {
     db: ?*db_mod.DB,
     snapshot: tree.ReadSnapshot,
@@ -147,6 +268,21 @@ pub const ReadTx = struct {
         return self.readView().scanInBucketPathAlloc(allocator, bucket_path, bounds);
     }
 
+    /// Returns a borrowed bucket-scoped view pinned to this snapshot.
+    pub fn bucketViewInBucket(self: *const ReadTx, bucket: []const u8) !BucketReadView {
+        const bucket_path = [_][]const u8{bucket};
+        return self.bucketViewInBucketPath(bucket_path[0..]);
+    }
+
+    /// Returns a borrowed bucket-scoped view pinned to the descendant bucket
+    /// at `bucket_path`.
+    pub fn bucketViewInBucketPath(self: *const ReadTx, bucket_path: []const []const u8) !BucketReadView {
+        std.debug.assert(self.db != null);
+        return .{
+            .read_view = try self.readView().scopedToBucketPath(bucket_path),
+        };
+    }
+
     fn readView(self: *const ReadTx) TxReadView {
         std.debug.assert(self.db != null);
         return .{
@@ -154,6 +290,246 @@ pub const ReadTx = struct {
             .temp_allocator = self.db.?.allocator,
             .cursor_owner = cursorOwnerForReadTx(self),
             .root_page_id = self.snapshot.root_page_id,
+        };
+    }
+};
+
+pub const ManagedBucketView = struct {
+    allocator: std.mem.Allocator,
+    read_tx: ?*ReadTx,
+    bucket_view: BucketReadView,
+
+    /// Opens a stable bucket-scoped snapshot that owns the underlying read
+    /// transaction.
+    pub fn initInBucket(db: *db_mod.DB, bucket: []const u8) !ManagedBucketView {
+        const bucket_path = [_][]const u8{bucket};
+        return initInBucketPath(db, bucket_path[0..]);
+    }
+
+    /// Opens a stable bucket-scoped snapshot rooted at the descendant bucket
+    /// `bucket_path`.
+    pub fn initInBucketPath(db: *db_mod.DB, bucket_path: []const []const u8) !ManagedBucketView {
+        const owned_read_tx = try initOwnedReadTx(db);
+        errdefer destroyOwnedReadTx(db.allocator, owned_read_tx);
+
+        return .{
+            .allocator = db.allocator,
+            .read_tx = owned_read_tx,
+            .bucket_view = try owned_read_tx.bucketViewInBucketPath(bucket_path),
+        };
+    }
+
+    pub fn get(self: *const ManagedBucketView, allocator: std.mem.Allocator, key: []const u8) !?[]u8 {
+        std.debug.assert(self.read_tx != null);
+        return self.bucket_view.get(allocator, key);
+    }
+
+    pub fn getInBucket(self: *const ManagedBucketView, allocator: std.mem.Allocator, bucket: []const u8, key: []const u8) !?[]u8 {
+        std.debug.assert(self.read_tx != null);
+        return self.bucket_view.getInBucket(allocator, bucket, key);
+    }
+
+    pub fn getInBucketPath(
+        self: *const ManagedBucketView,
+        allocator: std.mem.Allocator,
+        bucket_path: []const []const u8,
+        key: []const u8,
+    ) !?[]u8 {
+        std.debug.assert(self.read_tx != null);
+        return self.bucket_view.getInBucketPath(allocator, bucket_path, key);
+    }
+
+    pub fn bucketExists(self: *const ManagedBucketView, allocator: std.mem.Allocator, bucket: []const u8) !bool {
+        std.debug.assert(self.read_tx != null);
+        return self.bucket_view.bucketExists(allocator, bucket);
+    }
+
+    pub fn bucketExistsInBucketPath(
+        self: *const ManagedBucketView,
+        allocator: std.mem.Allocator,
+        parent_bucket_path: []const []const u8,
+        bucket: []const u8,
+    ) !bool {
+        std.debug.assert(self.read_tx != null);
+        return self.bucket_view.bucketExistsInBucketPath(allocator, parent_bucket_path, bucket);
+    }
+
+    pub fn bucketNamesAlloc(self: *const ManagedBucketView, allocator: std.mem.Allocator) !namespace.BucketNames {
+        std.debug.assert(self.read_tx != null);
+        return self.bucket_view.bucketNamesAlloc(allocator);
+    }
+
+    pub fn bucketNamesInBucketPathAlloc(
+        self: *const ManagedBucketView,
+        allocator: std.mem.Allocator,
+        parent_bucket_path: []const []const u8,
+    ) !namespace.BucketNames {
+        std.debug.assert(self.read_tx != null);
+        return self.bucket_view.bucketNamesInBucketPathAlloc(allocator, parent_bucket_path);
+    }
+
+    pub fn scanAlloc(self: *const ManagedBucketView, allocator: std.mem.Allocator, bounds: ScanBounds) !ScanRecords {
+        std.debug.assert(self.read_tx != null);
+        return self.bucket_view.scanAlloc(allocator, bounds);
+    }
+
+    pub fn cursor(self: *const ManagedBucketView) tree.Cursor {
+        std.debug.assert(self.read_tx != null);
+        return self.bucket_view.cursor();
+    }
+
+    pub fn cursorInBucket(self: *const ManagedBucketView, bucket: []const u8) !tree.Cursor {
+        std.debug.assert(self.read_tx != null);
+        return self.bucket_view.cursorInBucket(bucket);
+    }
+
+    pub fn cursorInBucketPath(self: *const ManagedBucketView, bucket_path: []const []const u8) !tree.Cursor {
+        std.debug.assert(self.read_tx != null);
+        return self.bucket_view.cursorInBucketPath(bucket_path);
+    }
+
+    pub fn scanInBucketAlloc(self: *const ManagedBucketView, allocator: std.mem.Allocator, bucket: []const u8, bounds: ScanBounds) !ScanRecords {
+        std.debug.assert(self.read_tx != null);
+        return self.bucket_view.scanInBucketAlloc(allocator, bucket, bounds);
+    }
+
+    pub fn scanInBucketPathAlloc(
+        self: *const ManagedBucketView,
+        allocator: std.mem.Allocator,
+        bucket_path: []const []const u8,
+        bounds: ScanBounds,
+    ) !ScanRecords {
+        std.debug.assert(self.read_tx != null);
+        return self.bucket_view.scanInBucketPathAlloc(allocator, bucket_path, bounds);
+    }
+
+    /// Returns a borrowed descendant bucket-scoped view rooted at the direct
+    /// child bucket `bucket`.
+    pub fn bucketViewInBucket(self: *const ManagedBucketView, bucket: []const u8) !BucketReadView {
+        std.debug.assert(self.read_tx != null);
+        return self.bucket_view.bucketViewInBucket(bucket);
+    }
+
+    /// Returns a borrowed descendant bucket-scoped view rooted at
+    /// `bucket_path`.
+    pub fn bucketViewInBucketPath(self: *const ManagedBucketView, bucket_path: []const []const u8) !BucketReadView {
+        std.debug.assert(self.read_tx != null);
+        return self.bucket_view.bucketViewInBucketPath(bucket_path);
+    }
+
+    /// Releases the owned read transaction snapshot.
+    pub fn deinit(self: *ManagedBucketView) void {
+        const owned_read_tx = self.read_tx orelse return;
+        self.read_tx = null;
+        destroyOwnedReadTx(self.allocator, owned_read_tx);
+    }
+};
+
+/// Write-transaction bucket-scoped read helper.
+///
+/// This view keeps a back-reference to the owning WriteTx so every operation
+/// still enforces the usual staged-read lifetime and closed-transaction checks.
+pub const WriteBucketView = struct {
+    write_tx: *const WriteTx,
+    bucket_view: BucketReadView,
+
+    pub fn get(self: *const WriteBucketView, allocator: std.mem.Allocator, key: []const u8) !?[]u8 {
+        try self.write_tx.ensureActive();
+        return self.bucket_view.get(allocator, key);
+    }
+
+    pub fn getInBucket(self: *const WriteBucketView, allocator: std.mem.Allocator, bucket: []const u8, key: []const u8) !?[]u8 {
+        try self.write_tx.ensureActive();
+        return self.bucket_view.getInBucket(allocator, bucket, key);
+    }
+
+    pub fn getInBucketPath(
+        self: *const WriteBucketView,
+        allocator: std.mem.Allocator,
+        bucket_path: []const []const u8,
+        key: []const u8,
+    ) !?[]u8 {
+        try self.write_tx.ensureActive();
+        return self.bucket_view.getInBucketPath(allocator, bucket_path, key);
+    }
+
+    pub fn bucketExists(self: *const WriteBucketView, allocator: std.mem.Allocator, bucket: []const u8) !bool {
+        try self.write_tx.ensureActive();
+        return self.bucket_view.bucketExists(allocator, bucket);
+    }
+
+    pub fn bucketExistsInBucketPath(
+        self: *const WriteBucketView,
+        allocator: std.mem.Allocator,
+        parent_bucket_path: []const []const u8,
+        bucket: []const u8,
+    ) !bool {
+        try self.write_tx.ensureActive();
+        return self.bucket_view.bucketExistsInBucketPath(allocator, parent_bucket_path, bucket);
+    }
+
+    pub fn bucketNamesAlloc(self: *const WriteBucketView, allocator: std.mem.Allocator) !namespace.BucketNames {
+        try self.write_tx.ensureActive();
+        return self.bucket_view.bucketNamesAlloc(allocator);
+    }
+
+    pub fn bucketNamesInBucketPathAlloc(
+        self: *const WriteBucketView,
+        allocator: std.mem.Allocator,
+        parent_bucket_path: []const []const u8,
+    ) !namespace.BucketNames {
+        try self.write_tx.ensureActive();
+        return self.bucket_view.bucketNamesInBucketPathAlloc(allocator, parent_bucket_path);
+    }
+
+    pub fn scanAlloc(self: *const WriteBucketView, allocator: std.mem.Allocator, bounds: ScanBounds) !ScanRecords {
+        try self.write_tx.ensureActive();
+        return self.bucket_view.scanAlloc(allocator, bounds);
+    }
+
+    pub fn cursor(self: *const WriteBucketView) !tree.Cursor {
+        try self.write_tx.ensureActive();
+        return self.bucket_view.cursor();
+    }
+
+    pub fn cursorInBucket(self: *const WriteBucketView, bucket: []const u8) !tree.Cursor {
+        try self.write_tx.ensureActive();
+        return self.bucket_view.cursorInBucket(bucket);
+    }
+
+    pub fn cursorInBucketPath(self: *const WriteBucketView, bucket_path: []const []const u8) !tree.Cursor {
+        try self.write_tx.ensureActive();
+        return self.bucket_view.cursorInBucketPath(bucket_path);
+    }
+
+    pub fn scanInBucketAlloc(self: *const WriteBucketView, allocator: std.mem.Allocator, bucket: []const u8, bounds: ScanBounds) !ScanRecords {
+        try self.write_tx.ensureActive();
+        return self.bucket_view.scanInBucketAlloc(allocator, bucket, bounds);
+    }
+
+    pub fn scanInBucketPathAlloc(
+        self: *const WriteBucketView,
+        allocator: std.mem.Allocator,
+        bucket_path: []const []const u8,
+        bounds: ScanBounds,
+    ) !ScanRecords {
+        try self.write_tx.ensureActive();
+        return self.bucket_view.scanInBucketPathAlloc(allocator, bucket_path, bounds);
+    }
+
+    pub fn bucketViewInBucket(self: *const WriteBucketView, bucket: []const u8) !WriteBucketView {
+        try self.write_tx.ensureActive();
+        return .{
+            .write_tx = self.write_tx,
+            .bucket_view = try self.bucket_view.bucketViewInBucket(bucket),
+        };
+    }
+
+    pub fn bucketViewInBucketPath(self: *const WriteBucketView, bucket_path: []const []const u8) !WriteBucketView {
+        try self.write_tx.ensureActive();
+        return .{
+            .write_tx = self.write_tx,
+            .bucket_view = try self.bucket_view.bucketViewInBucketPath(bucket_path),
         };
     }
 };
@@ -270,6 +646,20 @@ pub const ManagedReadView = struct {
     ) !ScanRecords {
         std.debug.assert(self.read_tx != null);
         return self.read_tx.?.scanInBucketPathAlloc(allocator, bucket_path, bounds);
+    }
+
+    /// Returns a borrowed bucket-scoped view rooted at the direct child bucket
+    /// `bucket`.
+    pub fn bucketViewInBucket(self: *const ManagedReadView, bucket: []const u8) !BucketReadView {
+        std.debug.assert(self.read_tx != null);
+        return self.read_tx.?.bucketViewInBucket(bucket);
+    }
+
+    /// Returns a borrowed bucket-scoped view rooted at the descendant bucket
+    /// `bucket_path`.
+    pub fn bucketViewInBucketPath(self: *const ManagedReadView, bucket_path: []const []const u8) !BucketReadView {
+        std.debug.assert(self.read_tx != null);
+        return self.read_tx.?.bucketViewInBucketPath(bucket_path);
     }
 
     /// Releases the owned read transaction snapshot.
@@ -523,6 +913,25 @@ pub const WriteTx = struct {
     ) !ScanRecords {
         try self.ensureActive();
         return self.readView().scanInBucketPathAlloc(allocator, bucket_path, bounds);
+    }
+
+    /// Returns a borrowed bucket-scoped view rooted at the direct child bucket
+    /// `bucket`, including staged writes.
+    pub fn bucketViewInBucket(self: *const WriteTx, bucket: []const u8) !WriteBucketView {
+        const bucket_path = [_][]const u8{bucket};
+        return self.bucketViewInBucketPath(bucket_path[0..]);
+    }
+
+    /// Returns a borrowed bucket-scoped view rooted at the descendant bucket
+    /// `bucket_path`, including staged writes.
+    pub fn bucketViewInBucketPath(self: *const WriteTx, bucket_path: []const []const u8) !WriteBucketView {
+        try self.ensureActive();
+        return .{
+            .write_tx = self,
+            .bucket_view = .{
+                .read_view = try self.readView().scopedToBucketPath(bucket_path),
+            },
+        };
     }
 
     pub fn put(self: *WriteTx, key: []const u8, value: []const u8) !void {
@@ -947,6 +1356,15 @@ const TxReadView = struct {
 
     fn resolveBucketPathRootPageId(self: TxReadView, allocator: std.mem.Allocator, bucket_path: []const []const u8) !u64 {
         return resolveBucketPathPageReaderRootPageId(self.page_reader, allocator, self.root_page_id, bucket_path);
+    }
+
+    fn scopedToBucketPath(self: TxReadView, bucket_path: []const []const u8) !TxReadView {
+        return .{
+            .page_reader = self.page_reader,
+            .temp_allocator = self.temp_allocator,
+            .cursor_owner = self.cursor_owner,
+            .root_page_id = try self.resolveBucketPathRootPageId(self.temp_allocator, bucket_path),
+        };
     }
 
     fn cursorAtRoot(self: TxReadView, root_page_id: u64) tree.Cursor {
@@ -1445,6 +1863,81 @@ test "write transaction staged read view reflects namespace scan and cursor stat
     try expectScanRecord(first, "crow", "three");
 }
 
+test "read transaction bucket view keeps bucket scope and snapshot stability" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const db = try openTempDb(tmp, "bucket-read-view.db");
+    defer db.close();
+
+    try db.createBucket("animals");
+    try db.putInBucket("animals", "ant", "one");
+    try db.createBucketInBucketPath(&[_][]const u8{"animals"}, "birds");
+    try db.putInBucketPath(&[_][]const u8{ "animals", "birds" }, "crow", "three");
+
+    var read_tx = try db.beginRead();
+    defer read_tx.deinit();
+
+    var animals = try read_tx.bucketViewInBucket("animals");
+    var birds = try animals.bucketViewInBucket("birds");
+
+    try db.putInBucket("animals", "bat", "two");
+    try db.putInBucketPath(&[_][]const u8{ "animals", "birds" }, "crow", "updated");
+
+    const ant = (try animals.get(std.testing.allocator, "ant")).?;
+    defer std.testing.allocator.free(ant);
+    try std.testing.expectEqualSlices(u8, "one", ant);
+
+    try std.testing.expect(try animals.bucketExists(std.testing.allocator, "birds"));
+    var bucket_names = try animals.bucketNamesAlloc(std.testing.allocator);
+    defer bucket_names.deinit(std.testing.allocator);
+    try expectBucketNames(bucket_names, &[_][]const u8{"birds"});
+
+    var scan = try animals.scanAlloc(std.testing.allocator, .{});
+    defer scan.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 2), scan.items.len);
+    try expectScanRecord(scan.items[0], "ant", "one");
+    try std.testing.expectEqualStrings("birds", scan.items[1].key);
+    try std.testing.expect(namespace.isBucketFlags(scan.items[1].flags));
+
+    const crow = (try birds.get(std.testing.allocator, "crow")).?;
+    defer std.testing.allocator.free(crow);
+    try std.testing.expectEqualSlices(u8, "three", crow);
+}
+
+test "write transaction bucket view reads staged nested state" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const db = try openTempDb(tmp, "write-bucket-view.db");
+    defer db.close();
+
+    var write_tx = try db.beginWrite();
+    defer write_tx.deinit();
+
+    try write_tx.createBucket("animals");
+    try write_tx.putInBucket("animals", "ant", "one");
+    try write_tx.createBucketInBucketPath(&[_][]const u8{"animals"}, "birds");
+    try write_tx.putInBucketPath(&[_][]const u8{ "animals", "birds" }, "crow", "three");
+
+    var animals = try write_tx.bucketViewInBucket("animals");
+    var birds = try animals.bucketViewInBucket("birds");
+
+    const ant = (try animals.get(std.testing.allocator, "ant")).?;
+    defer std.testing.allocator.free(ant);
+    try std.testing.expectEqualSlices(u8, "one", ant);
+
+    try std.testing.expect(try animals.bucketExists(std.testing.allocator, "birds"));
+    var bucket_names = try animals.bucketNamesAlloc(std.testing.allocator);
+    defer bucket_names.deinit(std.testing.allocator);
+    try expectBucketNames(bucket_names, &[_][]const u8{"birds"});
+
+    var scan = try birds.scanAlloc(std.testing.allocator, .{});
+    defer scan.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 1), scan.items.len);
+    try expectScanRecord(scan.items[0], "crow", "three");
+}
+
 test "write transaction read helpers reject access after rollback" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -1454,10 +1947,13 @@ test "write transaction read helpers reject access after rollback" {
 
     var write_tx = try db.beginWrite();
     try write_tx.createBucket("animals");
+    var bucket_view = try write_tx.bucketViewInBucket("animals");
     try write_tx.rollback();
 
     try std.testing.expectError(WriteTxError.WriteTransactionClosed, write_tx.get(std.testing.allocator, "animals"));
     try std.testing.expectError(WriteTxError.WriteTransactionClosed, write_tx.bucketNamesAlloc(std.testing.allocator));
     try std.testing.expectError(WriteTxError.WriteTransactionClosed, write_tx.scanAlloc(std.testing.allocator, .{}));
     try std.testing.expectError(WriteTxError.WriteTransactionClosed, write_tx.cursor());
+    try std.testing.expectError(WriteTxError.WriteTransactionClosed, write_tx.bucketViewInBucket("animals"));
+    try std.testing.expectError(WriteTxError.WriteTransactionClosed, bucket_view.get(std.testing.allocator, "animals"));
 }

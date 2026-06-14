@@ -16,7 +16,7 @@ Current capabilities include:
 - bucket-scoped `put` / `delete`, including nested bucket paths
 - read cursor traversal, including nested bucket-scoped cursor traversal
 - range scan APIs at root or within bucket scopes
-- managed DB-owned read views for stable multi-call snapshot reads without manual `ReadTx` lifecycle handling
+- managed DB-owned read views, including bucket-scoped stable snapshots, for multi-call reads without manual `ReadTx` lifecycle handling
 - managed DB-owned read cursors for snapshot traversal without manual `ReadTx` lifecycle handling
 - persisted delayed reclaim through allocator state pages
 - explicit `compact()` file rewriting with state reload
