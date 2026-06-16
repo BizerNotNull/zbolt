@@ -113,6 +113,9 @@ fn checksum(page: []const u8) u32 {
     const checksum_end = checksum_offset + @sizeOf(u32);
     const zero_checksum = std.mem.toBytes(@as(u32, 0));
 
+    std.debug.assert(page.len >= encoded_size);
+    std.debug.assert(checksum_end <= encoded_size);
+
     // The on-disk meta format computes CRC over the fixed header while
     // treating the checksum field itself as zero.
     crc.update(page[0..checksum_offset]);
