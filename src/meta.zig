@@ -109,11 +109,16 @@ fn validateMagicAndVersion(page: []const u8) Error!void {
 }
 
 fn checksum(page: []const u8) u32 {
-    var scratch: [encoded_size]u8 = undefined;
-    // TODO: triple crc.update may be better
-    std.mem.copyForwards(u8, scratch[0..], page[0..encoded_size]);
-    @memset(scratch[checksum_offset .. checksum_offset + @sizeOf(u32)], 0);
-    return std.hash.Crc32.hash(scratch[0..]);
+    var crc = std.hash.Crc32.init();
+    const checksum_end = checksum_offset + @sizeOf(u32);
+    const zero_checksum = std.mem.toBytes(@as(u32, 0));
+
+    // The on-disk meta format computes CRC over the fixed header while
+    // treating the checksum field itself as zero.
+    crc.update(page[0..checksum_offset]);
+    crc.update(zero_checksum[0..]);
+    crc.update(page[checksum_end..encoded_size]);
+    return crc.final();
 }
 
 // little endian
@@ -165,6 +170,45 @@ test "verifyChecksum accepts a valid meta page" {
     defer std.testing.allocator.free(page);
 
     try verifyChecksum(page);
+}
+
+test "checksum ignores page bytes beyond the encoded meta header" {
+    const meta = Meta{
+        .page_size = 4096,
+        .flags = 9,
+        .root_page_id = 2,
+        .allocator_root = 3,
+        .high_water_mark = 5,
+        .txid = 11,
+    };
+
+    const page = try encode(std.testing.allocator, meta);
+    defer std.testing.allocator.free(page);
+
+    const expected = readInt(u32, page, checksum_offset);
+    page[encoded_size] ^= 0x5A;
+    page[page.len - 1] ^= 0xA5;
+
+    try std.testing.expectEqual(expected, checksum(page));
+    try verifyChecksum(page);
+}
+
+test "verifyChecksum rejects a modified checksum field" {
+    const meta = Meta{
+        .page_size = 4096,
+        .flags = 1,
+        .root_page_id = 2,
+        .allocator_root = 2,
+        .high_water_mark = 2,
+        .txid = 1,
+    };
+
+    const page = try encode(std.testing.allocator, meta);
+    defer std.testing.allocator.free(page);
+
+    page[checksum_offset] ^= 0x01;
+
+    try std.testing.expectError(error.InvalidChecksum, verifyChecksum(page));
 }
 
 test "decode rejects page with modified payload and stale checksum" {
