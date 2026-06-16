@@ -6,6 +6,7 @@ pub const version: u32 = 1;
 pub const encoded_size: usize = 52;
 
 const checksum_offset = 48;
+const zero_checksum_bytes = std.mem.toBytes(@as(u32, 0));
 
 pub const Meta = struct {
     page_size: u32,
@@ -111,7 +112,6 @@ fn validateMagicAndVersion(page: []const u8) Error!void {
 fn checksum(page: []const u8) u32 {
     var crc = std.hash.Crc32.init();
     const checksum_end = checksum_offset + @sizeOf(u32);
-    const zero_checksum = std.mem.toBytes(@as(u32, 0));
 
     std.debug.assert(page.len >= encoded_size);
     std.debug.assert(checksum_end <= encoded_size);
@@ -119,7 +119,7 @@ fn checksum(page: []const u8) u32 {
     // The on-disk meta format computes CRC over the fixed header while
     // treating the checksum field itself as zero.
     crc.update(page[0..checksum_offset]);
-    crc.update(zero_checksum[0..]);
+    crc.update(zero_checksum_bytes[0..]);
     crc.update(page[checksum_end..encoded_size]);
     return crc.final();
 }
@@ -187,6 +187,8 @@ test "checksum ignores page bytes beyond the encoded meta header" {
 
     const page = try encode(std.testing.allocator, meta);
     defer std.testing.allocator.free(page);
+
+    try std.testing.expect(page.len > encoded_size);
 
     const expected = readInt(u32, page, checksum_offset);
     page[encoded_size] ^= 0x5A;
