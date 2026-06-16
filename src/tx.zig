@@ -430,17 +430,15 @@ pub const ManagedBucketView = struct {
 /// This view keeps a back-reference to the owning WriteTx so every operation
 /// still enforces the usual staged-read lifetime and closed-transaction checks.
 pub const WriteBucketView = struct {
-    write_tx: *const WriteTx,
-    bucket_view: BucketReadView,
+    write_tx: *WriteTx,
+    bucket_path: []const []const u8,
 
     pub fn get(self: *const WriteBucketView, allocator: std.mem.Allocator, key: []const u8) !?[]u8 {
-        try self.write_tx.ensureActive();
-        return self.bucket_view.get(allocator, key);
+        return (try self.currentBucketReadView()).get(allocator, key);
     }
 
     pub fn getInBucket(self: *const WriteBucketView, allocator: std.mem.Allocator, bucket: []const u8, key: []const u8) !?[]u8 {
-        try self.write_tx.ensureActive();
-        return self.bucket_view.getInBucket(allocator, bucket, key);
+        return (try self.currentBucketReadView()).getInBucket(allocator, bucket, key);
     }
 
     pub fn getInBucketPath(
@@ -449,13 +447,11 @@ pub const WriteBucketView = struct {
         bucket_path: []const []const u8,
         key: []const u8,
     ) !?[]u8 {
-        try self.write_tx.ensureActive();
-        return self.bucket_view.getInBucketPath(allocator, bucket_path, key);
+        return (try self.currentBucketReadView()).getInBucketPath(allocator, bucket_path, key);
     }
 
     pub fn bucketExists(self: *const WriteBucketView, allocator: std.mem.Allocator, bucket: []const u8) !bool {
-        try self.write_tx.ensureActive();
-        return self.bucket_view.bucketExists(allocator, bucket);
+        return (try self.currentBucketReadView()).bucketExists(allocator, bucket);
     }
 
     pub fn bucketExistsInBucketPath(
@@ -464,13 +460,11 @@ pub const WriteBucketView = struct {
         parent_bucket_path: []const []const u8,
         bucket: []const u8,
     ) !bool {
-        try self.write_tx.ensureActive();
-        return self.bucket_view.bucketExistsInBucketPath(allocator, parent_bucket_path, bucket);
+        return (try self.currentBucketReadView()).bucketExistsInBucketPath(allocator, parent_bucket_path, bucket);
     }
 
     pub fn bucketNamesAlloc(self: *const WriteBucketView, allocator: std.mem.Allocator) !namespace.BucketNames {
-        try self.write_tx.ensureActive();
-        return self.bucket_view.bucketNamesAlloc(allocator);
+        return (try self.currentBucketReadView()).bucketNamesAlloc(allocator);
     }
 
     pub fn bucketNamesInBucketPathAlloc(
@@ -478,33 +472,27 @@ pub const WriteBucketView = struct {
         allocator: std.mem.Allocator,
         parent_bucket_path: []const []const u8,
     ) !namespace.BucketNames {
-        try self.write_tx.ensureActive();
-        return self.bucket_view.bucketNamesInBucketPathAlloc(allocator, parent_bucket_path);
+        return (try self.currentBucketReadView()).bucketNamesInBucketPathAlloc(allocator, parent_bucket_path);
     }
 
     pub fn scanAlloc(self: *const WriteBucketView, allocator: std.mem.Allocator, bounds: ScanBounds) !ScanRecords {
-        try self.write_tx.ensureActive();
-        return self.bucket_view.scanAlloc(allocator, bounds);
+        return (try self.currentBucketReadView()).scanAlloc(allocator, bounds);
     }
 
     pub fn cursor(self: *const WriteBucketView) !tree.Cursor {
-        try self.write_tx.ensureActive();
-        return self.bucket_view.cursor();
+        return (try self.currentBucketReadView()).cursor();
     }
 
     pub fn cursorInBucket(self: *const WriteBucketView, bucket: []const u8) !tree.Cursor {
-        try self.write_tx.ensureActive();
-        return self.bucket_view.cursorInBucket(bucket);
+        return (try self.currentBucketReadView()).cursorInBucket(bucket);
     }
 
     pub fn cursorInBucketPath(self: *const WriteBucketView, bucket_path: []const []const u8) !tree.Cursor {
-        try self.write_tx.ensureActive();
-        return self.bucket_view.cursorInBucketPath(bucket_path);
+        return (try self.currentBucketReadView()).cursorInBucketPath(bucket_path);
     }
 
     pub fn scanInBucketAlloc(self: *const WriteBucketView, allocator: std.mem.Allocator, bucket: []const u8, bounds: ScanBounds) !ScanRecords {
-        try self.write_tx.ensureActive();
-        return self.bucket_view.scanInBucketAlloc(allocator, bucket, bounds);
+        return (try self.currentBucketReadView()).scanInBucketAlloc(allocator, bucket, bounds);
     }
 
     pub fn scanInBucketPathAlloc(
@@ -513,23 +501,104 @@ pub const WriteBucketView = struct {
         bucket_path: []const []const u8,
         bounds: ScanBounds,
     ) !ScanRecords {
-        try self.write_tx.ensureActive();
-        return self.bucket_view.scanInBucketPathAlloc(allocator, bucket_path, bounds);
+        return (try self.currentBucketReadView()).scanInBucketPathAlloc(allocator, bucket_path, bounds);
     }
 
     pub fn bucketViewInBucket(self: *const WriteBucketView, bucket: []const u8) !WriteBucketView {
         try self.write_tx.ensureActive();
+        _ = try (try self.currentBucketReadView()).bucketViewInBucket(bucket);
         return .{
             .write_tx = self.write_tx,
-            .bucket_view = try self.bucket_view.bucketViewInBucket(bucket),
+            .bucket_path = try self.write_tx.extendScopedBucketPath(self.bucket_path, &[_][]const u8{bucket}),
         };
     }
 
     pub fn bucketViewInBucketPath(self: *const WriteBucketView, bucket_path: []const []const u8) !WriteBucketView {
         try self.write_tx.ensureActive();
+        _ = try (try self.currentBucketReadView()).bucketViewInBucketPath(bucket_path);
         return .{
             .write_tx = self.write_tx,
-            .bucket_view = try self.bucket_view.bucketViewInBucketPath(bucket_path),
+            .bucket_path = try self.write_tx.extendScopedBucketPath(self.bucket_path, bucket_path),
+        };
+    }
+
+    pub fn put(self: *const WriteBucketView, key: []const u8, value: []const u8) !void {
+        try self.write_tx.ensureActive();
+        return self.write_tx.putInBucketPath(self.bucket_path, key, value);
+    }
+
+    pub fn delete(self: *const WriteBucketView, key: []const u8) !void {
+        try self.write_tx.ensureActive();
+        return self.write_tx.deleteInBucketPath(self.bucket_path, key);
+    }
+
+    pub fn createBucket(self: *const WriteBucketView, bucket: []const u8) !void {
+        try self.write_tx.ensureActive();
+        return self.write_tx.createBucketInBucketPath(self.bucket_path, bucket);
+    }
+
+    pub fn createBucketInBucket(self: *const WriteBucketView, parent_bucket: []const u8, bucket: []const u8) !void {
+        return self.createBucketInBucketPath(&[_][]const u8{parent_bucket}, bucket);
+    }
+
+    pub fn createBucketInBucketPath(
+        self: *const WriteBucketView,
+        parent_bucket_path: []const []const u8,
+        bucket: []const u8,
+    ) !void {
+        try self.write_tx.ensureActive();
+        const scoped_parent_bucket_path = try self.write_tx.extendScopedBucketPath(self.bucket_path, parent_bucket_path);
+        return self.write_tx.createBucketInBucketPath(scoped_parent_bucket_path, bucket);
+    }
+
+    pub fn deleteBucket(self: *const WriteBucketView, bucket: []const u8) !void {
+        try self.write_tx.ensureActive();
+        return self.write_tx.deleteBucketInBucketPath(self.bucket_path, bucket);
+    }
+
+    pub fn deleteBucketInBucket(self: *const WriteBucketView, parent_bucket: []const u8, bucket: []const u8) !void {
+        return self.deleteBucketInBucketPath(&[_][]const u8{parent_bucket}, bucket);
+    }
+
+    pub fn deleteBucketInBucketPath(
+        self: *const WriteBucketView,
+        parent_bucket_path: []const []const u8,
+        bucket: []const u8,
+    ) !void {
+        try self.write_tx.ensureActive();
+        const scoped_parent_bucket_path = try self.write_tx.extendScopedBucketPath(self.bucket_path, parent_bucket_path);
+        return self.write_tx.deleteBucketInBucketPath(scoped_parent_bucket_path, bucket);
+    }
+
+    pub fn putInBucket(self: *const WriteBucketView, bucket: []const u8, key: []const u8, value: []const u8) !void {
+        return self.putInBucketPath(&[_][]const u8{bucket}, key, value);
+    }
+
+    pub fn putInBucketPath(
+        self: *const WriteBucketView,
+        bucket_path: []const []const u8,
+        key: []const u8,
+        value: []const u8,
+    ) !void {
+        try self.write_tx.ensureActive();
+        const scoped_bucket_path = try self.write_tx.extendScopedBucketPath(self.bucket_path, bucket_path);
+        return self.write_tx.putInBucketPath(scoped_bucket_path, key, value);
+    }
+
+    pub fn deleteInBucket(self: *const WriteBucketView, bucket: []const u8, key: []const u8) !void {
+        return self.deleteInBucketPath(&[_][]const u8{bucket}, key);
+    }
+
+    pub fn deleteInBucketPath(self: *const WriteBucketView, bucket_path: []const []const u8, key: []const u8) !void {
+        try self.write_tx.ensureActive();
+        const scoped_bucket_path = try self.write_tx.extendScopedBucketPath(self.bucket_path, bucket_path);
+        return self.write_tx.deleteInBucketPath(scoped_bucket_path, key);
+    }
+
+    fn currentBucketReadView(self: *const WriteBucketView) !BucketReadView {
+        try self.write_tx.ensureActive();
+        return .{
+            .read_view = try self.write_tx.readView().scopedToBucketPath(self.bucket_path),
         };
     }
 };
@@ -917,20 +986,19 @@ pub const WriteTx = struct {
 
     /// Returns a borrowed bucket-scoped view rooted at the direct child bucket
     /// `bucket`, including staged writes.
-    pub fn bucketViewInBucket(self: *const WriteTx, bucket: []const u8) !WriteBucketView {
+    pub fn bucketViewInBucket(self: *WriteTx, bucket: []const u8) !WriteBucketView {
         const bucket_path = [_][]const u8{bucket};
         return self.bucketViewInBucketPath(bucket_path[0..]);
     }
 
     /// Returns a borrowed bucket-scoped view rooted at the descendant bucket
     /// `bucket_path`, including staged writes.
-    pub fn bucketViewInBucketPath(self: *const WriteTx, bucket_path: []const []const u8) !WriteBucketView {
+    pub fn bucketViewInBucketPath(self: *WriteTx, bucket_path: []const []const u8) !WriteBucketView {
         try self.ensureActive();
+        _ = try self.readView().scopedToBucketPath(bucket_path);
         return .{
             .write_tx = self,
-            .bucket_view = .{
-                .read_view = try self.readView().scopedToBucketPath(bucket_path),
-            },
+            .bucket_path = try self.cloneScopedBucketPath(bucket_path),
         };
     }
 
@@ -1296,6 +1364,21 @@ pub const WriteTx = struct {
             .cursor_owner = cursorOwnerForWriteTx(self),
             .root_page_id = self.view.?.current_root_page_id,
         };
+    }
+
+    fn cloneScopedBucketPath(self: *WriteTx, bucket_path: []const []const u8) ![]const []const u8 {
+        return self.extendScopedBucketPath(&.{}, bucket_path);
+    }
+
+    fn extendScopedBucketPath(self: *WriteTx, prefix: []const []const u8, suffix: []const []const u8) ![]const []const u8 {
+        const combined = try self.arena.allocator().alloc([]const u8, prefix.len + suffix.len);
+        @memcpy(combined[0..prefix.len], prefix);
+        // New relative path segments may be borrowed from caller-owned buffers,
+        // so copy their bytes into the transaction arena before storing them.
+        for (suffix, 0..) |segment, index| {
+            combined[prefix.len + index] = try self.arena.allocator().dupe(u8, segment);
+        }
+        return combined;
     }
 };
 
@@ -1938,6 +2021,97 @@ test "write transaction bucket view reads staged nested state" {
     try expectScanRecord(scan.items[0], "crow", "three");
 }
 
+test "write transaction bucket view writes scoped keys and buckets" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const db = try openTempDb(tmp, "write-bucket-view-writes.db");
+    defer db.close();
+
+    var write_tx = try db.beginWrite();
+    defer write_tx.deinit();
+
+    try write_tx.createBucket("animals");
+    var animals = try write_tx.bucketViewInBucket("animals");
+
+    try animals.put("ant", "one");
+    try animals.createBucket("birds");
+    try animals.putInBucket("birds", "crow", "three");
+    try animals.createBucketInBucket("birds", "owls");
+    try animals.putInBucketPath(&[_][]const u8{ "birds", "owls" }, "snowy", "white");
+    try animals.delete("ant");
+
+    try std.testing.expect((try animals.get(std.testing.allocator, "ant")) == null);
+    try std.testing.expect(try animals.bucketExists(std.testing.allocator, "birds"));
+
+    var bucket_names = try animals.bucketNamesAlloc(std.testing.allocator);
+    defer bucket_names.deinit(std.testing.allocator);
+    try expectBucketNames(bucket_names, &[_][]const u8{"birds"});
+
+    var birds = try animals.bucketViewInBucket("birds");
+    const crow = (try birds.get(std.testing.allocator, "crow")).?;
+    defer std.testing.allocator.free(crow);
+    try std.testing.expectEqualSlices(u8, "three", crow);
+
+    try std.testing.expect(try birds.bucketExists(std.testing.allocator, "owls"));
+    const snowy = (try birds.getInBucket(std.testing.allocator, "owls", "snowy")).?;
+    defer std.testing.allocator.free(snowy);
+    try std.testing.expectEqualSlices(u8, "white", snowy);
+}
+
+test "nested write bucket views keep scoped paths for child writes" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const db = try openTempDb(tmp, "nested-write-bucket-view-writes.db");
+    defer db.close();
+
+    var write_tx = try db.beginWrite();
+    defer write_tx.deinit();
+
+    try write_tx.createBucket("animals");
+    var animals = try write_tx.bucketViewInBucket("animals");
+    try animals.createBucket("birds");
+
+    var birds = try animals.bucketViewInBucket("birds");
+    try birds.put("crow", "three");
+    try birds.createBucket("owls");
+
+    var owls = try birds.bucketViewInBucket("owls");
+    try owls.put("snowy", "white");
+    try owls.delete("snowy");
+    try owls.put("great-horned", "brown");
+
+    const crow = (try write_tx.getInBucketPath(std.testing.allocator, &[_][]const u8{ "animals", "birds" }, "crow")).?;
+    defer std.testing.allocator.free(crow);
+    try std.testing.expectEqualSlices(u8, "three", crow);
+
+    try std.testing.expect((try owls.get(std.testing.allocator, "snowy")) == null);
+    const great_horned = (try birds.getInBucket(std.testing.allocator, "owls", "great-horned")).?;
+    defer std.testing.allocator.free(great_horned);
+    try std.testing.expectEqualSlices(u8, "brown", great_horned);
+}
+
+test "write bucket view delete bucket reuses write transaction bucket semantics" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const db = try openTempDb(tmp, "write-bucket-view-delete-bucket.db");
+    defer db.close();
+
+    try db.createBucket("animals");
+    try db.createBucketInBucketPath(&[_][]const u8{"animals"}, "birds");
+    try db.putInBucketPath(&[_][]const u8{ "animals", "birds" }, "crow", "three");
+
+    var write_tx = try db.beginWrite();
+    defer write_tx.deinit();
+
+    var animals = try write_tx.bucketViewInBucket("animals");
+    try animals.deleteBucket("birds");
+    try std.testing.expect(!(try animals.bucketExists(std.testing.allocator, "birds")));
+    try std.testing.expectError(error.BucketNotFound, animals.deleteBucket("birds"));
+}
+
 test "write transaction read helpers reject access after rollback" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -1956,4 +2130,23 @@ test "write transaction read helpers reject access after rollback" {
     try std.testing.expectError(WriteTxError.WriteTransactionClosed, write_tx.cursor());
     try std.testing.expectError(WriteTxError.WriteTransactionClosed, write_tx.bucketViewInBucket("animals"));
     try std.testing.expectError(WriteTxError.WriteTransactionClosed, bucket_view.get(std.testing.allocator, "animals"));
+    try std.testing.expectError(WriteTxError.WriteTransactionClosed, bucket_view.put("ant", "one"));
+    try std.testing.expectError(WriteTxError.WriteTransactionClosed, bucket_view.createBucket("birds"));
+}
+
+test "write bucket view rejects access after commit" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const db = try openTempDb(tmp, "closed-write-bucket-view-after-commit.db");
+    defer db.close();
+
+    var write_tx = try db.beginWrite();
+    try write_tx.createBucket("animals");
+    var bucket_view = try write_tx.bucketViewInBucket("animals");
+    try write_tx.commit();
+
+    try std.testing.expectError(WriteTxError.WriteTransactionClosed, bucket_view.get(std.testing.allocator, "animals"));
+    try std.testing.expectError(WriteTxError.WriteTransactionClosed, bucket_view.put("ant", "one"));
+    try std.testing.expectError(WriteTxError.WriteTransactionClosed, bucket_view.deleteBucket("birds"));
 }
