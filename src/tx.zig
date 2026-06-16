@@ -434,12 +434,10 @@ pub const WriteBucketView = struct {
     bucket_path: []const []const u8,
 
     pub fn get(self: *const WriteBucketView, allocator: std.mem.Allocator, key: []const u8) !?[]u8 {
-        try self.write_tx.ensureActive();
         return (try self.currentBucketReadView()).get(allocator, key);
     }
 
     pub fn getInBucket(self: *const WriteBucketView, allocator: std.mem.Allocator, bucket: []const u8, key: []const u8) !?[]u8 {
-        try self.write_tx.ensureActive();
         return (try self.currentBucketReadView()).getInBucket(allocator, bucket, key);
     }
 
@@ -449,12 +447,10 @@ pub const WriteBucketView = struct {
         bucket_path: []const []const u8,
         key: []const u8,
     ) !?[]u8 {
-        try self.write_tx.ensureActive();
         return (try self.currentBucketReadView()).getInBucketPath(allocator, bucket_path, key);
     }
 
     pub fn bucketExists(self: *const WriteBucketView, allocator: std.mem.Allocator, bucket: []const u8) !bool {
-        try self.write_tx.ensureActive();
         return (try self.currentBucketReadView()).bucketExists(allocator, bucket);
     }
 
@@ -464,12 +460,10 @@ pub const WriteBucketView = struct {
         parent_bucket_path: []const []const u8,
         bucket: []const u8,
     ) !bool {
-        try self.write_tx.ensureActive();
         return (try self.currentBucketReadView()).bucketExistsInBucketPath(allocator, parent_bucket_path, bucket);
     }
 
     pub fn bucketNamesAlloc(self: *const WriteBucketView, allocator: std.mem.Allocator) !namespace.BucketNames {
-        try self.write_tx.ensureActive();
         return (try self.currentBucketReadView()).bucketNamesAlloc(allocator);
     }
 
@@ -478,32 +472,26 @@ pub const WriteBucketView = struct {
         allocator: std.mem.Allocator,
         parent_bucket_path: []const []const u8,
     ) !namespace.BucketNames {
-        try self.write_tx.ensureActive();
         return (try self.currentBucketReadView()).bucketNamesInBucketPathAlloc(allocator, parent_bucket_path);
     }
 
     pub fn scanAlloc(self: *const WriteBucketView, allocator: std.mem.Allocator, bounds: ScanBounds) !ScanRecords {
-        try self.write_tx.ensureActive();
         return (try self.currentBucketReadView()).scanAlloc(allocator, bounds);
     }
 
     pub fn cursor(self: *const WriteBucketView) !tree.Cursor {
-        try self.write_tx.ensureActive();
         return (try self.currentBucketReadView()).cursor();
     }
 
     pub fn cursorInBucket(self: *const WriteBucketView, bucket: []const u8) !tree.Cursor {
-        try self.write_tx.ensureActive();
         return (try self.currentBucketReadView()).cursorInBucket(bucket);
     }
 
     pub fn cursorInBucketPath(self: *const WriteBucketView, bucket_path: []const []const u8) !tree.Cursor {
-        try self.write_tx.ensureActive();
         return (try self.currentBucketReadView()).cursorInBucketPath(bucket_path);
     }
 
     pub fn scanInBucketAlloc(self: *const WriteBucketView, allocator: std.mem.Allocator, bucket: []const u8, bounds: ScanBounds) !ScanRecords {
-        try self.write_tx.ensureActive();
         return (try self.currentBucketReadView()).scanInBucketAlloc(allocator, bucket, bounds);
     }
 
@@ -513,7 +501,6 @@ pub const WriteBucketView = struct {
         bucket_path: []const []const u8,
         bounds: ScanBounds,
     ) !ScanRecords {
-        try self.write_tx.ensureActive();
         return (try self.currentBucketReadView()).scanInBucketPathAlloc(allocator, bucket_path, bounds);
     }
 
@@ -609,6 +596,7 @@ pub const WriteBucketView = struct {
     }
 
     fn currentBucketReadView(self: *const WriteBucketView) !BucketReadView {
+        try self.write_tx.ensureActive();
         return .{
             .read_view = try self.write_tx.readView().scopedToBucketPath(self.bucket_path),
         };
@@ -1385,7 +1373,11 @@ pub const WriteTx = struct {
     fn extendScopedBucketPath(self: *WriteTx, prefix: []const []const u8, suffix: []const []const u8) ![]const []const u8 {
         const combined = try self.arena.allocator().alloc([]const u8, prefix.len + suffix.len);
         @memcpy(combined[0..prefix.len], prefix);
-        @memcpy(combined[prefix.len..], suffix);
+        // New relative path segments may be borrowed from caller-owned buffers,
+        // so copy their bytes into the transaction arena before storing them.
+        for (suffix, 0..) |segment, index| {
+            combined[prefix.len + index] = try self.arena.allocator().dupe(u8, segment);
+        }
         return combined;
     }
 };
