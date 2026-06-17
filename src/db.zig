@@ -1035,17 +1035,14 @@ fn applyMetaFault(path: []const u8, slot: meta.MetaSlot, fault: RecoveryFault) !
     const page_bytes = try storage.readPageAlloc(std.testing.allocator, &file, io, page_id, default_page_size);
     defer std.testing.allocator.free(page_bytes);
 
-    var invalid_page = try std.testing.allocator.dupe(u8, page_bytes);
-    defer std.testing.allocator.free(invalid_page);
-
     switch (fault) {
         // Flip a payload byte without recomputing the checksum to model the
         // repo's existing checksum/partial-write corruption path.
-        .corrupt_meta => invalid_page[12] ^= 0xFF,
+        .corrupt_meta => page_bytes[12] ^= 0xFF,
         .none => unreachable,
     }
 
-    try storage.writePageObject(&file, io, default_page_size, page_id, invalid_page);
+    try storage.writePageObject(&file, io, default_page_size, page_id, page_bytes);
 }
 
 fn runRecoveryScenario(path: []const u8, scenario: RecoveryScenario) !void {
@@ -1070,6 +1067,15 @@ fn runRecoveryScenario(path: []const u8, scenario: RecoveryScenario) !void {
             );
         },
     }
+}
+
+fn runRecoveryScenarioInTempFile(file_name: []const u8, scenario: RecoveryScenario) !void {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path = try tempFilePath(&path_buf, tmp.dir, file_name);
+    try runRecoveryScenario(path, scenario);
 }
 
 fn expectBucketValue(db: *DB, bucket: []const u8, key: []const u8, expected: []const u8) !void {
@@ -1596,13 +1602,7 @@ test "loadNewestRecoverableSnapshot prefers meta0 when txids tie" {
 // snapshot.
 
 test "open selects meta0 when meta0 is the newest valid snapshot" {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
-    const path = try tempFilePath(&path_buf, tmp.dir, "recover-meta0-newest.db");
-
-    try runRecoveryScenario(path, .{
+    try runRecoveryScenarioInTempFile("recover-meta0-newest.db", .{
         .meta0 = .{ .txid = 9, .root_page_id = 2 },
         .meta1 = .{ .txid = 7, .root_page_id = 3 },
         .expected = .{ .selected = .{
@@ -1614,13 +1614,7 @@ test "open selects meta0 when meta0 is the newest valid snapshot" {
 }
 
 test "open selects meta1 when meta1 is the newest valid snapshot" {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
-    const path = try tempFilePath(&path_buf, tmp.dir, "recover-meta1-newest.db");
-
-    try runRecoveryScenario(path, .{
+    try runRecoveryScenarioInTempFile("recover-meta1-newest.db", .{
         .meta0 = .{ .txid = 7, .root_page_id = 2 },
         .meta1 = .{ .txid = 9, .root_page_id = 3 },
         .expected = .{ .selected = .{
@@ -1632,13 +1626,7 @@ test "open selects meta1 when meta1 is the newest valid snapshot" {
 }
 
 test "open prefers meta0 when both valid meta pages have the same txid" {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
-    const path = try tempFilePath(&path_buf, tmp.dir, "recover-tie-open-prefers-meta0.db");
-
-    try runRecoveryScenario(path, .{
+    try runRecoveryScenarioInTempFile("recover-tie-open-prefers-meta0.db", .{
         .meta0 = .{ .txid = 5, .root_page_id = 2, .flags = 11 },
         .meta1 = .{ .txid = 5, .root_page_id = 3, .flags = 22 },
         .expected = .{ .selected = .{
@@ -1650,13 +1638,7 @@ test "open prefers meta0 when both valid meta pages have the same txid" {
 }
 
 test "open falls back to meta0 when meta1 is corrupt" {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
-    const path = try tempFilePath(&path_buf, tmp.dir, "recover-meta1-corrupt.db");
-
-    try runRecoveryScenario(path, .{
+    try runRecoveryScenarioInTempFile("recover-meta1-corrupt.db", .{
         .meta0 = .{ .txid = 8, .root_page_id = 2 },
         .meta1 = .{ .txid = 9, .root_page_id = 3 },
         .meta1_fault = .corrupt_meta,
@@ -1669,13 +1651,7 @@ test "open falls back to meta0 when meta1 is corrupt" {
 }
 
 test "open falls back to meta1 when meta0 is corrupt" {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
-    const path = try tempFilePath(&path_buf, tmp.dir, "recover-meta0-corrupt.db");
-
-    try runRecoveryScenario(path, .{
+    try runRecoveryScenarioInTempFile("recover-meta0-corrupt.db", .{
         .meta0 = .{ .txid = 9, .root_page_id = 2 },
         .meta1 = .{ .txid = 8, .root_page_id = 3 },
         .meta0_fault = .corrupt_meta,
@@ -1688,13 +1664,7 @@ test "open falls back to meta1 when meta0 is corrupt" {
 }
 
 test "open falls back to stale meta0 when newer meta1 is corrupt" {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
-    const path = try tempFilePath(&path_buf, tmp.dir, "recover-stale-meta0.db");
-
-    try runRecoveryScenario(path, .{
+    try runRecoveryScenarioInTempFile("recover-stale-meta0.db", .{
         .meta0 = .{ .txid = 7, .root_page_id = 2 },
         .meta1 = .{ .txid = 9, .root_page_id = 3 },
         .meta1_fault = .corrupt_meta,
@@ -1707,13 +1677,7 @@ test "open falls back to stale meta0 when newer meta1 is corrupt" {
 }
 
 test "open falls back to stale meta1 when newer meta0 is corrupt" {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
-    const path = try tempFilePath(&path_buf, tmp.dir, "recover-stale-meta1.db");
-
-    try runRecoveryScenario(path, .{
+    try runRecoveryScenarioInTempFile("recover-stale-meta1.db", .{
         .meta0 = .{ .txid = 9, .root_page_id = 2 },
         .meta1 = .{ .txid = 7, .root_page_id = 3 },
         .meta0_fault = .corrupt_meta,
@@ -1758,13 +1722,7 @@ test "open rejects too-small non-empty file" {
 }
 
 test "open maps invalid meta recovery into centralized db error" {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
-    const path = try tempFilePath(&path_buf, tmp.dir, "bad-meta.db");
-
-    try runRecoveryScenario(path, .{
+    try runRecoveryScenarioInTempFile("bad-meta.db", .{
         .meta0 = .{ .txid = 1, .root_page_id = 2 },
         .meta1 = .{ .txid = 2, .root_page_id = 3 },
         .meta0_fault = .corrupt_meta,
