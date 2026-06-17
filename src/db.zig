@@ -984,6 +984,94 @@ fn expectDbMissing(db: *DB, key: []const u8) !void {
     try std.testing.expect(value == null);
 }
 
+const RecoveryMetaFixture = struct {
+    txid: u64,
+    root_page_id: u64,
+    allocator_root: u64 = 0,
+    flags: u32 = 0,
+
+    fn toMeta(self: RecoveryMetaFixture) meta.Meta {
+        return .{
+            .page_size = default_page_size,
+            .flags = self.flags,
+            .root_page_id = self.root_page_id,
+            .allocator_root = self.allocator_root,
+            .high_water_mark = @max(@as(u64, 2), @max(self.root_page_id, self.allocator_root)),
+            .txid = self.txid,
+        };
+    }
+};
+
+const RecoveryFault = enum {
+    none,
+    corrupt_meta,
+};
+
+const RecoveryExpectation = union(enum) {
+    selected: struct {
+        slot: meta.MetaSlot,
+        root_page_id: u64,
+        txid: u64,
+    },
+    invalid_database,
+};
+
+const RecoveryScenario = struct {
+    meta0: RecoveryMetaFixture,
+    meta1: RecoveryMetaFixture,
+    meta0_fault: RecoveryFault = .none,
+    meta1_fault: RecoveryFault = .none,
+    expected: RecoveryExpectation,
+};
+
+fn applyMetaFault(path: []const u8, slot: meta.MetaSlot, fault: RecoveryFault) !void {
+    if (fault == .none) return;
+
+    const io = std.testing.io;
+    var file = try std.Io.Dir.openFileAbsolute(io, path, .{ .mode = .read_write });
+    defer file.close(io);
+
+    const page_id = metaSlotPageId(slot);
+    const page_bytes = try storage.readPageAlloc(std.testing.allocator, &file, io, page_id, default_page_size);
+    defer std.testing.allocator.free(page_bytes);
+
+    var invalid_page = try std.testing.allocator.dupe(u8, page_bytes);
+    defer std.testing.allocator.free(invalid_page);
+
+    switch (fault) {
+        // Flip a payload byte without recomputing the checksum to model the
+        // repo's existing checksum/partial-write corruption path.
+        .corrupt_meta => invalid_page[12] ^= 0xFF,
+        .none => unreachable,
+    }
+
+    try storage.writePageObject(&file, io, default_page_size, page_id, invalid_page);
+}
+
+fn runRecoveryScenario(path: []const u8, scenario: RecoveryScenario) !void {
+    try writeSeededDatabase(path, scenario.meta0.toMeta(), scenario.meta1.toMeta());
+    try applyMetaFault(path, .meta0, scenario.meta0_fault);
+    try applyMetaFault(path, .meta1, scenario.meta1_fault);
+
+    switch (scenario.expected) {
+        .selected => |expected| {
+            const db = try open(std.testing.allocator, std.testing.io, path);
+            defer db.close();
+
+            try std.testing.expectEqual(expected.slot, db.meta_slot);
+            try std.testing.expectEqual(default_page_size, db.page_size);
+            try std.testing.expectEqual(expected.root_page_id, db.root_page_id);
+            try std.testing.expectEqual(expected.txid, db.txid);
+        },
+        .invalid_database => {
+            try std.testing.expectError(
+                errors.DbOpenError.InvalidDatabaseFile,
+                open(std.testing.allocator, std.testing.io, path),
+            );
+        },
+    }
+}
+
 fn expectBucketValue(db: *DB, bucket: []const u8, key: []const u8, expected: []const u8) !void {
     const value = (try db.getInBucket(std.testing.allocator, bucket, key)).?;
     defer std.testing.allocator.free(value);
@@ -1500,49 +1588,141 @@ test "loadNewestRecoverableSnapshot prefers meta0 when txids tie" {
     try std.testing.expectEqual(@as(u64, 5), snapshot.meta.txid);
 }
 
-test "open prefers only valid meta when the other one is invalid" {
+// These meta recovery matrix tests strengthen the reopen path coverage for
+// issue #57 and the broader recovery tracking under issue #46. "stale" means
+// a lower committed txid; the on-disk format does not have a separate
+// uncommitted-meta marker, so distinct failure paths are modeled as either an
+// invalid meta page or a valid meta page that references an unrecoverable
+// snapshot.
+
+test "open selects meta0 when meta0 is the newest valid snapshot" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
-    const path = try tempFilePath(&path_buf, tmp.dir, "recover-one-valid.db");
+    const path = try tempFilePath(&path_buf, tmp.dir, "recover-meta0-newest.db");
 
-    try writeSeededDatabase(path, .{
-        .page_size = default_page_size,
-        .flags = 0,
-        .root_page_id = 2,
-        .allocator_root = 0,
-        .high_water_mark = 2,
-        .txid = 7,
-    }, .{
-        .page_size = default_page_size,
-        .flags = 0,
-        .root_page_id = 3,
-        .allocator_root = 0,
-        .high_water_mark = 3,
-        .txid = 8,
+    try runRecoveryScenario(path, .{
+        .meta0 = .{ .txid = 9, .root_page_id = 2 },
+        .meta1 = .{ .txid = 7, .root_page_id = 3 },
+        .expected = .{ .selected = .{
+            .slot = .meta0,
+            .root_page_id = 2,
+            .txid = 9,
+        } },
     });
+}
 
-    {
-        const io = std.testing.io;
-        var file = try std.Io.Dir.openFileAbsolute(io, path, .{ .mode = .read_write });
-        defer file.close(io);
+test "open selects meta1 when meta1 is the newest valid snapshot" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
 
-        const page_bytes = try storage.readPageAlloc(std.testing.allocator, &file, io, 1, default_page_size);
-        defer std.testing.allocator.free(page_bytes);
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path = try tempFilePath(&path_buf, tmp.dir, "recover-meta1-newest.db");
 
-        var invalid_page = try std.testing.allocator.dupe(u8, page_bytes);
-        defer std.testing.allocator.free(invalid_page);
-        invalid_page[12] ^= 0xFF;
-        try storage.writePageObject(&file, io, default_page_size, 1, invalid_page);
-    }
+    try runRecoveryScenario(path, .{
+        .meta0 = .{ .txid = 7, .root_page_id = 2 },
+        .meta1 = .{ .txid = 9, .root_page_id = 3 },
+        .expected = .{ .selected = .{
+            .slot = .meta1,
+            .root_page_id = 3,
+            .txid = 9,
+        } },
+    });
+}
 
-    const db = try open(std.testing.allocator, std.testing.io, path);
-    defer db.close();
+test "open prefers meta0 when both valid meta pages have the same txid" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
 
-    try std.testing.expectEqual(default_page_size, db.page_size);
-    try std.testing.expectEqual(@as(u64, 2), db.root_page_id);
-    try std.testing.expectEqual(@as(u64, 7), db.txid);
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path = try tempFilePath(&path_buf, tmp.dir, "recover-tie-open-prefers-meta0.db");
+
+    try runRecoveryScenario(path, .{
+        .meta0 = .{ .txid = 5, .root_page_id = 2, .flags = 11 },
+        .meta1 = .{ .txid = 5, .root_page_id = 3, .flags = 22 },
+        .expected = .{ .selected = .{
+            .slot = .meta0,
+            .root_page_id = 2,
+            .txid = 5,
+        } },
+    });
+}
+
+test "open falls back to meta0 when meta1 is corrupt" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path = try tempFilePath(&path_buf, tmp.dir, "recover-meta1-corrupt.db");
+
+    try runRecoveryScenario(path, .{
+        .meta0 = .{ .txid = 8, .root_page_id = 2 },
+        .meta1 = .{ .txid = 9, .root_page_id = 3 },
+        .meta1_fault = .corrupt_meta,
+        .expected = .{ .selected = .{
+            .slot = .meta0,
+            .root_page_id = 2,
+            .txid = 8,
+        } },
+    });
+}
+
+test "open falls back to meta1 when meta0 is corrupt" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path = try tempFilePath(&path_buf, tmp.dir, "recover-meta0-corrupt.db");
+
+    try runRecoveryScenario(path, .{
+        .meta0 = .{ .txid = 9, .root_page_id = 2 },
+        .meta1 = .{ .txid = 8, .root_page_id = 3 },
+        .meta0_fault = .corrupt_meta,
+        .expected = .{ .selected = .{
+            .slot = .meta1,
+            .root_page_id = 3,
+            .txid = 8,
+        } },
+    });
+}
+
+test "open falls back to stale meta0 when newer meta1 is corrupt" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path = try tempFilePath(&path_buf, tmp.dir, "recover-stale-meta0.db");
+
+    try runRecoveryScenario(path, .{
+        .meta0 = .{ .txid = 7, .root_page_id = 2 },
+        .meta1 = .{ .txid = 9, .root_page_id = 3 },
+        .meta1_fault = .corrupt_meta,
+        .expected = .{ .selected = .{
+            .slot = .meta0,
+            .root_page_id = 2,
+            .txid = 7,
+        } },
+    });
+}
+
+test "open falls back to stale meta1 when newer meta0 is corrupt" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path = try tempFilePath(&path_buf, tmp.dir, "recover-stale-meta1.db");
+
+    try runRecoveryScenario(path, .{
+        .meta0 = .{ .txid = 9, .root_page_id = 2 },
+        .meta1 = .{ .txid = 7, .root_page_id = 3 },
+        .meta0_fault = .corrupt_meta,
+        .expected = .{ .selected = .{
+            .slot = .meta1,
+            .root_page_id = 3,
+            .txid = 7,
+        } },
+    });
 }
 
 test "open rejects existing invalid non-empty file" {
@@ -1584,40 +1764,13 @@ test "open maps invalid meta recovery into centralized db error" {
     var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const path = try tempFilePath(&path_buf, tmp.dir, "bad-meta.db");
 
-    try writeSeededDatabase(path, .{
-        .page_size = default_page_size,
-        .flags = 0,
-        .root_page_id = 2,
-        .allocator_root = 0,
-        .high_water_mark = 2,
-        .txid = 1,
-    }, .{
-        .page_size = default_page_size,
-        .flags = 0,
-        .root_page_id = 2,
-        .allocator_root = 0,
-        .high_water_mark = 2,
-        .txid = 2,
+    try runRecoveryScenario(path, .{
+        .meta0 = .{ .txid = 1, .root_page_id = 2 },
+        .meta1 = .{ .txid = 2, .root_page_id = 3 },
+        .meta0_fault = .corrupt_meta,
+        .meta1_fault = .corrupt_meta,
+        .expected = .invalid_database,
     });
-
-    {
-        const io = std.testing.io;
-        var file = try std.Io.Dir.openFileAbsolute(io, path, .{ .mode = .read_write });
-        defer file.close(io);
-
-        var meta0_page = try storage.readPageAlloc(std.testing.allocator, &file, io, 0, default_page_size);
-        defer std.testing.allocator.free(meta0_page);
-        var meta1_page = try storage.readPageAlloc(std.testing.allocator, &file, io, 1, default_page_size);
-        defer std.testing.allocator.free(meta1_page);
-
-        meta0_page[8] ^= 0xFF;
-        meta1_page[8] ^= 0xFF;
-
-        try storage.writePageObject(&file, io, default_page_size, 0, meta0_page);
-        try storage.writePageObject(&file, io, default_page_size, 1, meta1_page);
-    }
-
-    try std.testing.expectError(errors.DbOpenError.InvalidDatabaseFile, open(std.testing.allocator, std.testing.io, path));
 }
 
 test "open fails with database locked while another handle owns the exclusive lock" {
