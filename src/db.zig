@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const errors = @import("errors.zig");
 const allocator_mod = @import("allocator.zig");
 const compact_mod = @import("compact.zig");
@@ -711,10 +712,15 @@ fn restoreAllocatorSnapshotForMeta(
     io: std.Io,
     decoded_meta: meta.Meta,
 ) !RestoredAllocatorSnapshot {
+    var page_allocator = allocator_mod.PageAllocator.init(allocator, decoded_meta.high_water_mark);
+    errdefer page_allocator.deinit(allocator);
+    var reclaim_state = reclaim.State.init(allocator);
+    errdefer reclaim_state.deinit(allocator);
+
     if (decoded_meta.allocator_root == 0) {
         return .{
-            .page_allocator = allocator_mod.PageAllocator.init(allocator, decoded_meta.high_water_mark),
-            .reclaim_state = reclaim.State.init(allocator),
+            .page_allocator = page_allocator,
+            .reclaim_state = reclaim_state,
         };
     }
 
@@ -740,9 +746,15 @@ fn restoreAllocatorSnapshotForMeta(
         if (pending_record.visible_through_txid > decoded_meta.txid) return error.InvalidAllocatorState;
     }
 
+    page_allocator.deinit(allocator);
+    page_allocator = restored_state.takePageAllocator(allocator);
+
+    reclaim_state.deinit(allocator);
+    reclaim_state = try reclaim.State.initFromStateRecords(allocator, restored_state.pending_records);
+
     return .{
-        .page_allocator = restored_state.takePageAllocator(allocator),
-        .reclaim_state = try reclaim.State.initFromStateRecords(allocator, restored_state.pending_records),
+        .page_allocator = page_allocator,
+        .reclaim_state = reclaim_state,
     };
 }
 
@@ -896,56 +908,64 @@ fn writeSeededDatabase(path: []const u8, meta0: meta.Meta, meta1: meta.Meta) !vo
     try storage.writePageObject(&file, io, default_page_size, 2, root_page);
 }
 
-fn readCurrentAllocatorStatePageAlloc(db: *DB) ![]u8 {
-    return readAllocatorStatePageObjectAlloc(
-        std.testing.allocator,
-        &db.file,
-        db.io,
-        db.allocator_root,
-        db.page_size,
-        db.high_water_mark,
-    );
-}
-
-fn writeCurrentAllocatorStatePage(db: *DB, bytes: []const u8) !void {
-    try storage.writePageObject(&db.file, db.io, db.page_size, db.allocator_root, bytes);
-}
-
-fn seedHighOrderAllocatorState(db: *DB) !void {
-    db.page_allocator.high_water_mark = 2040;
-
-    var index: u64 = 0;
-    while (index < 510) : (index += 1) {
-        try db.page_allocator.release(db.allocator, 4 + index * 4, 0);
+const test_support = if (builtin.is_test) struct {
+    fn readCurrentAllocatorStatePageAlloc(db: *DB) ![]u8 {
+        return readAllocatorStatePageObjectAlloc(
+            std.testing.allocator,
+            &db.file,
+            db.io,
+            db.allocator_root,
+            db.page_size,
+            db.high_water_mark,
+        );
     }
-}
 
-fn writeUnreferencedAllocatorStatePage(db: *DB) !void {
-    var candidate = try db.page_allocator.clone(db.allocator);
-    defer candidate.deinit(db.allocator);
+    fn writeCurrentAllocatorStatePage(db: *DB, bytes: []const u8) !void {
+        try storage.writePageObject(&db.file, db.io, db.page_size, db.allocator_root, bytes);
+    }
 
-    const unreferenced_root = try candidate.allocate(db.allocator, 0);
-    const state_page = try candidate.encodeStatePageAlloc(std.testing.allocator, db.page_size, unreferenced_root, 0, &.{
-        .{ .kind = .pending, .page_id = 3, .order = 0, .visible_through_txid = db.txid },
-    });
-    defer std.testing.allocator.free(state_page);
+    fn rewritePageType(bytes: []u8, page_type: page.PageType) !void {
+        var header = try page.decodeHeader(bytes);
+        header.page_type = page_type;
+        try page.encodeHeader(bytes, header);
+    }
 
-    try storage.writePageObject(&db.file, db.io, db.page_size, unreferenced_root, state_page);
-}
+    fn seedHighOrderAllocatorState(db: *DB) !void {
+        db.page_allocator.high_water_mark = 2040;
 
-fn writeCorruptUnreferencedAllocatorStatePage(db: *DB) !void {
-    var candidate = try db.page_allocator.clone(db.allocator);
-    defer candidate.deinit(db.allocator);
+        var index: u64 = 0;
+        while (index < 510) : (index += 1) {
+            try db.page_allocator.release(db.allocator, 4 + index * 4, 0);
+        }
+    }
 
-    const unreferenced_root = try candidate.allocate(db.allocator, 0);
-    const state_page = try candidate.encodeStatePageAlloc(std.testing.allocator, db.page_size, unreferenced_root, 0, &.{
-        .{ .kind = .pending, .page_id = 3, .order = 0, .visible_through_txid = db.txid },
-    });
-    defer std.testing.allocator.free(state_page);
+    fn writeUnreferencedAllocatorStatePage(db: *DB) !void {
+        var candidate = try db.page_allocator.clone(db.allocator);
+        defer candidate.deinit(db.allocator);
 
-    state_page[8] = @intFromEnum(page.PageType.leaf);
-    try storage.writePageObject(&db.file, db.io, db.page_size, unreferenced_root, state_page);
-}
+        const unreferenced_root = try candidate.allocate(db.allocator, 0);
+        const state_page = try candidate.encodeStatePageAlloc(std.testing.allocator, db.page_size, unreferenced_root, 0, &.{
+            .{ .kind = .pending, .page_id = 3, .order = 0, .visible_through_txid = db.txid },
+        });
+        defer std.testing.allocator.free(state_page);
+
+        try storage.writePageObject(&db.file, db.io, db.page_size, unreferenced_root, state_page);
+    }
+
+    fn writeCorruptUnreferencedAllocatorStatePage(db: *DB) !void {
+        var candidate = try db.page_allocator.clone(db.allocator);
+        defer candidate.deinit(db.allocator);
+
+        const unreferenced_root = try candidate.allocate(db.allocator, 0);
+        const state_page = try candidate.encodeStatePageAlloc(std.testing.allocator, db.page_size, unreferenced_root, 0, &.{
+            .{ .kind = .pending, .page_id = 3, .order = 0, .visible_through_txid = db.txid },
+        });
+        defer std.testing.allocator.free(state_page);
+
+        try rewritePageType(state_page, .leaf);
+        try storage.writePageObject(&db.file, db.io, db.page_size, unreferenced_root, state_page);
+    }
+} else struct {};
 
 fn writeTreeDatabase(path: []const u8, root_page_id: u64, pages: []const []const u8) !void {
     const io = std.testing.io;
@@ -2812,11 +2832,11 @@ test "open restores older snapshot when newer allocator state is corrupt" {
         try db.put("old", "one");
         try db.put("new", "two");
 
-        const allocator_state = try readCurrentAllocatorStatePageAlloc(db);
+        const allocator_state = try test_support.readCurrentAllocatorStatePageAlloc(db);
         defer std.testing.allocator.free(allocator_state);
 
-        allocator_state[8] = @intFromEnum(page.PageType.leaf);
-        try writeCurrentAllocatorStatePage(db, allocator_state);
+        try test_support.rewritePageType(allocator_state, .leaf);
+        try test_support.writeCurrentAllocatorStatePage(db, allocator_state);
     }
 
     const reopened = try open(std.testing.allocator, std.testing.io, path);
@@ -2843,7 +2863,7 @@ test "open restores older snapshot when newer allocator pending txid is impossib
         try db.put("new", "two");
 
         const newest_allocator_root = db.allocator_root;
-        const allocator_state = try readCurrentAllocatorStatePageAlloc(db);
+        const allocator_state = try test_support.readCurrentAllocatorStatePageAlloc(db);
         defer std.testing.allocator.free(allocator_state);
         const header = try page.decodeHeader(allocator_state);
 
@@ -2860,7 +2880,7 @@ test "open restores older snapshot when newer allocator pending txid is impossib
             .order = 0,
             .visible_through_txid = db.txid + 1,
         }});
-        try writeCurrentAllocatorStatePage(db, invalid_state);
+        try test_support.writeCurrentAllocatorStatePage(db, invalid_state);
     }
 
     const reopened = try open(std.testing.allocator, std.testing.io, path);
@@ -2884,7 +2904,7 @@ test "open ignores allocator state page that is not referenced by meta" {
         const db = try open(std.testing.allocator, std.testing.io, path);
         defer db.close();
         try db.put("old", "one");
-        try writeUnreferencedAllocatorStatePage(db);
+        try test_support.writeUnreferencedAllocatorStatePage(db);
     }
 
     const reopened = try open(std.testing.allocator, std.testing.io, path);
@@ -2904,7 +2924,7 @@ test "open restores order greater than zero allocator state pages" {
     {
         const db = try open(std.testing.allocator, std.testing.io, path);
         defer db.close();
-        try seedHighOrderAllocatorState(db);
+        try test_support.seedHighOrderAllocatorState(db);
         try db.put("alpha", "one");
         const allocator_state = try db.readPageAlloc(std.testing.allocator, db.root_page_id);
         defer std.testing.allocator.free(allocator_state);
@@ -2940,10 +2960,10 @@ test "open restores older snapshot when newer higher-order allocator tail page i
         defer db.close();
 
         try db.put("old", "one");
-        try seedHighOrderAllocatorState(db);
+        try test_support.seedHighOrderAllocatorState(db);
         try db.put("new", "two");
 
-        const allocator_state = try readCurrentAllocatorStatePageAlloc(db);
+        const allocator_state = try test_support.readCurrentAllocatorStatePageAlloc(db);
         defer std.testing.allocator.free(allocator_state);
         const header = try page.decodeHeader(allocator_state);
         try std.testing.expect(header.order > 0);
@@ -2977,12 +2997,12 @@ test "open restores older snapshot when newer allocator header page id mismatche
         try db.put("old", "one");
         try db.put("new", "two");
 
-        const allocator_state = try readCurrentAllocatorStatePageAlloc(db);
+        const allocator_state = try test_support.readCurrentAllocatorStatePageAlloc(db);
         defer std.testing.allocator.free(allocator_state);
         var header = try page.decodeHeader(allocator_state);
         header.page_id += 1;
         try page.encodeHeader(allocator_state, header);
-        try writeCurrentAllocatorStatePage(db, allocator_state);
+        try test_support.writeCurrentAllocatorStatePage(db, allocator_state);
     }
 
     const reopened = try open(std.testing.allocator, std.testing.io, path);
@@ -3007,7 +3027,7 @@ test "open ignores corrupt allocator state page that is not referenced by meta" 
         defer db.close();
         try db.put("old", "one");
         try db.put("new", "two");
-        try writeCorruptUnreferencedAllocatorStatePage(db);
+        try test_support.writeCorruptUnreferencedAllocatorStatePage(db);
     }
 
     const reopened = try open(std.testing.allocator, std.testing.io, path);
@@ -3033,10 +3053,10 @@ test "open rejects database when both meta candidates reference corrupt allocato
         const older_allocator_root = db.allocator_root;
         try db.put("new", "two");
 
-        var newer_allocator_state = try readCurrentAllocatorStatePageAlloc(db);
+        const newer_allocator_state = try test_support.readCurrentAllocatorStatePageAlloc(db);
         defer std.testing.allocator.free(newer_allocator_state);
-        newer_allocator_state[8] = @intFromEnum(page.PageType.leaf);
-        try writeCurrentAllocatorStatePage(db, newer_allocator_state);
+        try test_support.rewritePageType(newer_allocator_state, .leaf);
+        try test_support.writeCurrentAllocatorStatePage(db, newer_allocator_state);
 
         const older_allocator_state = try readAllocatorStatePageObjectAlloc(
             std.testing.allocator,
