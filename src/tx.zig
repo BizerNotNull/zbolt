@@ -13,6 +13,7 @@ pub const WriteTxError = error{
     WriteTransactionClosed,
     WriteTransactionFailed,
     NoPendingWrite,
+    CommitFaultInjected,
 };
 
 pub const ScanBounds = struct {
@@ -1181,6 +1182,14 @@ pub const WriteTx = struct {
     }
 
     pub fn commit(self: *WriteTx) !void {
+        return self.commitImpl(null);
+    }
+
+    pub fn commitWithFault(self: *WriteTx, fault_hook: db_mod.CommitFaultHook) !void {
+        return self.commitImpl(fault_hook);
+    }
+
+    fn commitImpl(self: *WriteTx, fault_hook: ?db_mod.CommitFaultHook) !void {
         try self.ensureActive();
         if (!self.has_pending_write) return WriteTxError.NoPendingWrite;
         errdefer self.fail();
@@ -1244,14 +1253,38 @@ pub const WriteTx = struct {
         const next_meta_page = try meta.encode(self.db.allocator, next_meta);
         defer self.db.allocator.free(next_meta_page);
 
+        // Fault injection step 1: before staged data page writes
+        if (fault_hook) |hook| {
+            if (hook.shouldFail(1)) return WriteTxError.CommitFaultInjected;
+        }
         for (staged_pages) |pending_page| {
             try storage.writePageObject(&self.db.file, self.db.io, self.db.page_size, pending_page.page_id, pending_page.bytes);
         }
+
+        // Fault injection step 2: before allocator state page write
+        if (fault_hook) |hook| {
+            if (hook.shouldFail(2)) return WriteTxError.CommitFaultInjected;
+        }
         try storage.writePageObject(&self.db.file, self.db.io, self.db.page_size, allocator_state.page_id, allocator_state.bytes);
+
+        // Fault injection step 3: before first sync (data + allocator durable boundary)
+        if (fault_hook) |hook| {
+            if (hook.shouldFail(3)) return WriteTxError.CommitFaultInjected;
+        }
         try storage.sync(self.db.file, self.db.io);
 
         const next_meta_slot = inactiveMetaSlot(self.db.meta_slot);
+
+        // Fault injection step 4: before meta page write
+        if (fault_hook) |hook| {
+            if (hook.shouldFail(4)) return WriteTxError.CommitFaultInjected;
+        }
         try storage.writePageObject(&self.db.file, self.db.io, self.db.page_size, metaSlotPageId(next_meta_slot), next_meta_page);
+
+        // Fault injection step 5: before final sync (commit durable boundary)
+        if (fault_hook) |hook| {
+            if (hook.shouldFail(5)) return WriteTxError.CommitFaultInjected;
+        }
         try storage.sync(self.db.file, self.db.io);
 
         db_mod.applyCommittedState(self.db, next_meta_slot, next_meta, allocator_state.page_allocator);

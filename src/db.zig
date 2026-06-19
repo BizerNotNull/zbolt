@@ -912,6 +912,14 @@ fn writeSeededDatabase(path: []const u8, meta0: meta.Meta, meta1: meta.Meta) !vo
     try storage.writePageObject(&file, io, default_page_size, 2, root_page);
 }
 
+pub const CommitFaultHook = struct {
+    fail_at_step: u8,
+
+    pub fn shouldFail(self: @This(), step: u8) bool {
+        return self.fail_at_step == step;
+    }
+};
+
 const test_support = if (builtin.is_test) struct {
     fn readCurrentAllocatorStatePageAlloc(db: *DB) ![]u8 {
         return readAllocatorStatePageObjectAlloc(
@@ -5121,4 +5129,289 @@ test "scanInBucketAlloc keeps read snapshots stable after later bucket writes" {
             .{ .key = "carol", .value = "updated" },
         },
     );
+}
+
+test "commit failure at data page write recovers previous snapshot" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path = try tempFilePath(&path_buf, tmp.dir, "commit-fail-data-page.db");
+
+    {
+        const db = try open(std.testing.allocator, std.testing.io, path);
+        defer db.close();
+
+        try db.put("old", "v1");
+        try std.testing.expectEqual(@as(u64, 1), db.txid);
+
+        var write_tx = try db.beginWrite();
+        try write_tx.put("new", "v2");
+
+        const initial_txid = db.txid;
+        const initial_hwm = db.high_water_mark;
+
+        try std.testing.expectError(
+            tx.WriteTxError.CommitFaultInjected,
+            write_tx.commitWithFault(.{ .fail_at_step = 1 }),
+        );
+
+        try std.testing.expectEqual(initial_txid, db.txid);
+        try std.testing.expectEqual(initial_hwm, db.high_water_mark);
+        try std.testing.expect(!db.write_tx_active);
+        try std.testing.expectError(tx.WriteTxError.WriteTransactionFailed, write_tx.put("beta", "two"));
+    }
+
+    const reopened = try open(std.testing.allocator, std.testing.io, path);
+    defer reopened.close();
+
+    try std.testing.expectEqual(@as(u64, 1), reopened.txid);
+    try expectDbValue(reopened, "old", "v1");
+    try expectDbMissing(reopened, "new");
+
+    try reopened.put("recovery_check", "yes");
+    try expectDbValue(reopened, "recovery_check", "yes");
+}
+
+test "commit failure at allocator state page write recovers previous snapshot" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path = try tempFilePath(&path_buf, tmp.dir, "commit-fail-allocator-page.db");
+
+    {
+        const db = try open(std.testing.allocator, std.testing.io, path);
+        defer db.close();
+
+        try db.put("old", "v1");
+        try std.testing.expectEqual(@as(u64, 1), db.txid);
+
+        var write_tx = try db.beginWrite();
+        try write_tx.put("new", "v2");
+
+        const initial_txid = db.txid;
+        const initial_hwm = db.high_water_mark;
+
+        try std.testing.expectError(
+            tx.WriteTxError.CommitFaultInjected,
+            write_tx.commitWithFault(.{ .fail_at_step = 2 }),
+        );
+
+        try std.testing.expectEqual(initial_txid, db.txid);
+        try std.testing.expectEqual(initial_hwm, db.high_water_mark);
+        try std.testing.expect(!db.write_tx_active);
+        try std.testing.expectError(tx.WriteTxError.WriteTransactionFailed, write_tx.put("beta", "two"));
+    }
+
+    const reopened = try open(std.testing.allocator, std.testing.io, path);
+    defer reopened.close();
+
+    try std.testing.expectEqual(@as(u64, 1), reopened.txid);
+    try expectDbValue(reopened, "old", "v1");
+    try expectDbMissing(reopened, "new");
+
+    try reopened.put("recovery_check", "yes");
+    try expectDbValue(reopened, "recovery_check", "yes");
+}
+
+test "commit failure at first sync recovers previous snapshot" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path = try tempFilePath(&path_buf, tmp.dir, "commit-fail-sync1.db");
+
+    {
+        const db = try open(std.testing.allocator, std.testing.io, path);
+        defer db.close();
+
+        try db.put("old", "v1");
+        try std.testing.expectEqual(@as(u64, 1), db.txid);
+
+        var write_tx = try db.beginWrite();
+        try write_tx.put("new", "v2");
+
+        const initial_txid = db.txid;
+        const initial_hwm = db.high_water_mark;
+
+        try std.testing.expectError(
+            tx.WriteTxError.CommitFaultInjected,
+            write_tx.commitWithFault(.{ .fail_at_step = 3 }),
+        );
+
+        try std.testing.expectEqual(initial_txid, db.txid);
+        try std.testing.expectEqual(initial_hwm, db.high_water_mark);
+        try std.testing.expect(!db.write_tx_active);
+        try std.testing.expectError(tx.WriteTxError.WriteTransactionFailed, write_tx.put("beta", "two"));
+    }
+
+    // Data pages and allocator state may have been written to disk before the
+    // sync failed, but the meta page still points to the old snapshot.
+    const reopened = try open(std.testing.allocator, std.testing.io, path);
+    defer reopened.close();
+
+    try std.testing.expectEqual(@as(u64, 1), reopened.txid);
+    try expectDbValue(reopened, "old", "v1");
+    try expectDbMissing(reopened, "new");
+
+    try reopened.put("post_failure", "ok");
+    try expectDbValue(reopened, "post_failure", "ok");
+}
+
+test "commit failure at meta page write recovers previous snapshot" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path = try tempFilePath(&path_buf, tmp.dir, "commit-fail-meta-page.db");
+
+    {
+        const db = try open(std.testing.allocator, std.testing.io, path);
+        defer db.close();
+
+        try db.put("old", "v1");
+        try std.testing.expectEqual(@as(u64, 1), db.txid);
+
+        var write_tx = try db.beginWrite();
+        try write_tx.put("new", "v2");
+
+        const initial_txid = db.txid;
+        const initial_hwm = db.high_water_mark;
+
+        try std.testing.expectError(
+            tx.WriteTxError.CommitFaultInjected,
+            write_tx.commitWithFault(.{ .fail_at_step = 4 }),
+        );
+
+        try std.testing.expectEqual(initial_txid, db.txid);
+        try std.testing.expectEqual(initial_hwm, db.high_water_mark);
+        try std.testing.expect(!db.write_tx_active);
+        try std.testing.expectError(tx.WriteTxError.WriteTransactionFailed, write_tx.put("beta", "two"));
+    }
+
+    // The new meta page was never written (or partially written with invalid
+    // checksum). selectNewestValid() picks the old valid meta.
+    const reopened = try open(std.testing.allocator, std.testing.io, path);
+    defer reopened.close();
+
+    try std.testing.expectEqual(@as(u64, 1), reopened.txid);
+    try expectDbValue(reopened, "old", "v1");
+    try expectDbMissing(reopened, "new");
+
+    try reopened.put("post_failure", "ok");
+    try expectDbValue(reopened, "post_failure", "ok");
+}
+
+test "commit failure at final sync recovers consistent state" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path = try tempFilePath(&path_buf, tmp.dir, "commit-fail-sync2.db");
+
+    {
+        const db = try open(std.testing.allocator, std.testing.io, path);
+        defer db.close();
+
+        try db.put("old", "v1");
+        try std.testing.expectEqual(@as(u64, 1), db.txid);
+
+        var write_tx = try db.beginWrite();
+        try write_tx.put("new", "v2");
+
+        const initial_txid = db.txid;
+        const initial_hwm = db.high_water_mark;
+
+        try std.testing.expectError(
+            tx.WriteTxError.CommitFaultInjected,
+            write_tx.commitWithFault(.{ .fail_at_step = 5 }),
+        );
+
+        try std.testing.expectEqual(initial_txid, db.txid);
+        try std.testing.expectEqual(initial_hwm, db.high_water_mark);
+        try std.testing.expect(!db.write_tx_active);
+        try std.testing.expectError(tx.WriteTxError.WriteTransactionFailed, write_tx.put("beta", "two"));
+    }
+
+    // The new meta was written to the inactive slot but never synced.
+    // Depending on OS buffering, the meta may or may not be readable.
+    // selectNewestValid() with checksum validation handles both outcomes:
+    // either the old or new consistent snapshot is selected.
+    const reopened = try open(std.testing.allocator, std.testing.io, path);
+    defer reopened.close();
+
+    try std.testing.expect(reopened.txid == 1 or reopened.txid == 2);
+
+    if (reopened.txid == 1) {
+        try expectDbValue(reopened, "old", "v1");
+        try expectDbMissing(reopened, "new");
+    } else {
+        try expectDbValue(reopened, "old", "v1");
+        try expectDbValue(reopened, "new", "v2");
+    }
+
+    try reopened.put("post_failure", "ok");
+    try expectDbValue(reopened, "post_failure", "ok");
+}
+
+test "commitWithFault with no failure step commits normally" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path = try tempFilePath(&path_buf, tmp.dir, "commit-no-fault.db");
+
+    {
+        const db = try open(std.testing.allocator, std.testing.io, path);
+        defer db.close();
+
+        try db.put("old", "v1");
+
+        var write_tx = try db.beginWrite();
+        try write_tx.put("new", "v2");
+        try write_tx.commitWithFault(.{ .fail_at_step = 0 });
+
+        try std.testing.expectEqual(@as(u64, 2), db.txid);
+        try expectDbValue(db, "old", "v1");
+        try expectDbValue(db, "new", "v2");
+    }
+
+    const reopened = try open(std.testing.allocator, std.testing.io, path);
+    defer reopened.close();
+
+    try std.testing.expectEqual(@as(u64, 2), reopened.txid);
+    try expectDbValue(reopened, "old", "v1");
+    try expectDbValue(reopened, "new", "v2");
+}
+
+test "commitWithFault with unknown failure step commits normally" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path = try tempFilePath(&path_buf, tmp.dir, "commit-unknown-fault.db");
+
+    {
+        const db = try open(std.testing.allocator, std.testing.io, path);
+        defer db.close();
+
+        try db.put("alpha", "one");
+
+        var write_tx = try db.beginWrite();
+        try write_tx.put("beta", "two");
+        // Step 255 does not match any injection point, so commit succeeds.
+        try write_tx.commitWithFault(.{ .fail_at_step = 255 });
+
+        try std.testing.expectEqual(@as(u64, 2), db.txid);
+        try expectDbValue(db, "alpha", "one");
+        try expectDbValue(db, "beta", "two");
+    }
+
+    const reopened = try open(std.testing.allocator, std.testing.io, path);
+    defer reopened.close();
+
+    try std.testing.expectEqual(@as(u64, 2), reopened.txid);
+    try expectDbValue(reopened, "alpha", "one");
+    try expectDbValue(reopened, "beta", "two");
 }
