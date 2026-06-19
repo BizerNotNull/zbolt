@@ -551,6 +551,7 @@ fn restoreRecoveredPendingReclaimIntoAllocator(db: *DB) !void {
     // until a later commit, so this step must remain safe across repeated
     // reopen cycles that restore the same pending records again.
     try db.reclaim.releaseReusableIntoAllocator(db.allocator, &db.page_allocator);
+    std.debug.assert(db.reclaim.pending.items.len == 0);
 }
 
 fn initializeEmptyDatabase(db: *DB) !void {
@@ -1463,6 +1464,20 @@ fn expectRecoveredPendingReclaimState(
     if (expected_entry) |entry| {
         try expectDbValue(db, entry.key, entry.value);
     }
+}
+
+fn currentRootPageRelease(db: *DB) !reclaim.ReleasedPage {
+    const root_page = try db.readPageAlloc(std.testing.allocator, db.root_page_id);
+    defer std.testing.allocator.free(root_page);
+
+    const header = try page.decodeHeader(root_page);
+    if (header.page_id != db.root_page_id) return error.InvalidTreePage;
+    if (header.page_type != .leaf and header.page_type != .branch) return error.InvalidTreePage;
+
+    return .{
+        .page_id = db.root_page_id,
+        .order = header.order,
+    };
 }
 
 // ======tests======
@@ -3937,7 +3952,7 @@ test "reopen restores and safely releases persisted pending reclaim" {
         defer db.close();
 
         try db.put("alpha", "one");
-        released_pages[0] = .{ .page_id = 3, .order = 0 };
+        released_pages[0] = try currentRootPageRelease(db);
         released_pages[1] = (try currentAllocatorRootRelease(db)).?;
         try db.put("alpha", "two");
 
@@ -3972,7 +3987,7 @@ test "reopen repeatedly restores pending reclaim without double release" {
         defer db.close();
 
         try db.put("alpha", "one");
-        released_pages[0] = .{ .page_id = 3, .order = 0 };
+        released_pages[0] = try currentRootPageRelease(db);
         released_pages[1] = (try currentAllocatorRootRelease(db)).?;
         try db.put("alpha", "two");
 
