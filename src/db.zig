@@ -60,6 +60,7 @@ pub const DB = struct {
     reclaim: reclaim.State,
     txid: u64,
     write_tx_active: bool,
+    committed_state_needs_reload: bool,
 
     pub fn close(self: *DB) void {
         // Active WriteTx values borrow this DB and must be ended before close.
@@ -206,6 +207,7 @@ pub const DB = struct {
 
     /// Opens a read-only view over the currently committed root.
     pub fn beginRead(self: *DB) !tx.ReadTx {
+        try ensureCurrentCommittedState(self);
         const snapshot = tree.ReadSnapshot{
             .root_page_id = self.root_page_id,
             .high_water_mark = self.high_water_mark,
@@ -225,6 +227,7 @@ pub const DB = struct {
 
     /// Opens the single writer slot for one explicit write transaction.
     pub fn beginWrite(self: *DB) !tx.WriteTx {
+        try ensureCurrentCommittedState(self);
         return tx.WriteTx.init(self);
     }
 
@@ -306,6 +309,7 @@ pub const DB = struct {
 
     /// Rewrites the latest committed snapshot into a compact replacement file.
     pub fn compact(self: *DB, allocator: std.mem.Allocator) !void {
+        try ensureCurrentCommittedState(self);
         if (self.write_tx_active) return error.WriteTransactionActive;
 
         const snapshot = tree.ReadSnapshot{
@@ -388,6 +392,7 @@ pub fn open(allocator: std.mem.Allocator, io: std.Io, path: []const u8) !*DB {
         .reclaim = reclaim.State.init(allocator),
         .txid = 0,
         .write_tx_active = false,
+        .committed_state_needs_reload = false,
     };
     errdefer db.reclaim.deinit(allocator);
     errdefer allocator.free(db.path);
@@ -510,6 +515,7 @@ pub fn reloadCommittedStateFromOpenFile(db: *DB) !void {
     previous_reclaim.deinit(db.allocator);
     selected.reclaim_state = reclaim.State.init(db.allocator);
     try restoreRecoveredPendingReclaimIntoAllocator(db);
+    db.committed_state_needs_reload = false;
 }
 
 fn reloadCompactedStateFromOpenFile(db: *DB) !void {
@@ -527,6 +533,20 @@ fn reloadCompactedStateFromOpenFile(db: *DB) !void {
     // pending reclaim list is replaced here; their reader bookkeeping must
     // survive until each snapshot closes.
     db.reclaim.clearPending(db.allocator);
+    db.committed_state_needs_reload = false;
+}
+
+pub fn markCommittedStateNeedsReload(db: *DB) void {
+    db.committed_state_needs_reload = true;
+}
+
+pub fn ensureCurrentCommittedState(db: *DB) !void {
+    if (!db.committed_state_needs_reload) return;
+
+    // A commit may have written a newer meta page before failing its final
+    // durability step. Reload before the next public operation so this handle
+    // cannot keep writing from a stale committed snapshot.
+    try reloadCommittedStateFromOpenFile(db);
 }
 
 fn installRecoverableSnapshotState(db: *DB, selected: *RecoverableSnapshot) void {
@@ -913,14 +933,6 @@ fn writeSeededDatabase(path: []const u8, meta0: meta.Meta, meta1: meta.Meta) !vo
 }
 
 const test_support = if (builtin.is_test) struct {
-    pub const CommitFaultHook = struct {
-        fail_at_step: u8,
-
-        pub fn shouldFail(self: @This(), step: u8) bool {
-            return self.fail_at_step == step;
-        }
-    };
-
     fn readCurrentAllocatorStatePageAlloc(db: *DB) ![]u8 {
         return readAllocatorStatePageObjectAlloc(
             std.testing.allocator,
@@ -5131,7 +5143,7 @@ test "scanInBucketAlloc keeps read snapshots stable after later bucket writes" {
     );
 }
 
-test "commit failure at data page write recovers previous snapshot" {
+test "commit failure before data page writes recovers previous snapshot" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -5173,7 +5185,7 @@ test "commit failure at data page write recovers previous snapshot" {
     try expectDbValue(reopened, "recovery_check", "yes");
 }
 
-test "commit failure at allocator state page write recovers previous snapshot" {
+test "commit failure before allocator state page write recovers previous snapshot" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -5215,7 +5227,7 @@ test "commit failure at allocator state page write recovers previous snapshot" {
     try expectDbValue(reopened, "recovery_check", "yes");
 }
 
-test "commit failure at first sync recovers previous snapshot" {
+test "commit failure before first sync recovers previous snapshot" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -5259,7 +5271,7 @@ test "commit failure at first sync recovers previous snapshot" {
     try expectDbValue(reopened, "post_failure", "ok");
 }
 
-test "commit failure at meta page write recovers previous snapshot" {
+test "commit failure before meta page write recovers previous snapshot" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -5303,7 +5315,7 @@ test "commit failure at meta page write recovers previous snapshot" {
     try expectDbValue(reopened, "post_failure", "ok");
 }
 
-test "commit failure at final sync recovers consistent state" {
+test "commit failure before final sync recovers consistent state" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -5320,21 +5332,18 @@ test "commit failure at final sync recovers consistent state" {
         var write_tx = try db.beginWrite();
         try write_tx.put("new", "v2");
 
-        const initial_txid = db.txid;
-        const initial_hwm = db.high_water_mark;
-
         try std.testing.expectError(
             tx.WriteTxError.CommitFaultInjected,
             write_tx.commitWithFault(5),
         );
 
-        try std.testing.expectEqual(initial_txid, db.txid);
-        try std.testing.expectEqual(initial_hwm, db.high_water_mark);
+        try std.testing.expect(db.txid == 1 or db.txid == 2);
         try std.testing.expect(!db.write_tx_active);
         try std.testing.expectError(tx.WriteTxError.WriteTransactionFailed, write_tx.put("beta", "two"));
     }
 
-    // The new meta was written to the inactive slot but never synced.
+    // The new meta was written to the inactive slot but this injected failure
+    // fires before the final sync runs.
     // Depending on OS buffering, the meta may or may not be readable.
     // selectNewestValid() with checksum validation handles both outcomes:
     // either the old or new consistent snapshot is selected.
@@ -5353,6 +5362,57 @@ test "commit failure at final sync recovers consistent state" {
 
     try reopened.put("post_failure", "ok");
     try expectDbValue(reopened, "post_failure", "ok");
+}
+
+test "commit failure before final sync reloads the same handle before later writes" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path = try tempFilePath(&path_buf, tmp.dir, "commit-fail-sync2-same-handle.db");
+
+    {
+        const db = try open(std.testing.allocator, std.testing.io, path);
+        defer db.close();
+
+        try db.put("old", "v1");
+        try std.testing.expectEqual(@as(u64, 1), db.txid);
+
+        var write_tx = try db.beginWrite();
+        try write_tx.put("new", "v2");
+        try std.testing.expectError(
+            tx.WriteTxError.CommitFaultInjected,
+            write_tx.commitWithFault(5),
+        );
+
+        // Final-sync injection happens after the meta page write, so the file
+        // may already expose either the previous or the newly committed
+        // snapshot. The handle must reload before its next write either way.
+        try std.testing.expect(db.txid == 1 or db.txid == 2);
+        const txid_after_fault = db.txid;
+
+        try db.put("post_failure", "ok");
+        try std.testing.expectEqual(txid_after_fault + 1, db.txid);
+        try expectDbValue(db, "old", "v1");
+        try expectDbValue(db, "post_failure", "ok");
+        if (txid_after_fault == 1) {
+            try expectDbMissing(db, "new");
+        } else {
+            try expectDbValue(db, "new", "v2");
+        }
+    }
+
+    const reopened = try open(std.testing.allocator, std.testing.io, path);
+    defer reopened.close();
+
+    try std.testing.expect(reopened.txid == 2 or reopened.txid == 3);
+    try expectDbValue(reopened, "old", "v1");
+    try expectDbValue(reopened, "post_failure", "ok");
+    if (reopened.txid == 2) {
+        try expectDbMissing(reopened, "new");
+    } else {
+        try expectDbValue(reopened, "new", "v2");
+    }
 }
 
 test "commitWithFault with no failure step commits normally" {

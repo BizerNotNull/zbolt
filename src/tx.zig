@@ -1201,7 +1201,15 @@ pub const WriteTx = struct {
     fn commitImpl(self: *WriteTx, fail_at_step: ?u8) !void {
         try self.ensureActive();
         if (!self.has_pending_write) return WriteTxError.NoPendingWrite;
-        errdefer self.fail();
+
+        var meta_page_written = false;
+        errdefer {
+            self.fail();
+            if (meta_page_written) {
+                db_mod.markCommittedStateNeedsReload(self.db);
+                db_mod.ensureCurrentCommittedState(self.db) catch {};
+            }
+        }
 
         const allocator_root_release = try db_mod.currentAllocatorRootRelease(self.db);
         const staged_reclaim_page_count = self.view.?.reclaim_committed_pages.count() + if (allocator_root_release == null) @as(usize, 0) else @as(usize, 1);
@@ -1281,6 +1289,7 @@ pub const WriteTx = struct {
         // Step 4: before meta page write
         try maybeFail(fail_at_step, 4);
         try storage.writePageObject(&self.db.file, self.db.io, self.db.page_size, metaSlotPageId(next_meta_slot), next_meta_page);
+        meta_page_written = true;
 
         // Step 5: before final sync (commit durable boundary)
         try maybeFail(fail_at_step, 5);
