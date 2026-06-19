@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const allocator_mod = @import("allocator.zig");
 const db_mod = @import("db.zig");
 const meta = @import("meta.zig");
@@ -13,6 +14,7 @@ pub const WriteTxError = error{
     WriteTransactionClosed,
     WriteTransactionFailed,
     NoPendingWrite,
+    CommitFaultInjected,
 };
 
 pub const ScanBounds = struct {
@@ -1181,9 +1183,33 @@ pub const WriteTx = struct {
     }
 
     pub fn commit(self: *WriteTx) !void {
+        return self.commitImpl(null);
+    }
+
+    pub const commitWithFault = if (builtin.is_test) struct {
+        pub fn call(self: *WriteTx, fail_at_step: u8) !void {
+            return self.commitImpl(fail_at_step);
+        }
+    }.call else @compileError("commitWithFault is only available in test builds");
+
+    fn maybeFail(fail_at_step: ?u8, step: u8) WriteTxError!void {
+        if (fail_at_step) |fas| {
+            if (fas == step) return WriteTxError.CommitFaultInjected;
+        }
+    }
+
+    fn commitImpl(self: *WriteTx, fail_at_step: ?u8) !void {
         try self.ensureActive();
         if (!self.has_pending_write) return WriteTxError.NoPendingWrite;
-        errdefer self.fail();
+
+        var meta_page_written = false;
+        errdefer {
+            self.fail();
+            if (meta_page_written) {
+                db_mod.markCommittedStateNeedsReload(self.db);
+                db_mod.ensureCurrentCommittedState(self.db) catch {};
+            }
+        }
 
         const allocator_root_release = try db_mod.currentAllocatorRootRelease(self.db);
         const staged_reclaim_page_count = self.view.?.reclaim_committed_pages.count() + if (allocator_root_release == null) @as(usize, 0) else @as(usize, 1);
@@ -1244,14 +1270,29 @@ pub const WriteTx = struct {
         const next_meta_page = try meta.encode(self.db.allocator, next_meta);
         defer self.db.allocator.free(next_meta_page);
 
+        // Step 1: before staged data page writes
+        try maybeFail(fail_at_step, 1);
         for (staged_pages) |pending_page| {
             try storage.writePageObject(&self.db.file, self.db.io, self.db.page_size, pending_page.page_id, pending_page.bytes);
         }
+
+        // Step 2: before allocator state page write
+        try maybeFail(fail_at_step, 2);
         try storage.writePageObject(&self.db.file, self.db.io, self.db.page_size, allocator_state.page_id, allocator_state.bytes);
+
+        // Step 3: before first sync (data + allocator durable boundary)
+        try maybeFail(fail_at_step, 3);
         try storage.sync(self.db.file, self.db.io);
 
         const next_meta_slot = inactiveMetaSlot(self.db.meta_slot);
+
+        // Step 4: before meta page write
+        try maybeFail(fail_at_step, 4);
         try storage.writePageObject(&self.db.file, self.db.io, self.db.page_size, metaSlotPageId(next_meta_slot), next_meta_page);
+        meta_page_written = true;
+
+        // Step 5: before final sync (commit durable boundary)
+        try maybeFail(fail_at_step, 5);
         try storage.sync(self.db.file, self.db.io);
 
         db_mod.applyCommittedState(self.db, next_meta_slot, next_meta, allocator_state.page_allocator);
