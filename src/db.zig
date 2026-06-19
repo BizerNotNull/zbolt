@@ -912,15 +912,15 @@ fn writeSeededDatabase(path: []const u8, meta0: meta.Meta, meta1: meta.Meta) !vo
     try storage.writePageObject(&file, io, default_page_size, 2, root_page);
 }
 
-pub const CommitFaultHook = struct {
-    fail_at_step: u8,
-
-    pub fn shouldFail(self: @This(), step: u8) bool {
-        return self.fail_at_step == step;
-    }
-};
-
 const test_support = if (builtin.is_test) struct {
+    pub const CommitFaultHook = struct {
+        fail_at_step: u8,
+
+        pub fn shouldFail(self: @This(), step: u8) bool {
+            return self.fail_at_step == step;
+        }
+    };
+
     fn readCurrentAllocatorStatePageAlloc(db: *DB) ![]u8 {
         return readAllocatorStatePageObjectAlloc(
             std.testing.allocator,
@@ -5153,7 +5153,7 @@ test "commit failure at data page write recovers previous snapshot" {
 
         try std.testing.expectError(
             tx.WriteTxError.CommitFaultInjected,
-            write_tx.commitWithFault(.{ .fail_at_step = 1 }),
+            write_tx.commitWithFault(1),
         );
 
         try std.testing.expectEqual(initial_txid, db.txid);
@@ -5195,7 +5195,7 @@ test "commit failure at allocator state page write recovers previous snapshot" {
 
         try std.testing.expectError(
             tx.WriteTxError.CommitFaultInjected,
-            write_tx.commitWithFault(.{ .fail_at_step = 2 }),
+            write_tx.commitWithFault(2),
         );
 
         try std.testing.expectEqual(initial_txid, db.txid);
@@ -5237,7 +5237,7 @@ test "commit failure at first sync recovers previous snapshot" {
 
         try std.testing.expectError(
             tx.WriteTxError.CommitFaultInjected,
-            write_tx.commitWithFault(.{ .fail_at_step = 3 }),
+            write_tx.commitWithFault(3),
         );
 
         try std.testing.expectEqual(initial_txid, db.txid);
@@ -5281,7 +5281,7 @@ test "commit failure at meta page write recovers previous snapshot" {
 
         try std.testing.expectError(
             tx.WriteTxError.CommitFaultInjected,
-            write_tx.commitWithFault(.{ .fail_at_step = 4 }),
+            write_tx.commitWithFault(4),
         );
 
         try std.testing.expectEqual(initial_txid, db.txid);
@@ -5325,7 +5325,7 @@ test "commit failure at final sync recovers consistent state" {
 
         try std.testing.expectError(
             tx.WriteTxError.CommitFaultInjected,
-            write_tx.commitWithFault(.{ .fail_at_step = 5 }),
+            write_tx.commitWithFault(5),
         );
 
         try std.testing.expectEqual(initial_txid, db.txid);
@@ -5370,7 +5370,7 @@ test "commitWithFault with no failure step commits normally" {
 
         var write_tx = try db.beginWrite();
         try write_tx.put("new", "v2");
-        try write_tx.commitWithFault(.{ .fail_at_step = 0 });
+        try write_tx.commitWithFault(0);
 
         try std.testing.expectEqual(@as(u64, 2), db.txid);
         try expectDbValue(db, "old", "v1");
@@ -5401,7 +5401,7 @@ test "commitWithFault with unknown failure step commits normally" {
         var write_tx = try db.beginWrite();
         try write_tx.put("beta", "two");
         // Step 255 does not match any injection point, so commit succeeds.
-        try write_tx.commitWithFault(.{ .fail_at_step = 255 });
+        try write_tx.commitWithFault(255);
 
         try std.testing.expectEqual(@as(u64, 2), db.txid);
         try expectDbValue(db, "alpha", "one");
