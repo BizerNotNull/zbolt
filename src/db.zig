@@ -504,22 +504,12 @@ pub fn reloadCommittedStateFromOpenFile(db: *DB) !void {
     errdefer selected.page_allocator.deinit(db.allocator);
     errdefer selected.reclaim_state.deinit(db.allocator);
 
-    db.meta_slot = selected.slot;
-    db.page_size = selected.meta.page_size;
-    db.flags = selected.meta.flags;
-    db.root_page_id = selected.meta.root_page_id;
-    db.allocator_root = selected.meta.allocator_root;
-    db.high_water_mark = selected.meta.high_water_mark;
-    var previous_page_allocator = db.page_allocator;
-    db.page_allocator = selected.page_allocator;
-    previous_page_allocator.deinit(db.allocator);
-    selected.page_allocator = movedPageAllocator(db.allocator);
+    installRecoverableSnapshotState(db, &selected);
     var previous_reclaim = db.reclaim;
     db.reclaim = selected.reclaim_state;
     previous_reclaim.deinit(db.allocator);
     selected.reclaim_state = reclaim.State.init(db.allocator);
-    db.txid = selected.meta.txid;
-    try db.reclaim.releaseReusableIntoAllocator(db.allocator, &db.page_allocator);
+    try restoreRecoveredPendingReclaimIntoAllocator(db);
 }
 
 fn reloadCompactedStateFromOpenFile(db: *DB) !void {
@@ -531,23 +521,37 @@ fn reloadCompactedStateFromOpenFile(db: *DB) !void {
     defer selected.page_allocator.deinit(db.allocator);
     defer selected.reclaim_state.deinit(db.allocator);
 
+    installRecoverableSnapshotState(db, &selected);
+
+    // Active readers still own handles to the pre-compact file, so only the
+    // pending reclaim list is replaced here; their reader bookkeeping must
+    // survive until each snapshot closes.
+    db.reclaim.clearPending(db.allocator);
+}
+
+fn installRecoverableSnapshotState(db: *DB, selected: *RecoverableSnapshot) void {
     db.meta_slot = selected.slot;
     db.page_size = selected.meta.page_size;
     db.flags = selected.meta.flags;
     db.root_page_id = selected.meta.root_page_id;
     db.allocator_root = selected.meta.allocator_root;
     db.high_water_mark = selected.meta.high_water_mark;
+    db.txid = selected.meta.txid;
 
     var previous_page_allocator = db.page_allocator;
     db.page_allocator = selected.page_allocator;
     previous_page_allocator.deinit(db.allocator);
     selected.page_allocator = movedPageAllocator(db.allocator);
+}
 
-    // Active readers still own handles to the pre-compact file, so only the
-    // pending reclaim list is replaced here; their reader bookkeeping must
-    // survive until each snapshot closes.
-    db.reclaim.clearPending(db.allocator);
-    db.txid = selected.meta.txid;
+fn restoreRecoveredPendingReclaimIntoAllocator(db: *DB) !void {
+    // Reopen starts without live readers from the previous process, so every
+    // pending reclaim record restored from the committed allocator state is
+    // immediately reusable in memory. The allocator state is not rewritten
+    // until a later commit, so this step must remain safe across repeated
+    // reopen cycles that restore the same pending records again.
+    try db.reclaim.releaseReusableIntoAllocator(db.allocator, &db.page_allocator);
+    std.debug.assert(db.reclaim.pending.items.len == 0);
 }
 
 fn initializeEmptyDatabase(db: *DB) !void {
@@ -1441,6 +1445,39 @@ fn expectKeyInRange(key: []const u8, lower_exclusive: ?[]const u8, upper_inclusi
     if (upper_inclusive) |upper| {
         try std.testing.expect(std.mem.order(u8, key, upper) != .gt);
     }
+}
+
+const ExpectedDbEntry = struct {
+    key: []const u8,
+    value: []const u8,
+};
+
+fn expectRecoveredPendingReclaimState(
+    db: *DB,
+    expected_released_pages: []const reclaim.ReleasedPage,
+    expected_entry: ?ExpectedDbEntry,
+) !void {
+    try std.testing.expectEqual(@as(usize, 0), db.reclaim.pending.items.len);
+    for (expected_released_pages) |released_page| {
+        try std.testing.expect(db.page_allocator.containsFreeBlock(released_page.page_id, released_page.order));
+    }
+    if (expected_entry) |entry| {
+        try expectDbValue(db, entry.key, entry.value);
+    }
+}
+
+fn currentRootPageRelease(db: *DB) !reclaim.ReleasedPage {
+    const root_page = try db.readPageAlloc(std.testing.allocator, db.root_page_id);
+    defer std.testing.allocator.free(root_page);
+
+    const header = try page.decodeHeader(root_page);
+    if (header.page_id != db.root_page_id) return error.InvalidTreePage;
+    if (header.page_type != .leaf and header.page_type != .branch) return error.InvalidTreePage;
+
+    return .{
+        .page_id = db.root_page_id,
+        .order = header.order,
+    };
 }
 
 // ======tests======
@@ -3908,14 +3945,15 @@ test "reopen restores and safely releases persisted pending reclaim" {
 
     var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const path = try tempFilePath(&path_buf, tmp.dir, "reclaim-pending-restored-on-reopen.db");
-    var released_allocator_root: reclaim.ReleasedPage = undefined;
+    var released_pages: [2]reclaim.ReleasedPage = undefined;
 
     {
         const db = try open(std.testing.allocator, std.testing.io, path);
         defer db.close();
 
         try db.put("alpha", "one");
-        released_allocator_root = (try currentAllocatorRootRelease(db)).?;
+        released_pages[0] = try currentRootPageRelease(db);
+        released_pages[1] = (try currentAllocatorRootRelease(db)).?;
         try db.put("alpha", "two");
 
         try std.testing.expectEqual(@as(usize, 1), db.reclaim.pending.items.len);
@@ -3925,15 +3963,70 @@ test "reopen restores and safely releases persisted pending reclaim" {
     const reopened = try open(std.testing.allocator, std.testing.io, path);
     defer reopened.close();
 
-    try std.testing.expectEqual(@as(usize, 0), reopened.reclaim.pending.items.len);
-    try std.testing.expect(reopened.page_allocator.containsFreeBlock(3, 0));
-    try std.testing.expect(reopened.page_allocator.containsFreeBlock(released_allocator_root.page_id, released_allocator_root.order));
-    try expectDbValue(reopened, "alpha", "two");
+    try expectRecoveredPendingReclaimState(reopened, released_pages[0..], .{
+        .key = "alpha",
+        .value = "two",
+    });
     const high_water_mark_before_reuse = reopened.high_water_mark;
 
     try reopened.put("alpha", "three");
     try std.testing.expectEqual(high_water_mark_before_reuse, reopened.high_water_mark);
     try expectDbValue(reopened, "alpha", "three");
+}
+
+test "reopen repeatedly restores pending reclaim without double release" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path = try tempFilePath(&path_buf, tmp.dir, "reclaim-pending-restored-repeatedly.db");
+    var released_pages: [2]reclaim.ReleasedPage = undefined;
+
+    {
+        const db = try open(std.testing.allocator, std.testing.io, path);
+        defer db.close();
+
+        try db.put("alpha", "one");
+        released_pages[0] = try currentRootPageRelease(db);
+        released_pages[1] = (try currentAllocatorRootRelease(db)).?;
+        try db.put("alpha", "two");
+
+        try std.testing.expectEqual(@as(usize, 1), db.reclaim.pending.items.len);
+        try std.testing.expectEqual(@as(usize, 0), try db.page_allocator.freeBlockCount());
+    }
+
+    {
+        const reopened = try open(std.testing.allocator, std.testing.io, path);
+        defer reopened.close();
+
+        try expectRecoveredPendingReclaimState(reopened, released_pages[0..], .{
+            .key = "alpha",
+            .value = "two",
+        });
+    }
+
+    {
+        const reopened_again = try open(std.testing.allocator, std.testing.io, path);
+        defer reopened_again.close();
+
+        try expectRecoveredPendingReclaimState(reopened_again, released_pages[0..], .{
+            .key = "alpha",
+            .value = "two",
+        });
+        const high_water_mark_before_reuse = reopened_again.high_water_mark;
+
+        try reopened_again.put("alpha", "three");
+        try std.testing.expectEqual(high_water_mark_before_reuse, reopened_again.high_water_mark);
+        try expectDbValue(reopened_again, "alpha", "three");
+    }
+
+    const reopened_after_commit = try open(std.testing.allocator, std.testing.io, path);
+    defer reopened_after_commit.close();
+
+    try expectRecoveredPendingReclaimState(reopened_after_commit, &.{}, .{
+        .key = "alpha",
+        .value = "three",
+    });
 }
 
 test "compact rewrites an empty database into a reopenable file" {
