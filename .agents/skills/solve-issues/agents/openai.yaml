@@ -1,0 +1,4 @@
+interface:
+  display_name: "Solve Issues"
+  short_description: "Resolve GitHub issues end to end"
+  default_prompt: "Use $solve-issues to take this GitHub issue from analysis through merge."

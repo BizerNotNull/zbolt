@@ -16,7 +16,7 @@ When writing code in this repository:
   changes to the smallest possible patch when that would preserve poor
   structure.
 - Write code comments according to the
-  `.agents/skills/code-comments/SKILLS.md` skill.
+  `.agents/skills/code-comments/SKILL.md` skill.
 - In code that is hard to follow or where a design choice is not
   obvious, add concise comments that explain the intent, invariant, or
   reason for the chosen approach.
@@ -26,9 +26,9 @@ When writing code in this repository:
 ## Commit Messages
 
 When asked to write or apply a commit, follow the
-`.agents/skills/writting-commit-messages/SKILLS.md` skill.
+`.agents/skills/writting-commit-messages/SKILL.md` skill.
 
 ## Pull Requests
 
 When asked to draft or open a pull request, follow the
-`.agents/skills/submiting-pull-requests/SKILLS.md` skill.
+`.agents/skills/submiting-pull-requests/SKILL.md` skill.

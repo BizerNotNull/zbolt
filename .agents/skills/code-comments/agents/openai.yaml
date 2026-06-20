@@ -1,0 +1,4 @@
+interface:
+  display_name: "Code Comments"
+  short_description: "Add or improve code comments"
+  default_prompt: "Use $code-comments to add, improve, standardize, or review comments in this code."
