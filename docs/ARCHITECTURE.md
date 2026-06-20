@@ -437,6 +437,40 @@ After file growth, remapping may be required. At that point, the implementation 
 
 This is why read transactions should not be held indefinitely.
 
+### 7.4 Page-View Ownership Boundary
+
+The storage layer should expose page bytes through a single ownership-aware
+abstraction:
+
+- `PageView.borrowed`: bytes owned by the storage source, such as an `mmap`
+  region or a staged in-memory page
+- `PageView.owned`: bytes copied into a heap buffer for callers that still rely
+  on allocation-backed reads
+- `PageReader`: the callback boundary that returns `PageView` without leaking
+  whether the underlying source is file IO, mapped memory, or staged pages
+
+This keeps page ownership decisions inside `storage` rather than inside tree
+traversal code.
+
+Current allocation-backed call sites that can stay buffer-oriented:
+
+- meta-page loading and validation
+- allocator-state recovery and validation
+- compacted-file validation helpers
+- one-shot debug and test helpers that inspect committed pages directly
+
+Current read paths that should migrate to mapped reads through the same
+`PageReader` contract:
+
+- `ReadTx` committed snapshot traversal
+- `SnapshotSource` and cursor traversal over committed trees
+- lookup, scan, and bucket-view reads
+- snapshot walkers such as `compact` that can consume borrowed committed pages
+  and duplicate only when they need independent ownership
+
+Write-path staged pages remain borrowed in-memory views. They already fit the
+same abstraction and should not be copied only to satisfy the read contract.
+
 ## 8. Read and Write Flows
 
 ### 8.1 Opening the Database

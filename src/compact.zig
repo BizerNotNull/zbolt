@@ -189,7 +189,7 @@ pub fn deleteFileIfExists(path: []const u8, io: std.Io) Error!void {
 
 // ======tests======
 
-fn fakeReadPage(context: *const anyopaque, allocator: std.mem.Allocator, page_id: u64) !tree.PageRef {
+fn fakeReadPage(context: *const anyopaque, allocator: std.mem.Allocator, page_id: u64) !storage.PageView {
     _ = allocator;
     const pages: *const [3][]const u8 = @ptrCast(@alignCast(context));
 

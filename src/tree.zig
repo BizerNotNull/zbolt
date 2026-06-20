@@ -70,33 +70,8 @@ pub const CursorRecord = struct {
     }
 };
 
-pub const PageRef = union(enum) {
-    borrowed: []const u8,
-    owned: []const u8,
-
-    pub fn bytes(self: PageRef) []const u8 {
-        return switch (self) {
-            .borrowed => |page_bytes| page_bytes,
-            .owned => |page_bytes| page_bytes,
-        };
-    }
-
-    pub fn deinit(self: PageRef, allocator: std.mem.Allocator) void {
-        switch (self) {
-            .borrowed => {},
-            .owned => |page_bytes| allocator.free(page_bytes),
-        }
-    }
-};
-
-pub const PageReader = struct {
-    context: *const anyopaque,
-    read_page_fn: *const fn (context: *const anyopaque, allocator: std.mem.Allocator, page_id: u64) anyerror!PageRef,
-
-    pub fn readPage(self: PageReader, allocator: std.mem.Allocator, page_id: u64) !PageRef {
-        return self.read_page_fn(self.context, allocator, page_id);
-    }
-};
+pub const PageView = storage.PageView;
+pub const PageReader = storage.PageReader;
 
 pub const CursorOwner = struct {
     context: *const anyopaque,
@@ -139,6 +114,11 @@ pub const SnapshotSource = struct {
         };
     }
 
+    /// Returns owned page bytes for committed file-backed snapshots.
+    ///
+    /// This keeps today's validated allocation-backed path in place while the
+    /// storage-level PageView abstraction allows a future mmap-backed source to
+    /// serve the same tree code with borrowed views instead.
     pub fn readPageAlloc(self: *const SnapshotSource, allocator: std.mem.Allocator, page_id: u64) ![]u8 {
         return storage.readPageObjectAlloc(
             allocator,
@@ -158,7 +138,7 @@ pub const SnapshotSource = struct {
         };
     }
 
-    fn readPage(context: *const anyopaque, allocator: std.mem.Allocator, page_id: u64) !PageRef {
+    fn readPage(context: *const anyopaque, allocator: std.mem.Allocator, page_id: u64) !PageView {
         const self: *const SnapshotSource = @ptrCast(@alignCast(context));
         return .{ .owned = try self.readPageAlloc(allocator, page_id) };
     }
@@ -447,7 +427,7 @@ const WriteContext = struct {
         return false;
     }
 
-    fn readAvailablePage(self: *WriteContext, allocator: std.mem.Allocator, page_id: u64) !PageRef {
+    fn readAvailablePage(self: *WriteContext, allocator: std.mem.Allocator, page_id: u64) !PageView {
         for (self.new_pages.items) |pending_page| {
             if (pending_page.page_id == page_id) {
                 return .{ .borrowed = pending_page.bytes };
@@ -1918,6 +1898,25 @@ fn expectCursorRecord(record: CursorRecord, expected_key: []const u8, expected_v
     try std.testing.expectEqualSlices(u8, expected_key, record.key);
     try std.testing.expectEqualSlices(u8, expected_value, record.value);
     try std.testing.expectEqual(expected_flags, record.flags);
+}
+
+test "snapshot page reader returns owned storage page views for committed pages" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const db = try openEmptyDb(tmp, "snapshot-page-reader-owned.db");
+    defer db.close();
+
+    try db.put("alpha", "one");
+
+    var snapshot_reader = snapshotPageReader(db);
+    const page_reader: storage.PageReader = snapshot_reader.pageReader();
+    const page_view: storage.PageView = try page_reader.readPage(std.testing.allocator, db.root_page_id);
+    defer page_view.deinit(std.testing.allocator);
+
+    try std.testing.expect(page_view == .owned);
+    const header = try page.decodeHeader(page_view.bytes());
+    try std.testing.expectEqual(db.root_page_id, header.page_id);
 }
 
 test "cursor record deinit is idempotent" {
