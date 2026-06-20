@@ -9,6 +9,41 @@ pub const OpenDatabaseFileError = std.Io.File.OpenError || error{
 const database_file_lock: std.Io.File.Lock = .exclusive;
 const database_file_lock_nonblocking = true;
 
+/// Storage-backed page bytes returned to higher layers.
+///
+/// `borrowed` views are owned by the underlying storage source, such as a
+/// future mmap window or an in-memory staged page table, and must not outlive
+/// that source. `owned` views are heap buffers that the caller must release.
+pub const PageView = union(enum) {
+    borrowed: []const u8,
+    owned: []const u8,
+
+    pub fn bytes(self: PageView) []const u8 {
+        return switch (self) {
+            .borrowed => |page_bytes| page_bytes,
+            .owned => |page_bytes| page_bytes,
+        };
+    }
+
+    pub fn deinit(self: PageView, allocator: std.mem.Allocator) void {
+        switch (self) {
+            .borrowed => {},
+            .owned => |page_bytes| allocator.free(page_bytes),
+        }
+    }
+};
+
+/// Abstract page access across file-backed, mapped, or staged storage sources
+/// without exposing the ownership policy to tree callers.
+pub const PageReader = struct {
+    context: *const anyopaque,
+    read_page_fn: *const fn (context: *const anyopaque, allocator: std.mem.Allocator, page_id: u64) anyerror!PageView,
+
+    pub fn readPage(self: PageReader, allocator: std.mem.Allocator, page_id: u64) !PageView {
+        return self.read_page_fn(self.context, allocator, page_id);
+    }
+};
+
 pub fn openDatabaseFileAbsolute(io: std.Io, path: []const u8) OpenDatabaseFileError!std.Io.File {
     return std.Io.Dir.openFileAbsolute(io, path, .{
         .mode = .read_write,

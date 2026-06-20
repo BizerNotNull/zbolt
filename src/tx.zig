@@ -1870,7 +1870,7 @@ const UncommittedView = struct {
         return reclaim_pages;
     }
 
-    fn readPage(context: *const anyopaque, allocator: std.mem.Allocator, page_id: u64) !tree.PageRef {
+    fn readPage(context: *const anyopaque, allocator: std.mem.Allocator, page_id: u64) !storage.PageView {
         const self: *const UncommittedView = @ptrCast(@alignCast(context));
         if (self.staged_pages.get(page_id)) |pending_page| {
             return .{ .borrowed = pending_page.bytes };
@@ -1938,6 +1938,52 @@ fn expectBucketNames(names: namespace.BucketNames, expected: []const []const u8)
 fn expectScanRecord(record: tree.CursorRecord, expected_key: []const u8, expected_value: []const u8) !void {
     try std.testing.expectEqualStrings(expected_key, record.key);
     try std.testing.expectEqualStrings(expected_value, record.value);
+}
+
+test "uncommitted view page reader borrows staged pages and owns committed fallback pages" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const db = try openTempDb(tmp, "uncommitted-view-page-reader.db");
+    defer db.close();
+
+    var view = UncommittedView.init(db.allocator, db, .{
+        .root_page_id = db.root_page_id,
+        .high_water_mark = db.high_water_mark,
+    });
+    defer view.deinit();
+
+    var working_page_allocator = try db.page_allocator.clone(db.allocator);
+    defer working_page_allocator.deinit(db.allocator);
+
+    const staged_page = try std.testing.allocator.alloc(u8, db.page_size);
+    defer std.testing.allocator.free(staged_page);
+    try page.LeafPage.init(staged_page, .{
+        .page_id = 0,
+        .page_type = .leaf,
+        .count = 0,
+        .order = 0,
+    });
+
+    const staged_page_id = try view.stageAllocatedPage(
+        db.allocator,
+        &working_page_allocator,
+        db.page_size,
+        staged_page,
+    );
+
+    const page_reader: storage.PageReader = view.pageReader();
+
+    const staged_view: storage.PageView = try page_reader.readPage(std.testing.allocator, staged_page_id);
+    defer staged_view.deinit(std.testing.allocator);
+    try std.testing.expect(staged_view == .borrowed);
+    try std.testing.expectEqualSlices(u8, staged_page, staged_view.bytes());
+
+    const committed_view: storage.PageView = try page_reader.readPage(std.testing.allocator, db.root_page_id);
+    defer committed_view.deinit(std.testing.allocator);
+    try std.testing.expect(committed_view == .owned);
+    const header = try page.decodeHeader(committed_view.bytes());
+    try std.testing.expectEqual(db.root_page_id, header.page_id);
 }
 
 test "write transaction staged read view reflects namespace scan and cursor state" {
