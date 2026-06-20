@@ -1,0 +1,4 @@
+interface:
+  display_name: "Submitting Pull Requests"
+  short_description: "Draft or open pull requests"
+  default_prompt: "Use $submiting-pull-requests to prepare and submit a pull request for these changes."

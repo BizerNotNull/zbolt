@@ -1,0 +1,4 @@
+interface:
+  display_name: "Writing Commit Messages"
+  short_description: "Draft and apply commit messages"
+  default_prompt: "Use $writing-commit-messages to draft and apply a commit message for the current changes."
