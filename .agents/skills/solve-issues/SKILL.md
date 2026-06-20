@@ -113,18 +113,6 @@ or reviews are available on the PR.
 - If a suggestion is declined, record the reason in the PR discussion
   when reviewer context would help.
 
-### 8. Merge The PR
-
-Merge only after the PR is actually ready.
-
-- Confirm required checks have passed.
-- Confirm review state and branch state allow merging.
-- If Sourcery-driven fixes changed behavior, rerun the relevant
-  validation before merging.
-- Merge the PR using the repository's normal merge flow.
-- Report the merged PR number, URL, and any follow-up work to the
-  user.
-
 ## Operating Rules
 
 - Do not skip the three plan reviews.
