@@ -104,21 +104,31 @@ pub const SnapshotSource = struct {
     file: std.Io.File,
     page_size: u32,
     snapshot: ReadSnapshot,
+    mapping: storage.ActiveMapping,
 
-    pub fn init(db: *db_mod.DB, snapshot: ReadSnapshot, file: std.Io.File) SnapshotSource {
+    pub fn init(db: *db_mod.DB, snapshot: ReadSnapshot, file: std.Io.File) !SnapshotSource {
+        const stat = try file.stat(db.io);
+        const mapping_len = std.math.cast(usize, stat.size) orelse return error.OutOfMemory;
+        var mapping = storage.ActiveMapping.init();
+        // Some caller-managed IO backends cannot establish file mappings on
+        // this platform. Keep the source usable by falling back to buffered
+        // page reads in that case.
+        mapping.remapReadOnly(db.io, file, mapping_len) catch {};
+
         return .{
             .io = db.io,
             .file = file,
             .page_size = db.page_size,
             .snapshot = snapshot,
+            .mapping = mapping,
         };
     }
 
+    pub fn deinit(self: *SnapshotSource) void {
+        self.mapping.deinit(self.io);
+    }
+
     /// Returns owned page bytes for committed file-backed snapshots.
-    ///
-    /// This keeps today's validated allocation-backed path in place while the
-    /// storage-level PageView abstraction allows a future mmap-backed source to
-    /// serve the same tree code with borrowed views instead.
     pub fn readPageAlloc(self: *const SnapshotSource, allocator: std.mem.Allocator, page_id: u64) ![]u8 {
         return storage.readPageObjectAlloc(
             allocator,
@@ -140,6 +150,16 @@ pub const SnapshotSource = struct {
 
     fn readPage(context: *const anyopaque, allocator: std.mem.Allocator, page_id: u64) !PageView {
         const self: *const SnapshotSource = @ptrCast(@alignCast(context));
+        if (self.mapping.bytes() != null) {
+            return storage.readMappedPageObject(
+                &self.mapping,
+                page_id,
+                self.page_size,
+                self.snapshot.high_water_mark,
+                try page.maxOrderForSpanSize(self.page_size, std.math.maxInt(u16)),
+            );
+        }
+
         return .{ .owned = try self.readPageAlloc(allocator, page_id) };
     }
 };
@@ -311,10 +331,14 @@ pub const Cursor = struct {
 pub const SnapshotPageReader = struct {
     source: SnapshotSource,
 
-    pub fn init(db: *db_mod.DB, snapshot: ReadSnapshot) SnapshotPageReader {
+    pub fn init(db: *db_mod.DB, snapshot: ReadSnapshot) !SnapshotPageReader {
         return .{
-            .source = SnapshotSource.init(db, snapshot, db.file),
+            .source = try SnapshotSource.init(db, snapshot, db.file),
         };
+    }
+
+    pub fn deinit(self: *SnapshotPageReader) void {
+        self.source.deinit();
     }
 
     pub fn pageReader(self: *const SnapshotPageReader) PageReader {
@@ -461,12 +485,14 @@ pub fn lookup(db: *db_mod.DB, allocator: std.mem.Allocator, key: []const u8) !?[
 }
 
 pub fn lookupSnapshot(db: *db_mod.DB, allocator: std.mem.Allocator, snapshot: ReadSnapshot, key: []const u8) !?[]u8 {
-    const snapshot_source = SnapshotSource.init(db, snapshot, db.file);
+    var snapshot_source = try SnapshotSource.init(db, snapshot, db.file);
+    defer snapshot_source.deinit();
     return lookupSnapshotSource(&snapshot_source, allocator, key);
 }
 
 pub fn lookupEntrySnapshot(db: *db_mod.DB, allocator: std.mem.Allocator, snapshot: ReadSnapshot, key: []const u8) !?LookupEntry {
-    const snapshot_source = SnapshotSource.init(db, snapshot, db.file);
+    var snapshot_source = try SnapshotSource.init(db, snapshot, db.file);
+    defer snapshot_source.deinit();
     return lookupEntrySnapshotSource(&snapshot_source, allocator, key);
 }
 
@@ -1841,7 +1867,8 @@ fn appendSnapshotPathPages(
     snapshot: ReadSnapshot,
     key: []const u8,
 ) !void {
-    const snapshot_source = SnapshotSource.init(db, snapshot, db.file);
+    var snapshot_source = try SnapshotSource.init(db, snapshot, db.file);
+    defer snapshot_source.deinit();
     const page_reader = snapshot_source.pageReader();
     var page_id = snapshot.root_page_id;
 
@@ -1887,7 +1914,7 @@ fn expectReleasedPagesContainPage(obsolete_pages: []const reclaim.ReleasedPage, 
     return error.ExpectedReleasedPageMissing;
 }
 
-fn snapshotPageReader(db: *db_mod.DB) SnapshotPageReader {
+fn snapshotPageReader(db: *db_mod.DB) !SnapshotPageReader {
     return SnapshotPageReader.init(db, .{
         .root_page_id = db.root_page_id,
         .high_water_mark = db.high_water_mark,
@@ -1900,7 +1927,7 @@ fn expectCursorRecord(record: CursorRecord, expected_key: []const u8, expected_v
     try std.testing.expectEqual(expected_flags, record.flags);
 }
 
-test "snapshot page reader returns owned storage page views for committed pages" {
+test "snapshot page reader returns borrowed storage page views for committed pages" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -1909,12 +1936,13 @@ test "snapshot page reader returns owned storage page views for committed pages"
 
     try db.put("alpha", "one");
 
-    var snapshot_reader = snapshotPageReader(db);
+    var snapshot_reader = try snapshotPageReader(db);
+    defer snapshot_reader.deinit();
     const page_reader: storage.PageReader = snapshot_reader.pageReader();
     const page_view: storage.PageView = try page_reader.readPage(std.testing.allocator, db.root_page_id);
     defer page_view.deinit(std.testing.allocator);
 
-    try std.testing.expect(page_view == .owned);
+    try std.testing.expect(page_view == .borrowed);
     const header = try page.decodeHeader(page_view.bytes());
     try std.testing.expectEqual(db.root_page_id, header.page_id);
 }
@@ -2786,7 +2814,8 @@ test "writePut records split children from non adjacent free blocks" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
 
-    var page_reader = snapshotPageReader(db);
+    var page_reader = try snapshotPageReader(db);
+    defer page_reader.deinit();
     const write_result = try writePut(
         page_reader.pageReader(),
         arena.allocator(),
@@ -2839,7 +2868,8 @@ test "writePut reports released pages for a single leaf update" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
 
-    var page_reader = snapshotPageReader(db);
+    var page_reader = try snapshotPageReader(db);
+    defer page_reader.deinit();
     const write_result = try writePut(
         page_reader.pageReader(),
         arena.allocator(),
@@ -2882,7 +2912,8 @@ test "writePut reports released pages when a root leaf split replaces the old ro
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
 
-    var page_reader = snapshotPageReader(db);
+    var page_reader = try snapshotPageReader(db);
+    defer page_reader.deinit();
     const write_result = try writePut(
         page_reader.pageReader(),
         arena.allocator(),
@@ -2926,7 +2957,8 @@ test "writePut reports released pages across a multi-level rewritten path" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
 
-    var page_reader = snapshotPageReader(db);
+    var page_reader = try snapshotPageReader(db);
+    defer page_reader.deinit();
     const write_result = try writePut(
         page_reader.pageReader(),
         arena.allocator(),
@@ -2969,7 +3001,8 @@ test "writePut records higher-order released pages for large root leaf replaceme
     defer arena.deinit();
 
     var next_value = [_]u8{'M'} ** 7000;
-    var page_reader = snapshotPageReader(db);
+    var page_reader = try snapshotPageReader(db);
+    defer page_reader.deinit();
     const write_result = try writePut(
         page_reader.pageReader(),
         arena.allocator(),
@@ -3000,7 +3033,8 @@ test "writeDelete returns unchanged when the key is absent" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
 
-    var page_reader = snapshotPageReader(db);
+    var page_reader = try snapshotPageReader(db);
+    defer page_reader.deinit();
     const delete_mutation = try writeDelete(
         page_reader.pageReader(),
         arena.allocator(),
@@ -3036,7 +3070,8 @@ test "writeDelete reports released pages for a single leaf delete" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
 
-    var page_reader = snapshotPageReader(db);
+    var page_reader = try snapshotPageReader(db);
+    defer page_reader.deinit();
     const delete_mutation = try writeDelete(
         page_reader.pageReader(),
         arena.allocator(),
@@ -3084,7 +3119,8 @@ test "writeDelete records the merged sibling as an obsolete committed page" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
 
-    var page_reader = snapshotPageReader(db);
+    var page_reader = try snapshotPageReader(db);
+    defer page_reader.deinit();
     const delete_mutation = try writeDelete(
         page_reader.pageReader(),
         arena.allocator(),

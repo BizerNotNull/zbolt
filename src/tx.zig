@@ -169,6 +169,7 @@ pub const ReadTx = struct {
     pub fn deinit(self: *ReadTx) void {
         const db = self.db orelse return;
         self.db = null;
+        self.snapshot_source.deinit();
         self.snapshot_source.file.close(self.snapshot_source.io);
         db.reclaim.endRead(self.txid);
     }

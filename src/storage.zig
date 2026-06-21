@@ -9,6 +9,42 @@ pub const OpenDatabaseFileError = std.Io.File.OpenError || error{
 const database_file_lock: std.Io.File.Lock = .exclusive;
 const database_file_lock_nonblocking = true;
 
+pub const ActiveMapping = struct {
+    map: ?std.Io.File.MemoryMap,
+
+    pub fn init() ActiveMapping {
+        return .{ .map = null };
+    }
+
+    pub fn deinit(self: *ActiveMapping, io: std.Io) void {
+        if (self.map) |*mapping| mapping.destroy(io);
+        self.map = null;
+    }
+
+    pub fn remapReadOnly(self: *ActiveMapping, io: std.Io, file: std.Io.File, len: usize) !void {
+        if (self.map) |mapping| {
+            if (mapping.memory.len == len) return;
+        }
+
+        const next = try std.Io.File.MemoryMap.create(io, file, .{
+            .len = len,
+            .protection = .{ .read = true, .write = false },
+        });
+        errdefer {
+            var cleanup = next;
+            cleanup.destroy(io);
+        }
+
+        self.deinit(io);
+        self.map = next;
+    }
+
+    pub fn bytes(self: *const ActiveMapping) ?[]const u8 {
+        const mapping = self.map orelse return null;
+        return mapping.memory;
+    }
+};
+
 /// Storage-backed page bytes returned to higher layers.
 ///
 /// `borrowed` views are owned by the underlying storage source, such as a
@@ -120,6 +156,37 @@ pub fn readPageObjectAlloc(
     try reader.interface.readSliceAll(object_bytes[base_page_size..]);
 
     return object_bytes;
+}
+
+pub fn readMappedPageObject(
+    mapping: *const ActiveMapping,
+    page_id: u64,
+    base_page_size: u32,
+    high_water_mark: u64,
+    max_order: u8,
+) !PageView {
+    if (page_id > high_water_mark) return error.EntryOutOfBounds;
+
+    const mapped_bytes = mapping.bytes() orelse return error.EntryOutOfBounds;
+    const page_start = try pageOffset(page_id, base_page_size);
+    const first_page_end = std.math.add(u64, page_start, base_page_size) catch return error.EntryOutOfBounds;
+    if (first_page_end > mapped_bytes.len) return error.EntryOutOfBounds;
+
+    const first_page = mapped_bytes[@intCast(page_start)..@intCast(first_page_end)];
+    const header = try page.decodeHeader(first_page);
+    if (header.page_id != page_id) return error.InvalidPageLayout;
+    if (header.order > max_order) return error.InvalidPageOrder;
+
+    const span_end = try page.spanEndPageId(page_id, header.order);
+    if (span_end > high_water_mark) return error.EntryOutOfBounds;
+
+    const span_size = try page.spanSize(base_page_size, header.order);
+    const object_end = std.math.add(u64, page_start, span_size) catch return error.EntryOutOfBounds;
+    if (object_end > mapped_bytes.len) return error.EntryOutOfBounds;
+
+    return .{
+        .borrowed = mapped_bytes[@intCast(page_start)..@intCast(object_end)],
+    };
 }
 
 pub fn writePage(file: *std.Io.File, io: std.Io, page_id: u64, page_size: u32, page_bytes: []const u8) !void {
@@ -254,4 +321,42 @@ test "openDatabaseFileAbsolute returns database locked when exclusive lock is al
     defer first.close(io);
 
     try std.testing.expectError(error.DatabaseLocked, openDatabaseFileAbsolute(io, path));
+}
+
+test "active mapping returns borrowed committed page bytes" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path = try tempFilePath(&path_buf, tmp.dir, "mapped-page.db");
+
+    const io = std.testing.io;
+    var file = try std.Io.Dir.createFileAbsolute(io, path, .{
+        .read = true,
+        .truncate = true,
+    });
+    defer file.close(io);
+
+    const page_size: u32 = 64;
+    var object_bytes = [_]u8{0} ** (page_size * 2);
+    try page.encodeHeader(object_bytes[0..], .{
+        .page_id = 2,
+        .page_type = .leaf,
+        .count = 0,
+        .order = 1,
+    });
+    object_bytes[page_size] = 0xAB;
+    object_bytes[object_bytes.len - 1] = 0xCD;
+
+    try writePageObject(&file, io, page_size, 2, object_bytes[0..]);
+
+    var mapping = ActiveMapping.init();
+    defer mapping.deinit(io);
+    try mapping.remapReadOnly(io, file, object_bytes.len + (page_size * 2));
+
+    const page_view = try readMappedPageObject(&mapping, 2, page_size, 3, 1);
+    defer page_view.deinit(std.testing.allocator);
+
+    try std.testing.expect(page_view == .borrowed);
+    try std.testing.expectEqualSlices(u8, object_bytes[0..], page_view.bytes());
 }
