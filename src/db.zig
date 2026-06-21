@@ -217,10 +217,11 @@ pub const DB = struct {
         });
         errdefer snapshot_file.close(self.io);
         try self.reclaim.beginRead(self.txid);
+        errdefer self.reclaim.endRead(self.txid);
         return .{
             .db = self,
             .snapshot = snapshot,
-            .snapshot_source = tree.SnapshotSource.init(self, snapshot, snapshot_file),
+            .snapshot_source = try tree.SnapshotSource.init(self, snapshot, snapshot_file),
             .txid = self.txid,
         };
     }
@@ -316,7 +317,8 @@ pub const DB = struct {
             .root_page_id = self.root_page_id,
             .high_water_mark = self.high_water_mark,
         };
-        var snapshot_page_reader = tree.SnapshotPageReader.init(self, snapshot);
+        var snapshot_page_reader = try tree.SnapshotPageReader.init(self, snapshot);
+        defer snapshot_page_reader.deinit();
         var walker = compact_mod.SnapshotTreeWalker.init(allocator, snapshot_page_reader.pageReader(), snapshot);
         defer walker.deinit();
 
@@ -2041,10 +2043,11 @@ test "reopen ignores dirty pages written before meta switch" {
         var working_page_allocator = try db.page_allocator.clone(std.testing.allocator);
         defer working_page_allocator.deinit(std.testing.allocator);
 
-        var page_reader = tree.SnapshotPageReader.init(db, .{
+        var page_reader = try tree.SnapshotPageReader.init(db, .{
             .root_page_id = db.root_page_id,
             .high_water_mark = db.high_water_mark,
         });
+        defer page_reader.deinit();
         const write_result = try tree.writePut(
             page_reader.pageReader(),
             arena.allocator(),
@@ -2098,10 +2101,11 @@ test "reopen selects inactive meta after data and allocator pages are durable" {
         var working_page_allocator = try db.page_allocator.clone(std.testing.allocator);
         errdefer working_page_allocator.deinit(std.testing.allocator);
 
-        var page_reader = tree.SnapshotPageReader.init(db, .{
+        var page_reader = try tree.SnapshotPageReader.init(db, .{
             .root_page_id = db.root_page_id,
             .high_water_mark = db.high_water_mark,
         });
+        defer page_reader.deinit();
         const write_result = try tree.writePut(
             page_reader.pageReader(),
             arena.allocator(),
