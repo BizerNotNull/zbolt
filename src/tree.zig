@@ -1947,6 +1947,28 @@ test "snapshot page reader returns borrowed storage page views for committed pag
     try std.testing.expectEqual(db.root_page_id, header.page_id);
 }
 
+test "snapshot page reader falls back to owned buffers when mapping is unavailable" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const db = try openEmptyDb(tmp, "snapshot-page-reader-fallback.db");
+    defer db.close();
+
+    try db.put("alpha", "one");
+
+    var snapshot_reader = try snapshotPageReader(db);
+    defer snapshot_reader.deinit();
+    snapshot_reader.source.mapping.deinit(std.testing.io);
+
+    const page_reader: storage.PageReader = snapshot_reader.pageReader();
+    const page_view: storage.PageView = try page_reader.readPage(std.testing.allocator, db.root_page_id);
+    defer page_view.deinit(std.testing.allocator);
+
+    try std.testing.expect(page_view == .owned);
+    const header = try page.decodeHeader(page_view.bytes());
+    try std.testing.expectEqual(db.root_page_id, header.page_id);
+}
+
 test "cursor record deinit is idempotent" {
     var record = CursorRecord{
         .key = try std.testing.allocator.dupe(u8, "alpha"),
