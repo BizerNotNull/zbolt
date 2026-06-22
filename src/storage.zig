@@ -114,6 +114,8 @@ pub const ActiveMapping = struct {
     }
 
     fn destroyRetainedMap(self: *ActiveMapping, io: std.Io, retained: *RetainedMap) void {
+        std.debug.assert(retained.pin_count == 0);
+
         var mapping = retained.map;
         mapping.destroy(io);
         self.allocator.destroy(retained);

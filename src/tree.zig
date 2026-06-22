@@ -666,7 +666,7 @@ pub fn writeDelete(
 
 fn readTreePageAlloc(page_reader: PageReader, allocator: std.mem.Allocator, page_id: u64) ![]const u8 {
     const page_ref = try page_reader.readPage(allocator, page_id);
-    errdefer page_ref.deinit(allocator);
+    defer page_ref.deinit(allocator);
 
     return switch (page_ref) {
         .owned => |page_bytes| page_bytes,
