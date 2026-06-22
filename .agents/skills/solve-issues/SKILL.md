@@ -101,6 +101,7 @@ Stress-test the plan before coding.
 After the PR is open, inspect Sourcery feedback if Sourcery comments
 or reviews are available on the PR.
 
+- Need to monitor for Sourcery CI to finish its analysis before triaging feedback.
 - Read the actual Sourcery suggestion before deciding.
 - Classify each comment as one of:
   - correct and worth fixing now
