@@ -2076,6 +2076,27 @@ test "read transaction bucket view keeps bucket scope and snapshot stability" {
     try std.testing.expectEqualSlices(u8, "three", crow);
 }
 
+test "read transaction page reader uses mapped committed pages" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const db = try openTempDb(tmp, "read-tx-mapped-page-reader.db");
+    defer db.close();
+
+    try db.put("alpha", "one");
+
+    var read_tx = try db.beginRead();
+    defer read_tx.deinit();
+
+    const page_reader: storage.PageReader = read_tx.snapshot_source.pageReader();
+    const page_view: storage.PageView = try page_reader.readPage(std.testing.allocator, read_tx.snapshot.root_page_id);
+    defer page_view.deinit(std.testing.allocator);
+
+    try std.testing.expect(page_view == .borrowed);
+    const header = try page.decodeHeader(page_view.bytes());
+    try std.testing.expectEqual(read_tx.snapshot.root_page_id, header.page_id);
+}
+
 test "write transaction bucket view reads staged nested state" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
