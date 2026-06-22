@@ -1874,7 +1874,7 @@ const UncommittedView = struct {
     fn readPage(context: *const anyopaque, allocator: std.mem.Allocator, page_id: u64) !storage.PageView {
         const self: *const UncommittedView = @ptrCast(@alignCast(context));
         if (self.staged_pages.get(page_id)) |pending_page| {
-            return .{ .borrowed = pending_page.bytes };
+            return storage.PageView.fromBorrowed(pending_page.bytes);
         }
 
         return .{

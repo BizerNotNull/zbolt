@@ -121,7 +121,7 @@ pub const SnapshotTreeWalker = struct {
 
         return switch (page_ref) {
             .owned => |page_bytes| try self.allocator.dupe(u8, page_bytes),
-            .borrowed => |page_bytes| try self.allocator.dupe(u8, page_bytes),
+            .borrowed => |page_bytes| try self.allocator.dupe(u8, page_bytes.bytes),
         };
     }
 };
@@ -193,12 +193,12 @@ fn fakeReadPage(context: *const anyopaque, allocator: std.mem.Allocator, page_id
     _ = allocator;
     const pages: *const [3][]const u8 = @ptrCast(@alignCast(context));
 
-    return .{ .borrowed = switch (page_id) {
+    return storage.PageView.fromBorrowed(switch (page_id) {
         2 => pages[0],
         3 => pages[1],
         4 => pages[2],
         else => return error.EntryOutOfBounds,
-    } };
+    });
 }
 
 test "SnapshotTreeWalker walks a branch root and rewrites child pointers" {

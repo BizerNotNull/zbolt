@@ -10,38 +10,134 @@ const database_file_lock: std.Io.File.Lock = .exclusive;
 const database_file_lock_nonblocking = true;
 
 pub const ActiveMapping = struct {
-    map: ?std.Io.File.MemoryMap,
+    allocator: std.mem.Allocator,
+    current: ?*RetainedMap,
+    retired: ?*RetainedMap,
 
-    pub fn init() ActiveMapping {
-        return .{ .map = null };
+    const RetainedMap = struct {
+        map: std.Io.File.MemoryMap,
+        pin_count: usize,
+        next_retired: ?*RetainedMap,
+    };
+
+    pub fn init(allocator: std.mem.Allocator) ActiveMapping {
+        return .{
+            .allocator = allocator,
+            .current = null,
+            .retired = null,
+        };
     }
 
     pub fn deinit(self: *ActiveMapping, io: std.Io) void {
-        if (self.map) |*mapping| mapping.destroy(io);
-        self.map = null;
+        if (self.current) |mapping| self.destroyRetainedMap(io, mapping);
+        self.current = null;
+
+        var retired = self.retired;
+        while (retired) |mapping| {
+            const next = mapping.next_retired;
+            self.destroyRetainedMap(io, mapping);
+            retired = next;
+        }
+        self.retired = null;
     }
 
     pub fn remapReadOnly(self: *ActiveMapping, io: std.Io, file: std.Io.File, len: usize) !void {
-        if (self.map) |mapping| {
-            if (mapping.memory.len == len) return;
+        if (self.current) |current| {
+            if (current.map.memory.len == len) return;
         }
 
-        const next = try std.Io.File.MemoryMap.create(io, file, .{
+        const next_map = try std.Io.File.MemoryMap.create(io, file, .{
             .len = len,
             .protection = .{ .read = true, .write = false },
         });
         errdefer {
-            var cleanup = next;
+            var cleanup = next_map;
             cleanup.destroy(io);
         }
 
-        self.deinit(io);
-        self.map = next;
+        const next = try self.allocator.create(RetainedMap);
+        errdefer self.allocator.destroy(next);
+        next.* = .{
+            .map = next_map,
+            .pin_count = 0,
+            .next_retired = null,
+        };
+
+        if (self.current) |current| {
+            if (current.pin_count == 0) {
+                self.destroyRetainedMap(io, current);
+            } else {
+                current.next_retired = self.retired;
+                self.retired = current;
+            }
+        }
+
+        self.current = next;
+        self.collectReleasedRetiredMappings(io);
     }
 
     pub fn bytes(self: *const ActiveMapping) ?[]const u8 {
-        const mapping = self.map orelse return null;
-        return mapping.memory;
+        const mapping = self.current orelse return null;
+        return mapping.map.memory;
+    }
+
+    fn borrowRange(self: *ActiveMapping, start: usize, end: usize) PageView {
+        const current = self.current orelse unreachable;
+        std.debug.assert(start <= end);
+        std.debug.assert(end <= current.map.memory.len);
+
+        current.pin_count += 1;
+        return PageView.pinBorrowed(
+            current.map.memory[start..end],
+            current,
+            releaseRetainedMap,
+        );
+    }
+
+    fn releaseRetainedMap(context: *anyopaque) void {
+        const retained: *RetainedMap = @ptrCast(@alignCast(context));
+        std.debug.assert(retained.pin_count > 0);
+        retained.pin_count -= 1;
+    }
+
+    fn collectReleasedRetiredMappings(self: *ActiveMapping, io: std.Io) void {
+        var current = &self.retired;
+        while (current.*) |retained| {
+            if (retained.pin_count == 0) {
+                current.* = retained.next_retired;
+                self.destroyRetainedMap(io, retained);
+                continue;
+            }
+
+            current = &retained.next_retired;
+        }
+    }
+
+    fn destroyRetainedMap(self: *ActiveMapping, io: std.Io, retained: *RetainedMap) void {
+        var mapping = retained.map;
+        mapping.destroy(io);
+        self.allocator.destroy(retained);
+    }
+
+    fn retiredMappingCount(self: *const ActiveMapping) usize {
+        var count: usize = 0;
+        var current = self.retired;
+        while (current) |retained| {
+            count += 1;
+            current = retained.next_retired;
+        }
+        return count;
+    }
+};
+
+pub const BorrowedPage = struct {
+    bytes: []const u8,
+    release_context: ?*anyopaque,
+    release_fn: ?*const fn (context: *anyopaque) void,
+
+    fn deinit(self: BorrowedPage) void {
+        const release = self.release_fn orelse return;
+        release(self.release_context.?);
     }
 };
 
@@ -51,19 +147,43 @@ pub const ActiveMapping = struct {
 /// future mmap window or an in-memory staged page table, and must not outlive
 /// that source. `owned` views are heap buffers that the caller must release.
 pub const PageView = union(enum) {
-    borrowed: []const u8,
+    borrowed: BorrowedPage,
     owned: []const u8,
+
+    pub fn fromBorrowed(page_bytes: []const u8) PageView {
+        return .{
+            .borrowed = .{
+                .bytes = page_bytes,
+                .release_context = null,
+                .release_fn = null,
+            },
+        };
+    }
+
+    pub fn pinBorrowed(
+        page_bytes: []const u8,
+        release_context: *anyopaque,
+        release_fn: *const fn (context: *anyopaque) void,
+    ) PageView {
+        return .{
+            .borrowed = .{
+                .bytes = page_bytes,
+                .release_context = release_context,
+                .release_fn = release_fn,
+            },
+        };
+    }
 
     pub fn bytes(self: PageView) []const u8 {
         return switch (self) {
-            .borrowed => |page_bytes| page_bytes,
+            .borrowed => |page_bytes| page_bytes.bytes,
             .owned => |page_bytes| page_bytes,
         };
     }
 
     pub fn deinit(self: PageView, allocator: std.mem.Allocator) void {
         switch (self) {
-            .borrowed => {},
+            .borrowed => |page_bytes| page_bytes.deinit(),
             .owned => |page_bytes| allocator.free(page_bytes),
         }
     }
@@ -159,7 +279,7 @@ pub fn readPageObjectAlloc(
 }
 
 pub fn readMappedPageObject(
-    mapping: *const ActiveMapping,
+    mapping: *ActiveMapping,
     page_id: u64,
     base_page_size: u32,
     high_water_mark: u64,
@@ -184,9 +304,7 @@ pub fn readMappedPageObject(
     const object_end = std.math.add(u64, page_start, span_size) catch return error.EntryOutOfBounds;
     if (object_end > mapped_bytes.len) return error.EntryOutOfBounds;
 
-    return .{
-        .borrowed = mapped_bytes[@intCast(page_start)..@intCast(object_end)],
-    };
+    return mapping.borrowRange(@intCast(page_start), @intCast(object_end));
 }
 
 pub fn writePage(file: *std.Io.File, io: std.Io, page_id: u64, page_size: u32, page_bytes: []const u8) !void {
@@ -350,7 +468,7 @@ test "active mapping returns borrowed committed page bytes" {
 
     try writePageObject(&file, io, page_size, 2, object_bytes[0..]);
 
-    var mapping = ActiveMapping.init();
+    var mapping = ActiveMapping.init(std.testing.allocator);
     defer mapping.deinit(io);
     try mapping.remapReadOnly(io, file, object_bytes.len + (page_size * 2));
 
@@ -359,4 +477,62 @@ test "active mapping returns borrowed committed page bytes" {
 
     try std.testing.expect(page_view == .borrowed);
     try std.testing.expectEqualSlices(u8, object_bytes[0..], page_view.bytes());
+}
+
+test "active mapping remap keeps borrowed pages pinned across file growth" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path = try tempFilePath(&path_buf, tmp.dir, "mapped-page-remap.db");
+
+    const io = std.testing.io;
+    var file = try std.Io.Dir.createFileAbsolute(io, path, .{
+        .read = true,
+        .truncate = true,
+    });
+    defer file.close(io);
+
+    const page_size: u32 = 64;
+    var initial_object = [_]u8{0} ** (page_size * 2);
+    try page.encodeHeader(initial_object[0..], .{
+        .page_id = 2,
+        .page_type = .leaf,
+        .count = 0,
+        .order = 1,
+    });
+    initial_object[page_size] = 0xAA;
+    initial_object[initial_object.len - 1] = 0xBB;
+    try writePageObject(&file, io, page_size, 2, initial_object[0..]);
+
+    var mapping = ActiveMapping.init(std.testing.allocator);
+    defer mapping.deinit(io);
+    try mapping.remapReadOnly(io, file, page_size * 4);
+
+    const initial_view = try readMappedPageObject(&mapping, 2, page_size, 3, 1);
+    try std.testing.expect(initial_view == .borrowed);
+
+    var grown_object = [_]u8{0} ** (page_size * 2);
+    try page.encodeHeader(grown_object[0..], .{
+        .page_id = 4,
+        .page_type = .leaf,
+        .count = 0,
+        .order = 1,
+    });
+    grown_object[page_size] = 0xCC;
+    grown_object[grown_object.len - 1] = 0xDD;
+    try writePageObject(&file, io, page_size, 4, grown_object[0..]);
+
+    try mapping.remapReadOnly(io, file, page_size * 6);
+    try std.testing.expectEqual(@as(usize, 1), mapping.retiredMappingCount());
+    try std.testing.expectEqualSlices(u8, initial_object[0..], initial_view.bytes());
+
+    const grown_view = try readMappedPageObject(&mapping, 4, page_size, 5, 1);
+    defer grown_view.deinit(std.testing.allocator);
+    try std.testing.expect(grown_view == .borrowed);
+    try std.testing.expectEqualSlices(u8, grown_object[0..], grown_view.bytes());
+
+    initial_view.deinit(std.testing.allocator);
+    mapping.collectReleasedRetiredMappings(io);
+    try std.testing.expectEqual(@as(usize, 0), mapping.retiredMappingCount());
 }
