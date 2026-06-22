@@ -3809,6 +3809,52 @@ test "read transaction keeps its snapshot after an explicit write commit" {
     try expectDbValue(db, "beta", "two");
 }
 
+test "mapped read transaction keeps borrowed pages stable across file growth" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path = try tempFilePath(&path_buf, tmp.dir, "mapped-read-remap-growth.db");
+
+    const db = try open(std.testing.allocator, std.testing.io, path);
+    defer db.close();
+
+    try db.put("alpha", "one");
+    var read_tx = try db.beginRead();
+    defer read_tx.deinit();
+
+    const page_reader: storage.PageReader = read_tx.snapshot_source.pageReader();
+    const root_view: storage.PageView = try page_reader.readPage(std.testing.allocator, read_tx.snapshot.root_page_id);
+    defer root_view.deinit(std.testing.allocator);
+    try std.testing.expect(root_view == .borrowed);
+
+    const root_header_before = try page.decodeHeader(root_view.bytes());
+    try std.testing.expectEqual(read_tx.snapshot.root_page_id, root_header_before.page_id);
+
+    var value_buf = [_]u8{'L'} ** 160;
+    const high_water_mark_before_growth = db.high_water_mark;
+    var index: usize = 0;
+    while (index < 32) : (index += 1) {
+        var key_buf: [5]u8 = undefined;
+        const key = try generatedKey(&key_buf, index);
+        try db.put(key, value_buf[0..]);
+    }
+    try std.testing.expect(db.high_water_mark > high_water_mark_before_growth);
+
+    const root_header_after_growth = try page.decodeHeader(root_view.bytes());
+    try std.testing.expectEqual(root_header_before.page_id, root_header_after_growth.page_id);
+    try expectReadTxValue(read_tx, "alpha", "one");
+    try expectReadTxMissing(read_tx, "k0031");
+
+    var latest_read_tx = try db.beginRead();
+    defer latest_read_tx.deinit();
+    const latest_page_reader: storage.PageReader = latest_read_tx.snapshot_source.pageReader();
+    const latest_root_view: storage.PageView = try latest_page_reader.readPage(std.testing.allocator, latest_read_tx.snapshot.root_page_id);
+    defer latest_root_view.deinit(std.testing.allocator);
+    try std.testing.expect(latest_root_view == .borrowed);
+    try expectReadTxValue(latest_read_tx, "k0031", value_buf[0..]);
+}
+
 test "commit failure releases the writer slot and leaves the transaction failed" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();

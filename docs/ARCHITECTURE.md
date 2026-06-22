@@ -467,14 +467,19 @@ Current allocation-backed call sites that can stay buffer-oriented:
 - compacted-file validation helpers
 - one-shot debug and test helpers that inspect committed pages directly
 
-Current read paths that should migrate to mapped reads through the same
-`PageReader` contract:
+Current read paths that use mapped reads through the same `PageReader`
+contract when a read-only file mapping is available:
 
 - `ReadTx` committed snapshot traversal
 - `SnapshotSource` and cursor traversal over committed trees
 - lookup, scan, and bucket-view reads
 - snapshot walkers such as `compact` that can consume borrowed committed pages
   and duplicate only when they need independent ownership
+
+If mapping setup is unavailable for the active platform or IO backend, the same
+contract falls back to owned buffers from file reads. Meta-page loading,
+allocator-state recovery, compacted-file validation, and low-level debug/test
+helpers remain allocation-backed.
 
 Write-path staged pages remain borrowed in-memory views. They already fit the
 same abstraction and should not be copied only to satisfy the read contract.
@@ -551,11 +556,14 @@ If more recoverable information is stored in allocator state pages in the future
 
 ## 10. Implementation Mapping
 
-This document describes the target architecture for future implementation. It does not imply that the repository already contains all modules. The current status and future module mapping are as follows:
+This document describes the target architecture and the current implementation
+status. Some sections remain design guidance for future work, while the storage
+read path now includes mmap-backed committed snapshot reads, fallback owned
+buffers, and mapping pinning for borrowed page views.
 
 ### 10.1 Planned Module Boundaries
 
-The following module responsibilities are planned to emerge incrementally:
+The following module responsibilities are implemented incrementally:
 
 - `db`
   - exposes the public database API
@@ -564,7 +572,7 @@ The following module responsibilities are planned to emerge incrementally:
 - `storage`
   - file open/close
   - file locking
-  - mmap initialization and remap
+  - read-only mmap initialization, remap, and borrowed-view pinning
   - translation between page IDs and file offsets or mapping addresses
   - file growth
   - low-level I/O support required for loading the current meta page
@@ -602,8 +610,7 @@ successful commit.
   - structural adjustments such as split and rebalance
   - mutation logic based on in-memory nodes
   - handing dirty nodes to the transaction layer for spill and persistence
-- `cursor`
-  - ordered traversal and range scanning
+  - ordered cursor traversal and range scanning
 
 The following constraints should be respected:
 
@@ -621,7 +628,7 @@ The following constraints should be respected:
 To land the system quickly, the implementation can be staged as follows:
 
 1. File initialization plus meta encoding/decoding
-2. mmap plus page abstraction
+2. mmap plus page abstraction (implemented for committed snapshot reads)
 3. Read-only B+Tree traversal
 4. Single-writer transaction plus COW commit
 5. Minimal page-based allocator
