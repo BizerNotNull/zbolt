@@ -109,7 +109,7 @@ pub const SnapshotSource = struct {
     pub fn init(db: *db_mod.DB, snapshot: ReadSnapshot, file: std.Io.File) !SnapshotSource {
         const stat = try file.stat(db.io);
         const mapping_len = std.math.cast(usize, stat.size) orelse return error.OutOfMemory;
-        var mapping = storage.ActiveMapping.init();
+        var mapping = storage.ActiveMapping.init(db.allocator);
         // Some caller-managed IO backends cannot establish file mappings on
         // this platform. Keep the source usable by falling back to buffered
         // page reads in that case.
@@ -152,7 +152,7 @@ pub const SnapshotSource = struct {
         const self: *const SnapshotSource = @ptrCast(@alignCast(context));
         if (self.mapping.bytes() != null) {
             return storage.readMappedPageObject(
-                &self.mapping,
+                @constCast(&self.mapping),
                 page_id,
                 self.page_size,
                 self.snapshot.high_water_mark,
@@ -454,7 +454,7 @@ const WriteContext = struct {
     fn readAvailablePage(self: *WriteContext, allocator: std.mem.Allocator, page_id: u64) !PageView {
         for (self.new_pages.items) |pending_page| {
             if (pending_page.page_id == page_id) {
-                return .{ .borrowed = pending_page.bytes };
+                return storage.PageView.fromBorrowed(pending_page.bytes);
             }
         }
 
@@ -666,11 +666,11 @@ pub fn writeDelete(
 
 fn readTreePageAlloc(page_reader: PageReader, allocator: std.mem.Allocator, page_id: u64) ![]const u8 {
     const page_ref = try page_reader.readPage(allocator, page_id);
-    errdefer page_ref.deinit(allocator);
+    defer page_ref.deinit(allocator);
 
     return switch (page_ref) {
         .owned => |page_bytes| page_bytes,
-        .borrowed => |page_bytes| try allocator.dupe(u8, page_bytes),
+        .borrowed => |page_bytes| try allocator.dupe(u8, page_bytes.bytes),
     };
 }
 

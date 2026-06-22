@@ -435,6 +435,14 @@ After file growth, remapping may be required. At that point, the implementation 
 - transaction lifetimes must be designed to remain stable
 - long-lived read transactions extend the lifetime of old pages and increase pressure on database growth
 
+The current ownership boundary uses page-view pinning for mapped reads:
+
+- `PageView.borrowed` from a mapped storage source pins the mapping that owns
+  those bytes until the view is released
+- remap-on-growth may install a newer mapping for future reads, but the old
+  mapping must stay alive while any borrowed page view still references it
+- read snapshots therefore remain stable without forcing all readers to reopen
+
 This is why read transactions should not be held indefinitely.
 
 ### 7.4 Page-View Ownership Boundary
