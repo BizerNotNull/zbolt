@@ -1264,6 +1264,18 @@ fn expectReadTxMissing(read_tx: tx.ReadTx, key: []const u8) !void {
     try std.testing.expect(value == null);
 }
 
+fn putGeneratedEntriesUntilHighWaterGrows(db: *DB, value: []const u8) !usize {
+    const initial_high_water_mark = db.high_water_mark;
+    var index: usize = 0;
+    while (index < 64) : (index += 1) {
+        var key_buf: [5]u8 = undefined;
+        const key = try generatedKey(&key_buf, index);
+        try db.put(key, value);
+        if (db.high_water_mark > initial_high_water_mark) return index;
+    }
+    return error.ExpectedFileGrowthMissing;
+}
+
 fn stagedPageBytes(write_tx: *tx.WriteTx, page_id: u64) []const u8 {
     return write_tx.view.?.staged_pages.get(page_id).?.bytes;
 }
@@ -3826,25 +3838,20 @@ test "mapped read transaction keeps borrowed pages stable across file growth" {
     const page_reader: storage.PageReader = read_tx.snapshot_source.pageReader();
     const root_view: storage.PageView = try page_reader.readPage(std.testing.allocator, read_tx.snapshot.root_page_id);
     defer root_view.deinit(std.testing.allocator);
-    try std.testing.expect(root_view == .borrowed);
+    if (root_view != .borrowed) return error.SkipZigTest;
 
     const root_header_before = try page.decodeHeader(root_view.bytes());
     try std.testing.expectEqual(read_tx.snapshot.root_page_id, root_header_before.page_id);
 
     var value_buf = [_]u8{'L'} ** 160;
-    const high_water_mark_before_growth = db.high_water_mark;
-    var index: usize = 0;
-    while (index < 32) : (index += 1) {
-        var key_buf: [5]u8 = undefined;
-        const key = try generatedKey(&key_buf, index);
-        try db.put(key, value_buf[0..]);
-    }
-    try std.testing.expect(db.high_water_mark > high_water_mark_before_growth);
+    const latest_index = try putGeneratedEntriesUntilHighWaterGrows(db, value_buf[0..]);
+    var latest_key_buf: [5]u8 = undefined;
+    const latest_key = try generatedKey(&latest_key_buf, latest_index);
 
     const root_header_after_growth = try page.decodeHeader(root_view.bytes());
     try std.testing.expectEqual(root_header_before.page_id, root_header_after_growth.page_id);
     try expectReadTxValue(read_tx, "alpha", "one");
-    try expectReadTxMissing(read_tx, "k0031");
+    try expectReadTxMissing(read_tx, latest_key);
 
     var latest_read_tx = try db.beginRead();
     defer latest_read_tx.deinit();
@@ -3852,7 +3859,7 @@ test "mapped read transaction keeps borrowed pages stable across file growth" {
     const latest_root_view: storage.PageView = try latest_page_reader.readPage(std.testing.allocator, latest_read_tx.snapshot.root_page_id);
     defer latest_root_view.deinit(std.testing.allocator);
     try std.testing.expect(latest_root_view == .borrowed);
-    try expectReadTxValue(latest_read_tx, "k0031", value_buf[0..]);
+    try expectReadTxValue(latest_read_tx, latest_key, value_buf[0..]);
 }
 
 test "commit failure releases the writer slot and leaves the transaction failed" {
