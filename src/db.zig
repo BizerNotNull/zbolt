@@ -171,29 +171,45 @@ pub const DB = struct {
         return read_tx.scanInBucketPathAlloc(allocator, bucket_path, bounds);
     }
 
-    /// Opens a cursor over the latest committed root snapshot and owns its read transaction.
+    /// Opens a cursor over the latest committed root snapshot.
+    ///
+    /// Ownership and invalidation rules are documented in
+    /// `docs/TRANSACTION_LIFETIMES.md`.
     pub fn cursor(self: *DB) !tx.ManagedCursor {
         return tx.ManagedCursor.init(self);
     }
 
-    /// Opens a stable read snapshot that owns its underlying transaction.
+    /// Opens a managed stable read snapshot.
+    ///
+    /// Ownership and invalidation rules are documented in
+    /// `docs/TRANSACTION_LIFETIMES.md`.
     pub fn readView(self: *DB) !tx.ManagedReadView {
         return tx.ManagedReadView.init(self);
     }
 
-    /// Opens a stable read snapshot rooted at the direct child bucket `bucket`.
+    /// Opens a managed stable read snapshot rooted at the direct child bucket
+    /// `bucket`.
+    ///
+    /// Ownership and invalidation rules are documented in
+    /// `docs/TRANSACTION_LIFETIMES.md`.
     pub fn readViewInBucket(self: *DB, bucket: []const u8) !tx.ManagedBucketView {
         const bucket_path = [_][]const u8{bucket};
         return self.readViewInBucketPath(bucket_path[0..]);
     }
 
-    /// Opens a stable read snapshot rooted at the descendant bucket
+    /// Opens a managed stable read snapshot rooted at the descendant bucket
     /// `bucket_path`.
+    ///
+    /// Ownership and invalidation rules are documented in
+    /// `docs/TRANSACTION_LIFETIMES.md`.
     pub fn readViewInBucketPath(self: *DB, bucket_path: []const []const u8) !tx.ManagedBucketView {
         return tx.ManagedBucketView.initInBucketPath(self, bucket_path);
     }
 
     /// Opens a cursor over the latest committed snapshot root of `bucket`.
+    ///
+    /// Ownership and invalidation rules are documented in
+    /// `docs/TRANSACTION_LIFETIMES.md`.
     pub fn cursorInBucket(self: *DB, bucket: []const u8) !tx.ManagedCursor {
         const bucket_path = [_][]const u8{bucket};
         return self.cursorInBucketPath(bucket_path[0..]);
@@ -201,11 +217,17 @@ pub const DB = struct {
 
     /// Opens a cursor over the latest committed snapshot root of the bucket at
     /// `bucket_path`.
+    ///
+    /// Ownership and invalidation rules are documented in
+    /// `docs/TRANSACTION_LIFETIMES.md`.
     pub fn cursorInBucketPath(self: *DB, bucket_path: []const []const u8) !tx.ManagedCursor {
         return try tx.ManagedCursor.initInBucketPath(self, bucket_path);
     }
 
-    /// Opens a read-only view over the currently committed root.
+    /// Opens an explicit read transaction over the currently committed root.
+    ///
+    /// Ownership and invalidation rules are documented in
+    /// `docs/TRANSACTION_LIFETIMES.md`.
     pub fn beginRead(self: *DB) !tx.ReadTx {
         try ensureCurrentCommittedState(self);
         const snapshot = tree.ReadSnapshot{
@@ -227,6 +249,9 @@ pub const DB = struct {
     }
 
     /// Opens the single writer slot for one explicit write transaction.
+    ///
+    /// Ownership and invalidation rules are documented in
+    /// `docs/TRANSACTION_LIFETIMES.md`.
     pub fn beginWrite(self: *DB) !tx.WriteTx {
         try ensureCurrentCommittedState(self);
         return tx.WriteTx.init(self);

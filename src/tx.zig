@@ -36,9 +36,8 @@ pub const ScanRecords = struct {
 
 /// Borrowed bucket-scoped read helper.
 ///
-/// This view reuses transaction-owned page readers and cursor ownership, so it
-/// remains valid only while the originating ReadTx, WriteTx, or managed view is
-/// still alive.
+/// Ownership and invalidation rules are documented in
+/// `docs/TRANSACTION_LIFETIMES.md`.
 pub const BucketReadView = struct {
     read_view: TxReadView,
 
@@ -161,11 +160,10 @@ pub const ReadTx = struct {
     snapshot_source: tree.SnapshotSource,
     txid: u64,
 
-    /// Releases this read view.
+    /// Releases this read transaction.
     ///
-    /// The transaction borrows the DB handle, must be used through a single
-    /// mutable binding without copying, and is valid only while that DB
-    /// remains open.
+    /// Ownership and invalidation rules are documented in
+    /// `docs/TRANSACTION_LIFETIMES.md`.
     pub fn deinit(self: *ReadTx) void {
         const db = self.db orelse return;
         self.db = null;
@@ -302,15 +300,20 @@ pub const ManagedBucketView = struct {
     read_tx: ?*ReadTx,
     bucket_view: BucketReadView,
 
-    /// Opens a stable bucket-scoped snapshot that owns the underlying read
-    /// transaction.
+    /// Opens a managed bucket-scoped snapshot.
+    ///
+    /// Ownership and invalidation rules are documented in
+    /// `docs/TRANSACTION_LIFETIMES.md`.
     pub fn initInBucket(db: *db_mod.DB, bucket: []const u8) !ManagedBucketView {
         const bucket_path = [_][]const u8{bucket};
         return initInBucketPath(db, bucket_path[0..]);
     }
 
-    /// Opens a stable bucket-scoped snapshot rooted at the descendant bucket
+    /// Opens a managed bucket-scoped snapshot rooted at the descendant bucket
     /// `bucket_path`.
+    ///
+    /// Ownership and invalidation rules are documented in
+    /// `docs/TRANSACTION_LIFETIMES.md`.
     pub fn initInBucketPath(db: *db_mod.DB, bucket_path: []const []const u8) !ManagedBucketView {
         const owned_read_tx = try initOwnedReadTx(db);
         errdefer destroyOwnedReadTx(db.allocator, owned_read_tx);
@@ -421,6 +424,9 @@ pub const ManagedBucketView = struct {
     }
 
     /// Releases the owned read transaction snapshot.
+    ///
+    /// Ownership and invalidation rules are documented in
+    /// `docs/TRANSACTION_LIFETIMES.md`.
     pub fn deinit(self: *ManagedBucketView) void {
         const owned_read_tx = self.read_tx orelse return;
         self.read_tx = null;
@@ -430,8 +436,8 @@ pub const ManagedBucketView = struct {
 
 /// Write-transaction bucket-scoped read helper.
 ///
-/// This view keeps a back-reference to the owning WriteTx so every operation
-/// still enforces the usual staged-read lifetime and closed-transaction checks.
+/// Ownership and invalidation rules are documented in
+/// `docs/TRANSACTION_LIFETIMES.md`.
 pub const WriteBucketView = struct {
     write_tx: *WriteTx,
     bucket_path: []const []const u8,
@@ -610,7 +616,10 @@ pub const ManagedReadView = struct {
     allocator: std.mem.Allocator,
     read_tx: ?*ReadTx,
 
-    /// Opens a stable read snapshot that owns the underlying transaction.
+    /// Opens a managed stable read snapshot.
+    ///
+    /// Ownership and invalidation rules are documented in
+    /// `docs/TRANSACTION_LIFETIMES.md`.
     pub fn init(db: *db_mod.DB) !ManagedReadView {
         return .{
             .allocator = db.allocator,
@@ -735,6 +744,9 @@ pub const ManagedReadView = struct {
     }
 
     /// Releases the owned read transaction snapshot.
+    ///
+    /// Ownership and invalidation rules are documented in
+    /// `docs/TRANSACTION_LIFETIMES.md`.
     pub fn deinit(self: *ManagedReadView) void {
         const owned_read_tx = self.read_tx orelse return;
         self.read_tx = null;
@@ -747,10 +759,10 @@ pub const ManagedCursor = struct {
     read_tx: ?*ReadTx,
     cursor: tree.Cursor,
 
-    /// Opens a cursor that owns the underlying read transaction.
+    /// Opens a managed cursor over the latest committed root snapshot.
     ///
-    /// The cursor and its snapshot remain valid until `deinit`, so callers can
-    /// traverse the latest committed state without manually managing `ReadTx`.
+    /// Ownership and invalidation rules are documented in
+    /// `docs/TRANSACTION_LIFETIMES.md`.
     pub fn init(db: *db_mod.DB) !ManagedCursor {
         const owned_read_tx = try initOwnedReadTx(db);
         errdefer destroyOwnedReadTx(db.allocator, owned_read_tx);
@@ -767,13 +779,19 @@ pub const ManagedCursor = struct {
         return managed;
     }
 
-    /// Opens a bucket-scoped cursor that owns the underlying read transaction.
+    /// Opens a managed cursor over a direct child bucket.
+    ///
+    /// Ownership and invalidation rules are documented in
+    /// `docs/TRANSACTION_LIFETIMES.md`.
     pub fn initInBucket(db: *db_mod.DB, bucket: []const u8) !ManagedCursor {
         const bucket_path = [_][]const u8{bucket};
         return initInBucketPath(db, bucket_path[0..]);
     }
 
-    /// Opens a bucket-scoped cursor that owns the underlying read transaction.
+    /// Opens a managed cursor over a descendant bucket.
+    ///
+    /// Ownership and invalidation rules are documented in
+    /// `docs/TRANSACTION_LIFETIMES.md`.
     pub fn initInBucketPath(db: *db_mod.DB, bucket_path: []const []const u8) !ManagedCursor {
         const owned_read_tx = try initOwnedReadTx(db);
         errdefer destroyOwnedReadTx(db.allocator, owned_read_tx);
@@ -808,6 +826,9 @@ pub const ManagedCursor = struct {
     }
 
     /// Releases both the cursor handle and the owned read transaction snapshot.
+    ///
+    /// Ownership and invalidation rules are documented in
+    /// `docs/TRANSACTION_LIFETIMES.md`.
     pub fn deinit(self: *ManagedCursor) void {
         const owned_read_tx = self.read_tx orelse return;
         self.read_tx = null;
@@ -850,8 +871,10 @@ pub const WriteTx = struct {
         failed,
     };
 
-    /// Write transactions borrow the DB handle, own their working state, and
-    /// must be used through a single mutable binding without copying.
+    /// Opens the single writer slot and initializes uncommitted working state.
+    ///
+    /// Ownership and invalidation rules are documented in
+    /// `docs/TRANSACTION_LIFETIMES.md`.
     pub fn init(db: *db_mod.DB) !WriteTx {
         if (db.write_tx_active) return WriteTxError.WriteTransactionActive;
         try db.reclaim.releaseReusableIntoAllocator(db.allocator, &db.page_allocator);
@@ -1172,6 +1195,9 @@ pub const WriteTx = struct {
 
     /// Ends the transaction, rolling back an active write if the caller exits
     /// without an explicit commit or rollback.
+    ///
+    /// Ownership and invalidation rules are documented in
+    /// `docs/TRANSACTION_LIFETIMES.md`.
     pub fn deinit(self: *WriteTx) void {
         switch (self.state) {
             .open_clean, .open_dirty => {
@@ -1183,6 +1209,10 @@ pub const WriteTx = struct {
         }
     }
 
+    /// Commits pending writes and closes the transaction.
+    ///
+    /// Ownership and invalidation rules are documented in
+    /// `docs/TRANSACTION_LIFETIMES.md`.
     pub fn commit(self: *WriteTx) !void {
         return self.commitImpl(null);
     }
@@ -1308,6 +1338,10 @@ pub const WriteTx = struct {
         self.state = .committed;
     }
 
+    /// Rolls back pending writes and closes the transaction.
+    ///
+    /// Ownership and invalidation rules are documented in
+    /// `docs/TRANSACTION_LIFETIMES.md`.
     pub fn rollback(self: *WriteTx) !void {
         switch (self.state) {
             .open_clean, .open_dirty => {
