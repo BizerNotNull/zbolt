@@ -13,7 +13,7 @@ zbolt exposes two ownership styles for reads:
 
 All transaction and managed wrapper handles borrow the `DB` that created them.
 The `DB` must remain open until those handles are released. `DB.close` asserts
-that no writer and no readers are still active.
+that no writers and no readers are still active.
 
 ## ReadTx
 
