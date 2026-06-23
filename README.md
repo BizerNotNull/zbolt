@@ -39,6 +39,10 @@ view. Long-lived read transactions still retain old snapshots and can delay
 page reuse, so applications should close read transactions and managed read
 views when they are no longer needed.
 
+See [Transaction Lifetimes and Ownership](docs/TRANSACTION_LIFETIMES.md) for
+the authoritative caller contract for `ReadTx`, `WriteTx`, managed views, and
+cursors.
+
 The write path does not mutate pages through `mmap`; mapped memory is a
 read-side optimization only. The database currently grows as needed and does
 not shrink on ordinary commits. Use explicit `compact()` to rewrite and shrink

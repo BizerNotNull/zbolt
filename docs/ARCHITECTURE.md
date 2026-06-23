@@ -292,6 +292,14 @@ When a write transaction rolls back:
 
 Because committed pages are never modified in place, rollback does not need to restore old contents. It only needs to abandon the new version.
 
+### 5.6 Caller Lifetime Contract
+
+The public caller contract for `ReadTx`, `WriteTx`, managed read views, bucket
+views, and cursors is maintained in
+[`TRANSACTION_LIFETIMES.md`](TRANSACTION_LIFETIMES.md). That document is the
+single source of truth for which handles own snapshots, which handles borrow
+transactions, and what becomes invalid after `deinit`, `commit`, or `rollback`.
+
 ## 6. Space Allocation and Reclamation
 
 ### 6.1 Why Use a Buddy Allocator
