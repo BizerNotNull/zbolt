@@ -31,8 +31,10 @@ time `DB.beginRead` succeeds.
 - Calling `deinit` more than once is allowed.
 
 After `ReadTx.deinit`, the `ReadTx` is closed. Any `BucketReadView` or
-`tree.Cursor` borrowed from it is also invalid. Debug builds assert if callers
-use the closed transaction or its borrowed handles.
+`tree.Cursor` borrowed from it is also invalid. Read APIs on the closed
+transaction or its borrowed bucket views return `ReadTxError.ReadTransactionClosed`.
+Cursor movement through an already-open borrowed cursor returns
+`CursorError.CursorOwnerClosed`.
 
 ## WriteTx
 
@@ -76,12 +78,16 @@ owned handle. They must not be copied and then used from multiple bindings.
 
 `deinit` releases the owned `ReadTx` and ends the active reader. Calling
 `deinit` more than once is allowed. After `deinit`, the managed wrapper is
-closed; using it again is invalid and debug builds assert.
+closed. `ManagedReadView` and `ManagedBucketView` APIs return
+`ManagedViewError.ManagedViewClosed`; `ManagedCursor` movement APIs return
+`ManagedCursorError.ManagedCursorClosed`.
 
 Bucket views and cursors borrowed from `ManagedReadView` or
 `ManagedBucketView` are valid only until the owning managed wrapper is
 deinitialized. `ManagedCursor` methods are valid only until
-`ManagedCursor.deinit`.
+`ManagedCursor.deinit`. After the owner closes, borrowed bucket views return
+`ReadTxError.ReadTransactionClosed` and borrowed cursor movement returns
+`CursorError.CursorOwnerClosed`.
 
 ## Bucket Views
 
