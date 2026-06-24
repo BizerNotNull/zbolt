@@ -22,6 +22,7 @@ pub const TreeWriteError = error{
 
 const CursorTraversalError = error{
     CursorUnpositioned,
+    CursorOwnerClosed,
 };
 
 const ReadTreePageError = @typeInfo(@typeInfo(@TypeOf(PageReader.readPage)).@"fn".return_type.?).error_union.error_set;
@@ -254,7 +255,7 @@ pub const Cursor = struct {
     /// Repositions the cursor to the first record visible in this snapshot.
     pub fn first(self: *Cursor, allocator: std.mem.Allocator) CursorError!?CursorRecord {
         const page_reader = self.page_reader orelse return error.CursorUnpositioned;
-        if (!self.ownerIsActive()) return error.CursorUnpositioned;
+        if (!self.ownerIsActive()) return error.CursorOwnerClosed;
         const position = try locateEdgePosition(page_reader, self.temp_allocator, self.root_page_id, .first);
         return try self.setPositionAndMaterialize(allocator, position);
     }
@@ -262,7 +263,7 @@ pub const Cursor = struct {
     /// Repositions the cursor to the last record visible in this snapshot.
     pub fn last(self: *Cursor, allocator: std.mem.Allocator) CursorError!?CursorRecord {
         const page_reader = self.page_reader orelse return error.CursorUnpositioned;
-        if (!self.ownerIsActive()) return error.CursorUnpositioned;
+        if (!self.ownerIsActive()) return error.CursorOwnerClosed;
         const position = try locateEdgePosition(page_reader, self.temp_allocator, self.root_page_id, .last);
         return try self.setPositionAndMaterialize(allocator, position);
     }
@@ -270,7 +271,7 @@ pub const Cursor = struct {
     /// Repositions the cursor to the first record whose key is not less than `key`.
     pub fn seek(self: *Cursor, allocator: std.mem.Allocator, key: []const u8) CursorError!?CursorRecord {
         const page_reader = self.page_reader orelse return error.CursorUnpositioned;
-        if (!self.ownerIsActive()) return error.CursorUnpositioned;
+        if (!self.ownerIsActive()) return error.CursorOwnerClosed;
         const position = try locateSeekPosition(page_reader, self.temp_allocator, self.root_page_id, key);
         return try self.setPositionAndMaterialize(allocator, position);
     }
@@ -278,7 +279,7 @@ pub const Cursor = struct {
     /// Returns the next record after the current cursor position.
     pub fn next(self: *Cursor, allocator: std.mem.Allocator) CursorError!?CursorRecord {
         const page_reader = self.page_reader orelse return error.CursorUnpositioned;
-        if (!self.ownerIsActive()) return error.CursorUnpositioned;
+        if (!self.ownerIsActive()) return error.CursorOwnerClosed;
 
         const position = switch (self.state) {
             .unpositioned => return error.CursorUnpositioned,
@@ -292,7 +293,7 @@ pub const Cursor = struct {
     /// Returns the previous record before the current cursor position.
     pub fn prev(self: *Cursor, allocator: std.mem.Allocator) CursorError!?CursorRecord {
         const page_reader = self.page_reader orelse return error.CursorUnpositioned;
-        if (!self.ownerIsActive()) return error.CursorUnpositioned;
+        if (!self.ownerIsActive()) return error.CursorOwnerClosed;
 
         const position = switch (self.state) {
             .unpositioned => return error.CursorUnpositioned,
@@ -312,7 +313,7 @@ pub const Cursor = struct {
 
     fn setPositionAndMaterialize(self: *Cursor, allocator: std.mem.Allocator, position: ?CursorPosition) CursorError!?CursorRecord {
         const page_reader = self.page_reader orelse return error.CursorUnpositioned;
-        if (!self.ownerIsActive()) return error.CursorUnpositioned;
+        if (!self.ownerIsActive()) return error.CursorOwnerClosed;
         const resolved_position = position orelse {
             self.state = .eof;
             return null;
@@ -2040,7 +2041,7 @@ test "cursor first returns null from an empty root leaf" {
 
     var read_tx = try db.beginRead();
     defer read_tx.deinit();
-    var cursor = read_tx.cursor();
+    var cursor = try read_tx.cursor();
     defer cursor.deinit();
 
     const first = try cursor.first(std.testing.allocator);
@@ -2074,7 +2075,7 @@ test "cursor first returns the smallest record with flags" {
 
     var read_tx = try db.beginRead();
     defer read_tx.deinit();
-    var cursor = read_tx.cursor();
+    var cursor = try read_tx.cursor();
     defer cursor.deinit();
 
     var first = (try cursor.first(std.testing.allocator)).?;
@@ -2091,7 +2092,7 @@ test "cursor next rejects unpositioned cursors" {
 
     var read_tx = try db.beginRead();
     defer read_tx.deinit();
-    var cursor = read_tx.cursor();
+    var cursor = try read_tx.cursor();
     defer cursor.deinit();
 
     try std.testing.expectError(error.CursorUnpositioned, cursor.next(std.testing.allocator));
@@ -2106,16 +2107,16 @@ test "cursor rejects use after the owning read transaction closes" {
     defer db.close();
 
     var read_tx = try db.beginRead();
-    var cursor = read_tx.cursor();
+    var cursor = try read_tx.cursor();
     defer cursor.deinit();
 
     read_tx.deinit();
 
-    try std.testing.expectError(error.CursorUnpositioned, cursor.first(std.testing.allocator));
-    try std.testing.expectError(error.CursorUnpositioned, cursor.last(std.testing.allocator));
-    try std.testing.expectError(error.CursorUnpositioned, cursor.seek(std.testing.allocator, "alpha"));
-    try std.testing.expectError(error.CursorUnpositioned, cursor.next(std.testing.allocator));
-    try std.testing.expectError(error.CursorUnpositioned, cursor.prev(std.testing.allocator));
+    try std.testing.expectError(error.CursorOwnerClosed, cursor.first(std.testing.allocator));
+    try std.testing.expectError(error.CursorOwnerClosed, cursor.last(std.testing.allocator));
+    try std.testing.expectError(error.CursorOwnerClosed, cursor.seek(std.testing.allocator, "alpha"));
+    try std.testing.expectError(error.CursorOwnerClosed, cursor.next(std.testing.allocator));
+    try std.testing.expectError(error.CursorOwnerClosed, cursor.prev(std.testing.allocator));
 }
 
 test "cursor last and prev support reverse traversal and reset semantics" {
@@ -2140,7 +2141,7 @@ test "cursor last and prev support reverse traversal and reset semantics" {
 
     var read_tx = try db.beginRead();
     defer read_tx.deinit();
-    var cursor = read_tx.cursor();
+    var cursor = try read_tx.cursor();
     defer cursor.deinit();
 
     var last = (try cursor.last(std.testing.allocator)).?;
@@ -2184,7 +2185,7 @@ test "cursor seek supports exact gap and reset semantics" {
 
     var read_tx = try db.beginRead();
     defer read_tx.deinit();
-    var cursor = read_tx.cursor();
+    var cursor = try read_tx.cursor();
     defer cursor.deinit();
 
     var exact = (try cursor.seek(std.testing.allocator, "gamma")).?;
@@ -2225,7 +2226,7 @@ test "cursor seek past the largest key enters eof" {
 
     var read_tx = try db.beginRead();
     defer read_tx.deinit();
-    var cursor = read_tx.cursor();
+    var cursor = try read_tx.cursor();
     defer cursor.deinit();
 
     const miss = try cursor.seek(std.testing.allocator, "omega");
@@ -2251,7 +2252,7 @@ test "cursor next traverses split leaves in key order" {
 
     var read_tx = try db.beginRead();
     defer read_tx.deinit();
-    var cursor = read_tx.cursor();
+    var cursor = try read_tx.cursor();
     defer cursor.deinit();
 
     var first = (try cursor.first(std.testing.allocator)).?;
@@ -2290,7 +2291,7 @@ test "cursor next traverses a multi-level tree" {
 
     var read_tx = try db.beginRead();
     defer read_tx.deinit();
-    var cursor = read_tx.cursor();
+    var cursor = try read_tx.cursor();
     defer cursor.deinit();
 
     var count: usize = 0;
@@ -2325,7 +2326,7 @@ test "cursor prev traverses a multi-level tree in reverse order" {
 
     var read_tx = try db.beginRead();
     defer read_tx.deinit();
-    var cursor = read_tx.cursor();
+    var cursor = try read_tx.cursor();
     defer cursor.deinit();
 
     var seen: usize = 261;
@@ -2354,7 +2355,7 @@ test "cursor snapshot remains stable after a later write commit" {
 
     var read_tx = try db.beginRead();
     defer read_tx.deinit();
-    var cursor = read_tx.cursor();
+    var cursor = try read_tx.cursor();
     defer cursor.deinit();
 
     var first = (try cursor.first(std.testing.allocator)).?;
@@ -2381,7 +2382,7 @@ test "cursor traverses higher-order leaf pages" {
 
     var read_tx = try db.beginRead();
     defer read_tx.deinit();
-    var cursor = read_tx.cursor();
+    var cursor = try read_tx.cursor();
     defer cursor.deinit();
 
     var first = (try cursor.first(std.testing.allocator)).?;
@@ -2407,7 +2408,7 @@ test "cursor traverses the latest snapshot after root collapse" {
 
     var read_tx = try db.beginRead();
     defer read_tx.deinit();
-    var cursor = read_tx.cursor();
+    var cursor = try read_tx.cursor();
     defer cursor.deinit();
 
     var first = (try cursor.first(std.testing.allocator)).?;
@@ -2448,7 +2449,7 @@ test "cursor first propagates non tree root type errors" {
 
     var read_tx = try db.beginRead();
     defer read_tx.deinit();
-    var cursor = read_tx.cursor();
+    var cursor = try read_tx.cursor();
     defer cursor.deinit();
 
     try std.testing.expectError(error.UnexpectedPageType, cursor.first(std.testing.allocator));
@@ -2474,7 +2475,7 @@ test "cursor first propagates malformed leaf layouts" {
 
     var read_tx = try db.beginRead();
     defer read_tx.deinit();
-    var cursor = read_tx.cursor();
+    var cursor = try read_tx.cursor();
     defer cursor.deinit();
 
     try std.testing.expectError(error.InvalidPageLayout, cursor.first(std.testing.allocator));

@@ -4208,7 +4208,7 @@ test "compact preserves cursor order across a multi-level tree" {
 
     var read_tx = try db.beginRead();
     defer read_tx.deinit();
-    var cursor = read_tx.cursor();
+    var cursor = try read_tx.cursor();
     defer cursor.deinit();
 
     var count: usize = 0;
@@ -4276,7 +4276,7 @@ test "compact keeps active read transactions on their original snapshot" {
     try expectReadTxValue(read_tx, "alpha", "one");
     try expectReadTxMissing(read_tx, "gamma");
 
-    var cursor = read_tx.cursor();
+    var cursor = try read_tx.cursor();
     defer cursor.deinit();
 
     var count: usize = 0;
